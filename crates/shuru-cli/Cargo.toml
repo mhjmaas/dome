@@ -7,6 +7,9 @@ edition = "2021"
 name = "shuru"
 path = "src/main.rs"
 
+[dev-dependencies]
+tempfile = "3"
+
 [dependencies]
 shuru-vm = { path = "../shuru-vm" }
 shuru-proto = { path = "../shuru-proto" }
