@@ -33,7 +33,17 @@ shell:
     {{ binary }} run -- sh
 
 # Full setup from scratch: rootfs + build
-setup: prepare-rootfs build
+setup: build-guest prepare-rootfs build
+
+# Run unit tests
+test: build
+    cargo test -p shuru-proto -p shuru-cli --lib
+
+# Run integration tests (boots real VMs)
+test-integration: build
+    cp {{ binary }} target/debug/shuru-signed
+    codesign --entitlements shuru.entitlements --force -s - target/debug/shuru-signed
+    SHURU_BIN={{ justfile_directory() }}/target/debug/shuru-signed cargo test -p shuru-cli --test rw_mounts -- --ignored
 
 # Check all crates compile (host targets only)
 check:

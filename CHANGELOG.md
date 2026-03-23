@@ -16,6 +16,13 @@
 
 - Re-exports the updated `MountConfig`. SDK users passing `mounts` in `SandboxConfig` must include the `read_only` field.
 
+### Build system
+
+- `prepare-rootfs.sh` now rebuilds the initramfs when the guest binary changes (sha256 hash tracking)
+- `just setup` builds the guest before `prepare-rootfs` so the hash check sees the latest binary
+- `just test` runs unit tests only (`--lib`, no ignored-test noise)
+- `just test-integration` copies the signed binary to avoid `cargo test` stripping macOS codesign entitlements
+
 ## 0.4.1
 
 ### CLI (`shuru-cli` 0.4.1)
