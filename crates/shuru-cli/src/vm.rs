@@ -63,7 +63,7 @@ pub(crate) fn prepare_vm(
                 .with_context(|| format!("invalid --secret: '{}' (expected NAME=ENV@host1,host2)", s))?;
             proxy.secrets.insert(
                 name,
-                shuru_proxy::config::SecretConfig { from, hosts },
+                shuru_proxy::config::SecretConfig { from, hosts, value: None },
             );
         }
 

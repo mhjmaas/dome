@@ -45,6 +45,7 @@ impl ShuruConfig {
                     shuru_proxy::config::SecretConfig {
                         from: entry.from.clone(),
                         hosts: entry.hosts.clone(),
+                        value: None,
                     },
                 );
             }

@@ -19,6 +19,8 @@ pub struct SecretConfig {
     /// Domain patterns where this secret may be sent (e.g., "api.openai.com").
     /// The proxy only substitutes the placeholder on requests to these hosts.
     pub hosts: Vec<String>,
+    /// If set, use this value directly instead of reading from the host env var.
+    pub value: Option<String>,
 }
 
 /// Network access policy.
@@ -48,7 +50,7 @@ impl ProxyConfig {
         domain: &str,
         placeholders: &HashMap<String, String>,
     ) -> Vec<(String, String)> {
-        let mut result = Vec::new();
+        let mut substitutions = Vec::new();
         for (name, secret) in &self.secrets {
             if secret
                 .hosts
@@ -56,13 +58,17 @@ impl ProxyConfig {
                 .any(|pattern| domain_matches(pattern, domain))
             {
                 if let Some(placeholder) = placeholders.get(name) {
-                    if let Ok(real_value) = std::env::var(&secret.from) {
-                        result.push((placeholder.clone(), real_value));
+                    let real_value = secret
+                        .value
+                        .clone()
+                        .or_else(|| std::env::var(&secret.from).ok());
+                    if let Some(real_value) = real_value {
+                        substitutions.push((placeholder.clone(), real_value));
                     }
                 }
             }
         }
-        result
+        substitutions
     }
 }
 

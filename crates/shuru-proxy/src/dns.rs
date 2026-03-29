@@ -42,6 +42,16 @@ async fn resolve_query(query_bytes: &[u8], config: &ProxyConfig) -> anyhow::Resu
     let qname = question.qname.to_string();
     let domain = qname.trim_end_matches('.');
 
+    // The VM network stack is IPv4-only (smoltcp proto-ipv4).
+    // Return empty NOERROR for AAAA queries — musl's getaddrinfo treats
+    // REFUSED as a hard failure (EAI_AGAIN), but empty NOERROR means
+    // "no AAAA records" and falls back to A records gracefully.
+    let qtype = question.qtype;
+    if qtype == simple_dns::QTYPE::TYPE(simple_dns::TYPE::AAAA) {
+        debug!("DNS AAAA empty (IPv4-only): {domain}");
+        return build_empty_response(query_bytes);
+    }
+
     debug!("DNS query: {domain}");
 
     if !config.is_domain_allowed(domain) {
@@ -69,14 +79,22 @@ fn forward_to_system_resolver(query: &[u8]) -> anyhow::Result<Vec<u8>> {
     Ok(buf[..n].to_vec())
 }
 
-/// Build a REFUSED response for blocked domains.
-fn build_refused_response(query_bytes: &[u8]) -> anyhow::Result<Vec<u8>> {
+/// Build a DNS response with the given RCODE and no answer records.
+fn build_response_with_rcode(query_bytes: &[u8], rcode: u8) -> anyhow::Result<Vec<u8>> {
     let mut response = query_bytes.to_vec();
     if response.len() < 12 {
         return Err(anyhow::anyhow!("query too short"));
     }
-    // Set QR=1 (response), keep opcode, set RCODE=5 (REFUSED)
+    // Set QR=1 (response), keep opcode, set RCODE
     response[2] |= 0x80;
-    response[3] = (response[3] & 0xF0) | 0x05;
+    response[3] = (response[3] & 0xF0) | (rcode & 0x0F);
     Ok(response)
+}
+
+fn build_empty_response(query_bytes: &[u8]) -> anyhow::Result<Vec<u8>> {
+    build_response_with_rcode(query_bytes, 0)
+}
+
+fn build_refused_response(query_bytes: &[u8]) -> anyhow::Result<Vec<u8>> {
+    build_response_with_rcode(query_bytes, 5)
 }
