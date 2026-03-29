@@ -56,6 +56,16 @@ describe("buildArgs", () => {
 		expect(args).toEqual(["shuru", "run", "--stdio"]);
 	});
 
+	test("allow host writes", () => {
+		const args = buildArgs("shuru", { allowHostWrites: true });
+		expect(args).toEqual(["shuru", "run", "--stdio", "--allow-host-writes"]);
+	});
+
+	test("allowHostWrites false is omitted", () => {
+		const args = buildArgs("shuru", { allowHostWrites: false });
+		expect(args).toEqual(["shuru", "run", "--stdio"]);
+	});
+
 	test("port forwards", () => {
 		const args = buildArgs("shuru", { ports: ["8080:80", "3000:3000"] });
 		expect(args).toEqual([
@@ -81,6 +91,21 @@ describe("buildArgs", () => {
 			"./src:/workspace",
 			"--mount",
 			"./data:/data",
+		]);
+	});
+
+	test("rw mount with allow host writes", () => {
+		const args = buildArgs("shuru", {
+			allowHostWrites: true,
+			mounts: { "./src": "/workspace:rw" },
+		});
+		expect(args).toEqual([
+			"shuru",
+			"run",
+			"--stdio",
+			"--allow-host-writes",
+			"--mount",
+			"./src:/workspace:rw",
 		]);
 	});
 

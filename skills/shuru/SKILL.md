@@ -183,7 +183,7 @@ CLI flags override config values. When `secrets` are configured, the guest recei
 - **Networking is off by default.** You must pass `--allow-net` to install packages or make HTTP requests.
 - **The guest is Debian Linux (aarch64).** Use `apt-get install` for packages.
 - **Ephemeral by default.** Everything is discarded on exit unless you checkpoint.
-- **Mounts are read-write.** Changes to mounted directories are visible on the host immediately.
+- **Mounts are read-only by default.** Guest writes go to a tmpfs overlay and are discarded on exit. Use `:rw` suffix + `--allow-host-writes` to write to the host.
 - **macOS only** (Apple Silicon). Uses Apple Virtualization.framework.
 - **Default resources:** 2 CPUs, 2048 MB RAM, 4096 MB disk. Override with `--cpus`, `--memory`, `--disk-size`.
 

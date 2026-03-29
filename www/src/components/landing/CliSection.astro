@@ -21,7 +21,7 @@ const tabs = [
   {
     id: "mounts",
     title: "Directory mounts",
-    description: "Share host directories into the VM. Writes stay in a tmpfs overlay.",
+    description: "Share host directories into the VM. Read-only by default; opt in to host writes with :rw.",
   },
   {
     id: "checkpoints",
@@ -81,11 +81,10 @@ const tabs = [
         <div class="tabbed-panel p-5 font-mono text-xs leading-[1.8] md:p-6 md:text-sm" data-panel="mounts">
           <p><span class="text-dim">$</span> <span class="text-text">shuru run --mount ./src:/workspace -- ls /workspace</span></p>
           <p class="text-amber">main.py  utils.py  tests/</p>
+          <p class="text-muted"># Read-only by default — guest writes stay in a tmpfs overlay.</p>
           <br />
-          <p><span class="text-dim">$</span> <span class="text-text">shuru run --mount ./src:/workspace -- sh -c 'echo "new" > /workspace/tmp && cat /workspace/tmp'</span></p>
-          <p class="text-amber">new</p>
-          <br />
-          <p class="text-muted"># Host directory is untouched. Guest writes live in a tmpfs overlay.</p>
+          <p><span class="text-dim">$</span> <span class="text-text">shuru run --allow-host-writes --mount ./src:/workspace:rw -- touch /workspace/new.py</span></p>
+          <p class="text-muted"># With :rw + --allow-host-writes, guest writes land on the host.</p>
         </div>
 
         <div class="tabbed-panel p-5 font-mono text-xs leading-[1.8] md:p-6 md:text-sm" data-panel="checkpoints">

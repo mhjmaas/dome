@@ -41,11 +41,16 @@ shuru run --cpus 4 --memory 4096 --disk-size 8192 -- make -j4
 
 ### Directory mounts
 
-Share host directories into the VM using VirtioFS. The host directory is read-only; guest writes go to a tmpfs overlay layer (discarded when the VM exits).
+Share host directories into the VM using VirtioFS. By default the host directory is read-only; guest writes go to a tmpfs overlay layer (discarded when the VM exits). Append `:rw` to make the mount read-write — guest writes go directly to the host filesystem.
 
 ```sh
-# Mount a directory (guest can write, host is untouched)
-shuru run --mount ./src:/workspace -- ls /workspace
+# Mount a directory (guest can read, writes go to overlay — host is untouched)
+shuru run --mount ./src:/workspace -- touch /workspace/test.txt
+ls ./src/test.txt   # not found — write stayed in the overlay
+
+# Read-write mount (guest writes land on host, requires --allow-host-writes)
+shuru run --allow-host-writes --mount ./src:/workspace:rw -- touch /workspace/test.txt
+ls ./src/test.txt   # found — write went to host
 
 # Multiple mounts
 shuru run --mount ./src:/workspace --mount ./data:/data -- sh

@@ -52,6 +52,7 @@ pub(crate) fn prepare_vm(
     let memory = vm.memory.or(cfg.memory).unwrap_or(2048);
     let disk_size = vm.disk_size.or(cfg.disk_size).unwrap_or(4096);
     let allow_net = vm.allow_net || cfg.allow_net.unwrap_or(false);
+    let allow_host_writes = vm.allow_host_writes || cfg.allow_host_writes.unwrap_or(false);
     let verbose = vm.verbose;
 
     let proxy_config = if allow_net {
@@ -103,6 +104,10 @@ pub(crate) fn prepare_vm(
         let mc = parse_mount_spec(s)
             .with_context(|| format!("invalid mount spec: '{}'", s))?;
         mounts.push(mc);
+    }
+
+    if !mounts.is_empty() {
+        validate_mounts(&mounts, allow_host_writes)?;
     }
 
     let data_dir = shuru_vm::default_data_dir();
@@ -311,10 +316,28 @@ pub(crate) fn run_command(prepared: &PreparedVm, command: &[String]) -> Result<i
     Ok(exit_code)
 }
 
+/// Pure string validation — no filesystem access. Separated from `parse_mount_spec`
+/// so unit tests can exercise mode/path logic without touching the filesystem.
+fn parse_mount_parts(host: &str, guest: &str, mode: Option<&str>) -> Result<MountConfig> {
+    if !guest.starts_with('/') {
+        bail!("guest path must be absolute (start with /): '{}'", guest);
+    }
+    let read_only = match mode {
+        None | Some("ro") => true,
+        Some("rw") => false,
+        Some(other) => bail!("invalid mount mode '{}': expected 'ro' or 'rw'", other),
+    };
+    Ok(MountConfig {
+        host_path: host.to_string(),
+        guest_path: guest.to_string(),
+        read_only,
+    })
+}
+
 fn parse_mount_spec(s: &str) -> Result<MountConfig> {
-    let parts: Vec<&str> = s.splitn(2, ':').collect();
+    let parts: Vec<&str> = s.splitn(3, ':').collect();
     if parts.len() < 2 {
-        bail!("expected HOST:GUEST format (e.g. ./src:/workspace)");
+        bail!("expected HOST:GUEST[:ro|rw] format (e.g. ./src:/workspace:rw)");
     }
 
     let host_path = std::fs::canonicalize(parts[0])
@@ -322,15 +345,57 @@ fn parse_mount_spec(s: &str) -> Result<MountConfig> {
         .to_string_lossy()
         .to_string();
 
-    let guest_path = parts[1].to_string();
-    if !guest_path.starts_with('/') {
-        bail!("guest path must be absolute (start with /): '{}'", guest_path);
+    let guest = parts[1];
+    let mode = parts.get(2).copied();
+
+    parse_mount_parts(&host_path, guest, mode)
+}
+
+fn validate_mounts(mounts: &[MountConfig], allow_host_writes: bool) -> Result<()> {
+    let cwd = std::env::current_dir().context("failed to determine current working directory")?;
+    let cwd = std::fs::canonicalize(&cwd).context("failed to canonicalize current working directory")?;
+    validate_mounts_with_cwd(mounts, allow_host_writes, &cwd)
+}
+
+fn validate_mounts_with_cwd(
+    mounts: &[MountConfig],
+    allow_host_writes: bool,
+    cwd: &std::path::Path,
+) -> Result<()> {
+    if cwd == std::path::Path::new("/") {
+        bail!(
+            "cannot use mounts when the current working directory is '/'. \
+             Change to a project directory first."
+        );
     }
 
-    Ok(MountConfig {
-        host_path,
-        guest_path,
-    })
+    for mc in mounts {
+        let host = std::path::Path::new(&mc.host_path);
+
+        if host == std::path::Path::new("/") {
+            bail!("mounting '/' as a host path is not allowed. Mount a specific subdirectory instead.");
+        }
+
+        if !host.starts_with(cwd) {
+            bail!(
+                "mount host path '{}' is outside the current working directory '{}'. \
+                 Only paths within CWD can be mounted.",
+                mc.host_path,
+                cwd.display()
+            );
+        }
+
+        if !mc.read_only && !allow_host_writes {
+            bail!(
+                "read-write mount '{}:{}:rw' requires --allow-host-writes flag \
+                 (or \"allow_host_writes\": true in config).",
+                mc.host_path,
+                mc.guest_path
+            );
+        }
+    }
+
+    Ok(())
 }
 
 /// Parse `NAME=ENV_VAR@host1,host2` into (name, from, hosts).
@@ -363,4 +428,113 @@ fn parse_port_mapping(s: &str) -> Result<PortMapping> {
         host_port,
         guest_port,
     })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn mount_defaults_to_read_only() {
+        let mc = parse_mount_parts("/some/host", "/workspace", None).unwrap();
+        assert!(mc.read_only);
+        assert_eq!(mc.guest_path, "/workspace");
+    }
+
+    #[test]
+    fn mount_ro_suffix() {
+        let mc = parse_mount_parts("/some/host", "/workspace", Some("ro")).unwrap();
+        assert!(mc.read_only);
+    }
+
+    #[test]
+    fn mount_rw_suffix() {
+        let mc = parse_mount_parts("/some/host", "/workspace", Some("rw")).unwrap();
+        assert!(!mc.read_only);
+    }
+
+    #[test]
+    fn mount_rejects_bad_mode() {
+        assert!(parse_mount_parts("/some/host", "/workspace", Some("xx")).is_err());
+    }
+
+    #[test]
+    fn mount_rejects_relative_guest() {
+        assert!(parse_mount_parts("/some/host", "relative/path", None).is_err());
+    }
+
+    #[test]
+    fn rw_mount_rejected_without_flag() {
+        let cwd = std::env::current_dir().unwrap();
+        let mounts = vec![MountConfig {
+            host_path: cwd.to_string_lossy().to_string(),
+            guest_path: "/workspace".to_string(),
+            read_only: false,
+        }];
+        let err = validate_mounts_with_cwd(&mounts, false, &cwd).unwrap_err();
+        assert!(err.to_string().contains("--allow-host-writes"));
+    }
+
+    #[test]
+    fn rw_mount_accepted_with_flag() {
+        let cwd = std::env::current_dir().unwrap();
+        let mounts = vec![MountConfig {
+            host_path: cwd.to_string_lossy().to_string(),
+            guest_path: "/workspace".to_string(),
+            read_only: false,
+        }];
+        assert!(validate_mounts_with_cwd(&mounts, true, &cwd).is_ok());
+    }
+
+    #[test]
+    fn ro_mount_accepted_without_flag() {
+        let cwd = std::env::current_dir().unwrap();
+        let mounts = vec![MountConfig {
+            host_path: cwd.to_string_lossy().to_string(),
+            guest_path: "/workspace".to_string(),
+            read_only: true,
+        }];
+        assert!(validate_mounts_with_cwd(&mounts, false, &cwd).is_ok());
+    }
+
+    #[test]
+    fn mount_outside_cwd_rejected() {
+        let cwd = std::path::Path::new("/Users/testuser/project");
+        let mounts = vec![MountConfig {
+            host_path: "/tmp".to_string(),
+            guest_path: "/workspace".to_string(),
+            read_only: true,
+        }];
+        let err = validate_mounts_with_cwd(&mounts, false, cwd).unwrap_err();
+        assert!(err.to_string().contains("outside the current working directory"));
+    }
+
+    #[test]
+    fn root_host_path_rejected() {
+        let cwd = std::path::Path::new("/Users/testuser/project");
+        let mounts = vec![MountConfig {
+            host_path: "/".to_string(),
+            guest_path: "/workspace".to_string(),
+            read_only: true,
+        }];
+        let err = validate_mounts_with_cwd(&mounts, false, cwd).unwrap_err();
+        assert!(err.to_string().contains("mounting '/'"));
+    }
+
+    #[test]
+    fn empty_mounts_passes() {
+        let cwd = std::env::current_dir().unwrap();
+        assert!(validate_mounts_with_cwd(&[], false, &cwd).is_ok());
+    }
+
+    #[test]
+    fn cwd_root_rejected() {
+        let mounts = vec![MountConfig {
+            host_path: "/usr".to_string(),
+            guest_path: "/workspace".to_string(),
+            read_only: true,
+        }];
+        let err = validate_mounts_with_cwd(&mounts, false, std::path::Path::new("/")).unwrap_err();
+        assert!(err.to_string().contains("current working directory is '/'"));
+    }
 }

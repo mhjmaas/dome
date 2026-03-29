@@ -26,6 +26,7 @@ use shuru_proto::{
 pub struct MountConfig {
     pub host_path: String,
     pub guest_path: String,
+    pub read_only: bool,
 }
 
 // --- VmConfigBuilder ---
@@ -171,13 +172,12 @@ impl VmConfigBuilder {
 
         for (i, m) in self.mounts.iter().enumerate() {
             let tag = format!("mount{}", i);
-            // Host directory is always read-only from the VM side.
-            // Overlay mode uses tmpfs upper layer inside the guest.
-            let shared_dir = SharedDirectory::new(&m.host_path, true);
+            let shared_dir = SharedDirectory::new(&m.host_path, m.read_only);
             fs_devices.push(VirtioFileSystemDevice::new(&tag, &shared_dir));
             mount_requests.push(MountRequest {
                 tag,
                 guest_path: m.guest_path.clone(),
+                read_only: m.read_only,
             });
         }
 

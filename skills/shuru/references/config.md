@@ -10,8 +10,9 @@ Place `shuru.json` in the project root (or pass `--config <path>`). All fields a
 | `memory` | number | 2048 | Memory in MB |
 | `disk_size` | number | 4096 | Disk size in MB |
 | `allow_net` | boolean | false | Enable networking |
+| `allow_host_writes` | boolean | false | Allow `:rw` mounts to write to host filesystem |
 | `ports` | string[] | [] | Port forwards, `"HOST:GUEST"` format |
-| `mounts` | string[] | [] | Directory mounts, `"HOST:GUEST"` format |
+| `mounts` | string[] | [] | Directory mounts, `"HOST:GUEST[:ro\|:rw]"` format (default: ro) |
 | `command` | string[] | ["/bin/sh"] | Default command to run |
 | `secrets` | object | {} | Secrets to inject via proxy (see below) |
 | `network` | object | {} | Network access policy (see below) |

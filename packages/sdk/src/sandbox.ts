@@ -199,6 +199,7 @@ export function buildArgs(bin: string, opts: StartOptions): string[] {
 	if (opts.memory) args.push("--memory", String(opts.memory));
 	if (opts.diskSize) args.push("--disk-size", String(opts.diskSize));
 	if (opts.allowNet) args.push("--allow-net");
+	if (opts.allowHostWrites) args.push("--allow-host-writes");
 
 	if (opts.secrets) {
 		for (const [name, secret] of Object.entries(opts.secrets)) {
