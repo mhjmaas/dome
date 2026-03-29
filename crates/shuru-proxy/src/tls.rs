@@ -91,8 +91,13 @@ impl CertificateAuthority {
 mod tests {
     use super::*;
 
+    fn init_crypto() {
+        let _ = rustls::crypto::aws_lc_rs::default_provider().install_default();
+    }
+
     #[test]
     fn test_server_config_alpn_h1_only() {
+        init_crypto();
         let mut ca = CertificateAuthority::new().unwrap();
         let config = ca.server_config_for_domain("example.com").unwrap();
         assert_eq!(config.alpn_protocols, vec![b"http/1.1".to_vec()]);
@@ -100,6 +105,7 @@ mod tests {
 
     #[test]
     fn test_server_config_cached() {
+        init_crypto();
         let mut ca = CertificateAuthority::new().unwrap();
         let c1 = ca.server_config_for_domain("example.com").unwrap();
         let c2 = ca.server_config_for_domain("example.com").unwrap();

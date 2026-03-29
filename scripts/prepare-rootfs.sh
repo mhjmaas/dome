@@ -38,21 +38,7 @@ else
     echo "==> Kernel already present."
 fi
 
-GUEST_HASH=$(shasum -a 256 "$GUEST_BINARY" | cut -d' ' -f1)
-STORED_GUEST_HASH=""
-STORED_INITRAMFS_HASH=""
-if [ -f "${DATA_DIR}/.guest-hash" ]; then
-    STORED_GUEST_HASH=$(cat "${DATA_DIR}/.guest-hash")
-fi
-if [ -f "${DATA_DIR}/.initramfs-hash" ]; then
-    STORED_INITRAMFS_HASH=$(cat "${DATA_DIR}/.initramfs-hash")
-fi
-CURRENT_INITRAMFS_HASH=""
-if [ -f "$INITRAMFS_PATH" ]; then
-    CURRENT_INITRAMFS_HASH=$(shasum -a 256 "$INITRAMFS_PATH" | cut -d' ' -f1)
-fi
-
-if [ ! -f "$INITRAMFS_PATH" ] || [ "$GUEST_HASH" != "$STORED_GUEST_HASH" ] || [ "$CURRENT_INITRAMFS_HASH" != "$STORED_INITRAMFS_HASH" ]; then
+if [ ! -f "$INITRAMFS_PATH" ]; then
     echo "==> Building minimal initramfs..."
 
     docker run --rm \
@@ -102,11 +88,9 @@ INITEOF
             find . | cpio -o -H newc 2>/dev/null | gzip > /output/initramfs.cpio.gz
             echo "==> Initramfs created: $(du -h /output/initramfs.cpio.gz | cut -f1)"
         '
-    echo "$GUEST_HASH" > "${DATA_DIR}/.guest-hash"
-    shasum -a 256 "$INITRAMFS_PATH" | cut -d' ' -f1 > "${DATA_DIR}/.initramfs-hash"
     echo "    Initramfs saved to ${INITRAMFS_PATH}"
 else
-    echo "==> Initramfs already present (guest binary unchanged)."
+    echo "==> Initramfs already present."
 fi
 
 if [ -f "$ROOTFS_IMG" ]; then
