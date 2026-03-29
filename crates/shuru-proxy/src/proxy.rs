@@ -2,12 +2,10 @@ use std::collections::HashMap;
 use std::net::SocketAddr;
 use std::sync::Arc;
 
-use rustls::pki_types::ServerName;
-use rustls::RootCertStore;
+use boring::ssl::{SslConnector, SslMethod};
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::TcpStream;
 use tokio::sync::mpsc;
-use tokio_rustls::TlsConnector;
 use tracing::{debug, info};
 
 use crate::config::ProxyConfig;
@@ -20,6 +18,10 @@ use crate::tls::CertificateAuthority;
 ///
 /// Receives events from the smoltcp NetworkStack and proxies TCP connections
 /// to the real internet, with optional MITM for secret injection.
+///
+/// Uses BoringSSL (Chrome's TLS stack) for upstream connections so that
+/// Cloudflare-protected sites accept the TLS fingerprint. The client-side
+/// (guest <-> proxy) uses rustls with our generated CA cert.
 pub struct ProxyEngine {
     config: Arc<ProxyConfig>,
     event_rx: mpsc::UnboundedReceiver<StackEvent>,
@@ -27,7 +29,7 @@ pub struct ProxyEngine {
     connections: HashMap<ConnectionId, mpsc::UnboundedSender<Vec<u8>>>,
     placeholders: Arc<HashMap<String, String>>,
     ca: Arc<tokio::sync::Mutex<CertificateAuthority>>,
-    upstream_tls: TlsConnector,
+    upstream_ssl: SslConnector,
 }
 
 impl ProxyEngine {
@@ -38,13 +40,13 @@ impl ProxyEngine {
         ca: CertificateAuthority,
         placeholders: HashMap<String, String>,
     ) -> Self {
-        let root_store = RootCertStore {
-            roots: webpki_roots::TLS_SERVER_ROOTS.into(),
-        };
-        let client_config = rustls::ClientConfig::builder()
-            .with_root_certificates(root_store)
-            .with_no_client_auth();
-        let upstream_tls = TlsConnector::from(Arc::new(client_config));
+        // BoringSSL upstream connector — Chrome's TLS stack so Cloudflare
+        // doesn't reject our MITM connections based on JA3/JA4 fingerprint.
+        let mut builder = SslConnector::builder(SslMethod::tls()).expect("SslConnector");
+        builder
+            .set_alpn_protos(b"\x08http/1.1")
+            .expect("ALPN");
+        let upstream_ssl = builder.build();
 
         ProxyEngine {
             config: Arc::new(config),
@@ -53,7 +55,7 @@ impl ProxyEngine {
             connections: HashMap::new(),
             placeholders: Arc::new(placeholders),
             ca: Arc::new(tokio::sync::Mutex::new(ca)),
-            upstream_tls,
+            upstream_ssl,
         }
     }
 
@@ -94,7 +96,7 @@ impl ProxyEngine {
         let config = self.config.clone();
         let ca = self.ca.clone();
         let placeholders = self.placeholders.clone();
-        let upstream_tls = self.upstream_tls.clone();
+        let upstream_ssl = self.upstream_ssl.clone();
 
         tokio::spawn(async move {
             if let Err(e) = handle_connection(
@@ -105,7 +107,7 @@ impl ProxyEngine {
                 &config,
                 ca,
                 &placeholders,
-                upstream_tls,
+                upstream_ssl,
             )
             .await
             {
@@ -124,7 +126,7 @@ async fn handle_connection(
     config: &ProxyConfig,
     ca: Arc<tokio::sync::Mutex<CertificateAuthority>>,
     placeholders: &HashMap<String, String>,
-    upstream_tls: TlsConnector,
+    upstream_ssl: SslConnector,
 ) -> anyhow::Result<()> {
     let is_tls = dst.port() == 443;
 
@@ -165,7 +167,7 @@ async fn handle_connection(
                     cmd_tx,
                     ca,
                     substitutions,
-                    upstream_tls,
+                    upstream_ssl,
                 )
                 .await;
             }
@@ -236,7 +238,7 @@ async fn blind_relay(
     Ok(())
 }
 
-/// MITM: terminate TLS on both sides, relay with secret substitution.
+/// MITM: terminate TLS on both sides, relay HTTP/1.1 with secret substitution.
 async fn handle_mitm(
     id: ConnectionId,
     dst: SocketAddr,
@@ -246,72 +248,68 @@ async fn handle_mitm(
     cmd_tx: mpsc::UnboundedSender<StackCommand>,
     ca: Arc<tokio::sync::Mutex<CertificateAuthority>>,
     substitutions: Vec<(String, String)>,
-    upstream_tls: TlsConnector,
+    upstream_ssl: SslConnector,
 ) -> anyhow::Result<()> {
-    // Get fake cert for this domain
     let acceptor = {
         let mut ca = ca.lock().await;
         ca.acceptor_for_domain(&domain)?
     };
 
-    // Wrap guest data channel as AsyncRead+AsyncWrite
     let mut guest_stream = ChannelStream::new(id, data_rx, cmd_tx.clone());
     guest_stream.prepend(first_chunk);
 
-    // TLS handshake with guest (fake cert)
-    let mut guest_tls = acceptor.accept(guest_stream).await?;
+    // Client-side: rustls with our generated CA cert
+    let guest_tls = acceptor.accept(guest_stream).await?;
 
-    // Open real TLS connection to upstream
+    // Upstream: BoringSSL — Chrome's TLS fingerprint passes Cloudflare
     let upstream_tcp = TcpStream::connect(dst).await?;
-    let server_name = ServerName::try_from(domain.clone())?;
-    let mut upstream_tls_stream = upstream_tls.connect(server_name, upstream_tcp).await?;
+    let upstream_tls = tokio_boring::connect(
+        upstream_ssl.configure()?,
+        &domain,
+        upstream_tcp,
+    )
+    .await
+    .map_err(|e| anyhow::anyhow!("BoringSSL connect to {domain}: {e}"))?;
 
-    if substitutions.is_empty() {
-        // No substitutions needed, just relay
-        tokio::io::copy_bidirectional(&mut guest_tls, &mut upstream_tls_stream).await?;
-    } else {
-        // Relay with secret substitution
-        let (mut guest_rd, mut guest_wr) = tokio::io::split(guest_tls);
-        let (mut upstream_rd, mut upstream_wr) = tokio::io::split(upstream_tls_stream);
+    // HTTP/1.1 text-based relay with secret substitution
+    let (mut guest_rd, mut guest_wr) = tokio::io::split(guest_tls);
+    let (mut upstream_rd, mut upstream_wr) = tokio::io::split(upstream_tls);
 
-        let subs = substitutions.clone();
-        let guest_to_upstream = async move {
-            let mut buf = vec![0u8; 65536];
-            loop {
-                match guest_rd.read(&mut buf).await {
-                    Ok(0) | Err(_) => break,
-                    Ok(n) => {
-                        let mut data = buf[..n].to_vec();
-                        // Replace placeholder tokens with real values
-                        for (placeholder, real_value) in &subs {
-                            data = replace_bytes(&data, placeholder.as_bytes(), real_value.as_bytes());
-                        }
-                        if upstream_wr.write_all(&data).await.is_err() {
-                            break;
-                        }
+    let guest_to_upstream = async move {
+        let mut buf = vec![0u8; 65536];
+        loop {
+            match guest_rd.read(&mut buf).await {
+                Ok(0) | Err(_) => break,
+                Ok(n) => {
+                    let mut data = buf[..n].to_vec();
+                    for (placeholder, real_value) in &substitutions {
+                        data = replace_bytes(&data, placeholder.as_bytes(), real_value.as_bytes());
+                    }
+                    if upstream_wr.write_all(&data).await.is_err() {
+                        break;
                     }
                 }
             }
-        };
-
-        let upstream_to_guest = async move {
-            let mut buf = vec![0u8; 65536];
-            loop {
-                match upstream_rd.read(&mut buf).await {
-                    Ok(0) | Err(_) => break,
-                    Ok(n) => {
-                        if guest_wr.write_all(&buf[..n]).await.is_err() {
-                            break;
-                        }
-                    }
-                }
-            }
-        };
-
-        tokio::select! {
-            _ = guest_to_upstream => {},
-            _ = upstream_to_guest => {},
         }
+    };
+
+    let upstream_to_guest = async move {
+        let mut buf = vec![0u8; 65536];
+        loop {
+            match upstream_rd.read(&mut buf).await {
+                Ok(0) | Err(_) => break,
+                Ok(n) => {
+                    if guest_wr.write_all(&buf[..n]).await.is_err() {
+                        break;
+                    }
+                }
+            }
+        }
+    };
+
+    tokio::select! {
+        _ = guest_to_upstream => {},
+        _ = upstream_to_guest => {},
     }
 
     let _ = cmd_tx.send(StackCommand::Close { id });

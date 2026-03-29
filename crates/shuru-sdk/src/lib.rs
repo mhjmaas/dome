@@ -223,9 +223,17 @@ impl AsyncSandbox {
         reply_rx.await?
     }
 
-    /// Execute a shell command string via `/bin/sh -c`.
+    /// Execute a command string via the given shell (defaults to `/bin/sh`).
     pub async fn exec_shell(&self, command: &str) -> Result<ExecResult> {
-        self.exec(&["/bin/sh", "-c", command]).await
+        self.exec_in("/bin/sh", command).await
+    }
+
+    /// Execute a command string via a specific shell.
+    ///
+    /// Use `exec_in("bash", cmd)` when you need login profile (PATH etc.),
+    /// or `exec_in("/bin/sh", cmd)` for basic POSIX shell.
+    pub async fn exec_in(&self, shell: &str, command: &str) -> Result<ExecResult> {
+        self.exec(&[shell, "-c", command]).await
     }
 
     /// Spawn an interactive shell with PTY support.

@@ -78,10 +78,31 @@ impl CertificateAuthority {
         let ca_cert_der = CertificateDer::from(self.ca_cert.der().to_vec());
         let key_der = PrivateKeyDer::Pkcs8(PrivatePkcs8KeyDer::from(key.serialize_der()));
 
-        let config = ServerConfig::builder()
+        let mut config = ServerConfig::builder()
             .with_no_client_auth()
             .with_single_cert(vec![cert_der, ca_cert_der], key_der)?;
+        config.alpn_protocols = vec![b"http/1.1".to_vec()];
 
         Ok(config)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_server_config_alpn_h1_only() {
+        let mut ca = CertificateAuthority::new().unwrap();
+        let config = ca.server_config_for_domain("example.com").unwrap();
+        assert_eq!(config.alpn_protocols, vec![b"http/1.1".to_vec()]);
+    }
+
+    #[test]
+    fn test_server_config_cached() {
+        let mut ca = CertificateAuthority::new().unwrap();
+        let c1 = ca.server_config_for_domain("example.com").unwrap();
+        let c2 = ca.server_config_for_domain("example.com").unwrap();
+        assert!(Arc::ptr_eq(&c1, &c2));
     }
 }
