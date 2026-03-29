@@ -411,6 +411,8 @@ fn boot_vm(
     // Determine rootfs source (checkpoint or base)
     let source = match &config.from {
         Some(name) => {
+            shuru_vm::validate_checkpoint_name(name)
+                .map_err(|e| anyhow::anyhow!(e))?;
             let path = format!("{}/checkpoints/{}.ext4", data_dir, name);
             if !std::path::Path::new(&path).exists() {
                 bail!("Checkpoint '{}' not found", name);
@@ -560,6 +562,8 @@ fn run_vm_loop(
             }
             SandboxCmd::Checkpoint { name, reply } => {
                 let result = (|| -> Result<()> {
+                    shuru_vm::validate_checkpoint_name(&name)
+                        .map_err(|e| anyhow::anyhow!(e))?;
                     let data_dir = shuru_vm::default_data_dir();
                     let checkpoints_dir = format!("{}/checkpoints", data_dir);
                     std::fs::create_dir_all(&checkpoints_dir)?;

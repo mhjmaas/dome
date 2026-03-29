@@ -22,6 +22,9 @@ pub(crate) fn create(
         vec!["/bin/sh".to_string()]
     };
 
+    shuru_vm::validate_checkpoint_name(&name)
+        .map_err(|e| anyhow::anyhow!(e))?;
+
     let data_dir = shuru_vm::default_data_dir();
     let checkpoints_dir = format!("{}/checkpoints", data_dir);
     let checkpoint_path = format!("{}/{}.ext4", checkpoints_dir, name);
@@ -104,6 +107,9 @@ pub(crate) fn list() -> Result<()> {
 }
 
 pub(crate) fn delete(name: &str) -> Result<()> {
+    shuru_vm::validate_checkpoint_name(name)
+        .map_err(|e| anyhow::anyhow!(e))?;
+
     let data_dir = default_data_dir();
     let checkpoint_path = format!("{}/checkpoints/{}.ext4", data_dir, name);
     if !std::path::Path::new(&checkpoint_path).exists() {

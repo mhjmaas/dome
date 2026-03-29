@@ -145,6 +145,8 @@ pub(crate) fn prepare_vm(
     let checkpoints_dir = format!("{}/checkpoints", data_dir);
     let source = match from {
         Some(name) => {
+            shuru_vm::validate_checkpoint_name(name)
+                .map_err(|e| anyhow::anyhow!(e))?;
             let path = format!("{}/{}.ext4", checkpoints_dir, name);
             if !std::path::Path::new(&path).exists() {
                 bail!("Checkpoint '{}' not found", name);

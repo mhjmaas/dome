@@ -15,6 +15,7 @@
 ### VM (`shuru-vm` 0.3.2)
 
 - `MountConfig` gains `read_only: bool` field. Consumers must add this field (`true` preserves existing behavior).
+- `validate_checkpoint_name()` rejects path traversal in checkpoint names (fixes #17)
 
 ### Guest (`shuru-guest` 0.3.1)
 
@@ -33,6 +34,7 @@
 ### SDK (`shuru-sdk` 0.3.2)
 
 - Re-exports updated `MountConfig` with `read_only` field
+- Checkpoint name validation on boot and save
 
 ### TypeScript SDK (`@superhq/shuru` 0.4.1)
 

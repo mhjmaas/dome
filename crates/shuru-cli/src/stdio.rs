@@ -901,6 +901,10 @@ fn handle_checkpoint(
         return send_error_shared(out, id, SERVER_ERROR, format!("checkpoint sync failed: {}", e));
     }
 
+    if let Err(msg) = shuru_vm::validate_checkpoint_name(name) {
+        return send_error_shared(out, id, SERVER_ERROR, msg);
+    }
+
     let data_dir = shuru_vm::default_data_dir();
     let checkpoints_dir = format!("{}/checkpoints", data_dir);
     let checkpoint_path = format!("{}/{}.ext4", checkpoints_dir, name);
