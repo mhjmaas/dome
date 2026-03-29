@@ -48,8 +48,8 @@ Share host directories into the VM using VirtioFS. By default the host directory
 shuru run --mount ./src:/workspace -- touch /workspace/test.txt
 ls ./src/test.txt   # not found — write stayed in the overlay
 
-# Read-write mount (guest writes land on host)
-shuru run --mount ./src:/workspace:rw -- touch /workspace/test.txt
+# Read-write mount (guest writes land on host, requires --allow-host-writes)
+shuru run --allow-host-writes --mount ./src:/workspace:rw -- touch /workspace/test.txt
 ls ./src/test.txt   # found — write went to host
 
 # Multiple mounts

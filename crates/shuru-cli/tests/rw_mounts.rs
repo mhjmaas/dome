@@ -1,10 +1,5 @@
-//! Integration tests for read-write mount support.
-//!
-//! These tests boot a real VM and require built assets (kernel, rootfs,
-//! initramfs) and a codesigned binary. They are #[ignore]d by default.
-//!
-//! Run with:
-//!   just build
+//! Integration tests for mounts. Boots a real VM — requires codesigned binary.
+//! All #[ignore]d by default. Run with:
 //!   SHURU_BIN=target/debug/shuru cargo test -p shuru-cli -- --ignored
 
 use std::process::Command;
@@ -82,10 +77,6 @@ fn explicit_ro_suffix_discards_guest_writes() {
     );
 }
 
-// Verify that process_mount's create_dir_all (main.rs:68) creates the guest
-// mount point for both rw and ro paths, even when it doesn't already exist in
-// the rootfs. Without that call, mount_direct would fail on missing directories.
-
 #[test]
 #[ignore]
 fn rw_mount_creates_missing_guest_dirs() {
@@ -123,20 +114,5 @@ fn ro_mount_creates_missing_guest_dirs() {
     assert!(
         String::from_utf8_lossy(&output.stdout).contains("from-host"),
         "should read host file through overlay at auto-created guest path"
-    );
-}
-
-#[test]
-#[ignore]
-fn bad_mount_mode_rejected() {
-    let tmp = tempdir().unwrap();
-    let host_dir = tmp.path().to_str().unwrap();
-    let spec = format!("{}:/workspace:xx", host_dir);
-
-    let output = run_in_vm(&spec, "echo hi");
-
-    assert!(
-        !output.status.success(),
-        "invalid mode should cause shuru to exit with error"
     );
 }

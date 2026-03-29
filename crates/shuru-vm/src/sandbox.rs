@@ -172,8 +172,6 @@ impl VmConfigBuilder {
 
         for (i, m) in self.mounts.iter().enumerate() {
             let tag = format!("mount{}", i);
-            // read_only=true (default): guest writes go to tmpfs overlay, host unchanged.
-            // read_only=false (:rw): guest writes go directly to the host filesystem.
             let shared_dir = SharedDirectory::new(&m.host_path, m.read_only);
             fs_devices.push(VirtioFileSystemDevice::new(&tag, &shared_dir));
             mount_requests.push(MountRequest {

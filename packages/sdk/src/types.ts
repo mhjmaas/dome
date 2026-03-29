@@ -16,7 +16,10 @@ export interface StartOptions {
 	memory?: number;
 	diskSize?: number;
 	allowNet?: boolean;
+	/** Allow :rw mounts to write to host filesystem. Default: false. */
+	allowHostWrites?: boolean;
 	ports?: string[];
+	/** Directory mounts. Key is host path, value is guest path or guest path with mode suffix (e.g. "/workspace" or "/workspace:rw"). */
 	mounts?: Record<string, string>;
 	secrets?: Record<string, SecretConfig>;
 	network?: NetworkConfig;
