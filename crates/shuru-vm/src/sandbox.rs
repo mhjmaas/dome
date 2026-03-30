@@ -40,6 +40,7 @@ pub struct VmConfigBuilder {
     console: bool,
     verbose: bool,
     network_fd: Option<i32>,
+    nbd_uri: Option<String>,
     mounts: Vec<MountConfig>,
 }
 
@@ -54,6 +55,7 @@ impl VmConfigBuilder {
             console: true,
             verbose: false,
             network_fd: None,
+            nbd_uri: None,
             mounts: Vec::new(),
         }
     }
@@ -104,6 +106,12 @@ impl VmConfigBuilder {
         self
     }
 
+    /// Use an NBD server for the root disk instead of a direct disk image.
+    pub fn nbd_uri(mut self, uri: impl Into<String>) -> Self {
+        self.nbd_uri = Some(uri.into());
+        self
+    }
+
     /// Add a host directory mount (virtio-fs).
     pub fn mount(mut self, config: MountConfig) -> Self {
         self.mounts.push(config);
@@ -149,14 +157,22 @@ impl VmConfigBuilder {
         let serial = VirtioConsoleSerialPort::new_with_attachment(&serial_attachment);
         config.set_serial_ports(&[serial]);
 
-        let disk_attachment = DiskImageAttachment::new_with_options(
-            &rootfs_path,
-            false,
-            DiskImageCachingMode::Cached,
-            DiskImageSynchronizationMode::Fsync,
-        )
-        .map_err(|e| anyhow::anyhow!("Failed to create disk attachment: {}", e))?;
-        let block_device = VirtioBlockDevice::new(&disk_attachment);
+        let nbd_attachment;
+        let disk_attachment;
+        let block_device = if let Some(ref uri) = self.nbd_uri {
+            nbd_attachment = NbdAttachment::new(uri, 30.0, false)
+                .map_err(|e| anyhow::anyhow!("Failed to create NBD attachment: {}", e))?;
+            VirtioBlockDevice::new(&nbd_attachment)
+        } else {
+            disk_attachment = DiskImageAttachment::new_with_options(
+                &rootfs_path,
+                false,
+                DiskImageCachingMode::Cached,
+                DiskImageSynchronizationMode::Fsync,
+            )
+            .map_err(|e| anyhow::anyhow!("Failed to create disk attachment: {}", e))?;
+            VirtioBlockDevice::new(&disk_attachment)
+        };
         config.set_storage_devices(&[&block_device]);
 
         if let Some(fd) = self.network_fd {

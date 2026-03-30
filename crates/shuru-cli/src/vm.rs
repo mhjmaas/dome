@@ -31,7 +31,10 @@ use crate::config::ShuruConfig;
 
 pub(crate) struct PreparedVm {
     pub instance_dir: String,
+    pub source_rootfs: String,
     pub work_rootfs: String,
+    /// If restoring from a CAS checkpoint, the index path.
+    pub cas_index: Option<String>,
     pub kernel_path: String,
     pub initrd_path: Option<String>,
     pub cpus: usize,
@@ -143,15 +146,22 @@ pub(crate) fn prepare_vm(
 
     // Determine source for working copy: checkpoint or base rootfs
     let checkpoints_dir = format!("{}/checkpoints", data_dir);
+    let mut cas_index: Option<String> = None;
     let source = match from {
         Some(name) => {
             shuru_vm::validate_checkpoint_name(name)
                 .map_err(|e| anyhow::anyhow!(e))?;
-            let path = format!("{}/{}.ext4", checkpoints_dir, name);
-            if !std::path::Path::new(&path).exists() {
+            // Check .idx (CAS) first, then .ext4 (legacy)
+            let idx_path = format!("{}/{}.idx", checkpoints_dir, name);
+            let ext4_path = format!("{}/{}.ext4", checkpoints_dir, name);
+            if std::path::Path::new(&idx_path).exists() {
+                cas_index = Some(idx_path.clone());
+                idx_path
+            } else if std::path::Path::new(&ext4_path).exists() {
+                ext4_path
+            } else {
                 bail!("Checkpoint '{}' not found", name);
             }
-            path
         }
         None => {
             if !std::path::Path::new(&rootfs_path).exists() {
@@ -169,10 +179,19 @@ pub(crate) fn prepare_vm(
     let _ = std::fs::remove_dir_all(&instance_dir);
     std::fs::create_dir_all(&instance_dir)?;
     let work_rootfs = format!("{}/rootfs.ext4", instance_dir);
-    if verbose {
-        eprintln!("shuru: creating working copy...");
+
+    // CAS checkpoints don't need a file copy — the NBD server reads from the chunk store.
+    // We still need a rootfs file for the VM builder (kernel cmdline root=), but it can be
+    // a dummy for CAS mode since I/O goes through NBD.
+    if cas_index.is_none() {
+        if verbose {
+            eprintln!("shuru: creating working copy...");
+        }
+        clone_file(&source, &work_rootfs)?;
+    } else {
+        // Create a minimal placeholder so the VM builder doesn't fail
+        std::fs::File::create(&work_rootfs)?;
     }
-    clone_file(&source, &work_rootfs)?;
 
     // Extend to requested disk size
     let f = std::fs::OpenOptions::new()
@@ -204,7 +223,9 @@ pub(crate) fn prepare_vm(
 
     Ok(PreparedVm {
         instance_dir,
+        source_rootfs: source,
         work_rootfs,
+        cas_index,
         kernel_path,
         initrd_path,
         cpus,
@@ -221,6 +242,7 @@ pub(crate) fn build_sandbox(
     prepared: &PreparedVm,
     console: bool,
     network_fd: Option<i32>,
+    nbd_uri: Option<&str>,
 ) -> Result<Sandbox> {
     let mut builder = Sandbox::builder()
         .kernel(&prepared.kernel_path)
@@ -234,6 +256,10 @@ pub(crate) fn build_sandbox(
         builder = builder.network_fd(fd);
     }
 
+    if let Some(uri) = nbd_uri {
+        builder = builder.nbd_uri(uri);
+    }
+
     if let Some(initrd) = &prepared.initrd_path {
         builder = builder.initrd(initrd);
     }
@@ -245,7 +271,36 @@ pub(crate) fn build_sandbox(
     builder.build()
 }
 
-pub(crate) fn run_command(prepared: &PreparedVm, command: &[String]) -> Result<i32> {
+/// Start the CAS NBD server for a prepared VM, respecting SHURU_STORAGE=direct fallback.
+pub(crate) fn start_nbd(prepared: &PreparedVm) -> Result<Option<shuru_store::NbdHandle>> {
+    if std::env::var("SHURU_STORAGE").unwrap_or_default() == "direct" {
+        return Ok(None);
+    }
+    let socket_path = format!("{}/nbd.sock", prepared.instance_dir);
+    let data_dir = shuru_vm::default_data_dir();
+    let cas_dir = format!("{}/cas", data_dir);
+    let index_path = if let Some(ref idx) = prepared.cas_index {
+        idx.clone()
+    } else {
+        let source_hash = blake3::hash(prepared.source_rootfs.as_bytes()).to_hex();
+        format!("{}/cas/indexes/{}.idx", data_dir, &source_hash[..16])
+    };
+    let target_size = prepared.disk_size * 1024 * 1024;
+    Ok(Some(shuru_store::start_cas_nbd_server(
+        &prepared.source_rootfs,
+        &cas_dir,
+        &index_path,
+        &socket_path,
+        target_size,
+    )?))
+}
+
+pub(crate) struct RunResult {
+    pub exit_code: i32,
+    pub nbd_handle: Option<shuru_store::NbdHandle>,
+}
+
+pub(crate) fn run_command(prepared: &PreparedVm, command: &[String]) -> Result<RunResult> {
     if prepared.verbose {
         eprintln!("shuru: kernel={}", prepared.kernel_path);
         eprintln!("shuru: rootfs={} (work copy)", prepared.work_rootfs);
@@ -269,7 +324,10 @@ pub(crate) fn run_command(prepared: &PreparedVm, command: &[String]) -> Result<i
         (None, None)
     };
 
-    let sandbox = build_sandbox(prepared, false, vm_fd)?;
+    let nbd_handle = start_nbd(prepared)?;
+    let nbd_uri = nbd_handle.as_ref().map(|h| h.uri());
+
+    let sandbox = build_sandbox(prepared, false, vm_fd, nbd_uri.as_deref())?;
     if prepared.verbose {
         eprintln!("shuru: VM created and validated successfully");
     }
@@ -315,7 +373,7 @@ pub(crate) fn run_command(prepared: &PreparedVm, command: &[String]) -> Result<i
 
     drop(proxy_handle);
     let _ = sandbox.stop();
-    Ok(exit_code)
+    Ok(RunResult { exit_code, nbd_handle })
 }
 
 /// Pure string validation — no filesystem access. Separated from `parse_mount_spec`

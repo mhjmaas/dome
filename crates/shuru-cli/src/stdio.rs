@@ -323,7 +323,10 @@ pub(crate) fn run_stdio(prepared: &PreparedVm) -> Result<i32> {
         (None, None)
     };
 
-    let sandbox = Arc::new(vm::build_sandbox(prepared, false, vm_fd)?);
+    let nbd_handle = vm::start_nbd(prepared)?;
+    let nbd_uri = nbd_handle.as_ref().map(|h| h.uri());
+
+    let sandbox = Arc::new(vm::build_sandbox(prepared, false, vm_fd, nbd_uri.as_deref())?);
     sandbox.start()?;
 
     // Inject CA cert and secret placeholders when MITM is needed
