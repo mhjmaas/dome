@@ -594,7 +594,8 @@ mod guest {
         let mut body = response.into_body().into_reader();
 
         if req.extract {
-            // Stream through gzip + tar, reporting progress
+            // Stream through gzip + tar, reporting progress.
+            // Strip one leading path component so e.g. node-v22/bin/node -> bin/node.
             let progress_writer = DownloadProgressWriter { writer, bytes: 0, total_bytes, last_report: 0 };
             let tee = TeeReader::new(&mut body, progress_writer);
             let decoder = flate2::read::GzDecoder::new(tee);
@@ -604,9 +605,43 @@ mod guest {
                 send_fs_err(writer, format!("mkdir {}: {e}", req.path));
                 return;
             }
-            if let Err(e) = archive.unpack(&req.path) {
-                send_fs_err(writer, format!("extract to {}: {e}", req.path));
-                return;
+
+            let dest = std::path::Path::new(&req.path);
+            let entries = match archive.entries() {
+                Ok(e) => e,
+                Err(e) => {
+                    send_fs_err(writer, format!("read tar entries: {e}"));
+                    return;
+                }
+            };
+            for entry in entries {
+                let mut entry = match entry {
+                    Ok(e) => e,
+                    Err(e) => {
+                        send_fs_err(writer, format!("tar entry: {e}"));
+                        return;
+                    }
+                };
+                let path = match entry.path() {
+                    Ok(p) => p.into_owned(),
+                    Err(e) => {
+                        send_fs_err(writer, format!("tar path: {e}"));
+                        return;
+                    }
+                };
+                // Strip the first path component (e.g. "node-v22.16.0-linux-arm64/")
+                let stripped = path.components().skip(1).collect::<std::path::PathBuf>();
+                if stripped.as_os_str().is_empty() {
+                    continue; // skip the top-level directory entry itself
+                }
+                let out_path = dest.join(&stripped);
+                if let Some(parent) = out_path.parent() {
+                    let _ = std::fs::create_dir_all(parent);
+                }
+                if let Err(e) = entry.unpack(&out_path) {
+                    send_fs_err(writer, format!("extract {}: {e}", stripped.display()));
+                    return;
+                }
             }
         } else {
             // Download to a single file
@@ -1517,6 +1552,9 @@ mod guest {
 
     pub fn run() -> ! {
         eprintln!("shuru-guest: starting as PID 1");
+
+        // Set PATH early so all child processes inherit it
+        std::env::set_var("PATH", "/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin");
 
         mount_filesystems();
         eprintln!("shuru-guest: filesystems mounted");
