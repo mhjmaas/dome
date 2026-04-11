@@ -788,10 +788,18 @@ impl Sandbox {
         let mut listeners = Vec::new();
 
         for mapping in forwards {
-            let addr = format!("127.0.0.1:{}", mapping.host_port);
-            let tcp_listener = TcpListener::bind(&addr)
+            let addr: std::net::SocketAddr = format!("127.0.0.1:{}", mapping.host_port)
+                .parse()
+                .with_context(|| format!("Invalid port {}", mapping.host_port))?;
+            let socket = socket2::Socket::new(socket2::Domain::IPV4, socket2::Type::STREAM, None)
+                .with_context(|| format!("Failed to create socket for port {}", mapping.host_port))?;
+            socket.set_reuse_address(true)?;
+            socket.bind(&addr.into())
                 .with_context(|| format!("Failed to bind port {}", mapping.host_port))?;
-            tcp_listener.set_nonblocking(true)?;
+            socket.listen(128)
+                .with_context(|| format!("Failed to listen on port {}", mapping.host_port))?;
+            socket.set_nonblocking(true)?;
+            let tcp_listener: TcpListener = socket.into();
 
             let guest_port = mapping.guest_port;
             let vm = Arc::clone(&self.vm);

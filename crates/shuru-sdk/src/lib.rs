@@ -244,6 +244,10 @@ enum SandboxCmd {
         path: String,
         reply: oneshot::Sender<Result<()>>,
     },
+    AddPortForward {
+        mapping: shuru_proto::PortMapping,
+        reply: oneshot::Sender<Result<()>>,
+    },
     Checkpoint {
         name: String,
         reply: oneshot::Sender<Result<()>>,
@@ -432,6 +436,18 @@ impl AsyncSandbox {
         self.cmd_tx
             .send(SandboxCmd::DiscardOverlay {
                 path: path.to_string(),
+                reply: reply_tx,
+            })
+            .map_err(|_| anyhow::anyhow!("VM thread exited"))?;
+        reply_rx.await?
+    }
+
+    /// Add a port forward to a running sandbox.
+    pub async fn add_port_forward(&self, host_port: u16, guest_port: u16) -> Result<()> {
+        let (reply_tx, reply_rx) = oneshot::channel();
+        self.cmd_tx
+            .send(SandboxCmd::AddPortForward {
+                mapping: shuru_proto::PortMapping { host_port, guest_port },
                 reply: reply_tx,
             })
             .map_err(|_| anyhow::anyhow!("VM thread exited"))?;
@@ -884,6 +900,8 @@ fn run_vm_loop(
 
     // Keep proxy_handle alive for the lifetime of the VM
     let _proxy = proxy_handle;
+    // Additional port forward handles added at runtime
+    let mut extra_fwd_handles: Vec<shuru_vm::PortForwardHandle> = Vec::new();
 
     while let Ok(cmd) = cmd_rx.recv() {
         match cmd {
@@ -933,6 +951,18 @@ fn run_vm_loop(
             }
             SandboxCmd::DiscardOverlay { path, reply } => {
                 let _ = reply.send(sandbox.discard_overlay(&path));
+            }
+            SandboxCmd::AddPortForward { mapping, reply } => {
+                let result = sandbox.start_port_forwarding(&[mapping]);
+                match result {
+                    Ok(handle) => {
+                        extra_fwd_handles.push(handle);
+                        let _ = reply.send(Ok(()));
+                    }
+                    Err(e) => {
+                        let _ = reply.send(Err(e));
+                    }
+                }
             }
             SandboxCmd::Checkpoint { name, reply } => {
                 let result = (|| -> Result<()> {
