@@ -58,6 +58,9 @@ pub struct SandboxConfig {
     pub from: Option<String>,
     /// Storage backend mode. Default: Direct (flat file with CoW).
     pub storage: StorageMode,
+    /// Default environment variables for all commands.
+    /// Merged with proxy placeholders; caller extra_env overrides both.
+    pub env: HashMap<String, String>,
 }
 
 impl Default for SandboxConfig {
@@ -75,6 +78,7 @@ impl Default for SandboxConfig {
             expose_host: vec![],
             from: None,
             storage: StorageMode::default(),
+            env: HashMap::new(),
         }
     }
 }
@@ -286,6 +290,7 @@ impl AsyncSandbox {
                             booted.fwd_handle,
                             #[cfg(feature = "cas")]
                             booted.nbd_handle,
+                            booted.default_env,
                         );
                     }
                     Err(e) => {
@@ -640,9 +645,11 @@ struct BootedVm {
     fwd_handle: Option<shuru_vm::PortForwardHandle>,
     #[cfg(feature = "cas")]
     nbd_handle: Option<shuru_store::NbdHandle>,
+    default_env: HashMap<String, String>,
 }
 
 fn boot_vm(config: SandboxConfig) -> Result<BootedVm> {
+    let default_env = config.env.clone();
     let data_dir = config
         .data_dir
         .unwrap_or_else(shuru_vm::default_data_dir);
@@ -855,6 +862,7 @@ fn boot_vm(config: SandboxConfig) -> Result<BootedVm> {
         fwd_handle,
         #[cfg(feature = "cas")]
         nbd_handle,
+        default_env,
     })
 }
 
@@ -866,12 +874,13 @@ fn run_vm_loop(
     proxy_handle: Option<shuru_proxy::ProxyHandle>,
     _fwd_handle: Option<shuru_vm::PortForwardHandle>,
     #[cfg(feature = "cas")] nbd_handle: Option<shuru_store::NbdHandle>,
+    default_env: HashMap<String, String>,
 ) {
-    // Secret placeholder env vars — passed to all commands
-    let env: HashMap<String, String> = proxy_handle
-        .as_ref()
-        .map(|h| h.placeholders.clone())
-        .unwrap_or_default();
+    // Base env: config defaults, then proxy placeholders on top
+    let mut env = default_env;
+    if let Some(ref handle) = proxy_handle {
+        env.extend(handle.placeholders.clone());
+    }
 
     // Keep proxy_handle alive for the lifetime of the VM
     let _proxy = proxy_handle;
