@@ -13,6 +13,7 @@ use crate::dns;
 use crate::stack::{ConnectionId, StackCommand, StackEvent, TcpConnection};
 use crate::stream::ChannelStream;
 use crate::tls::CertificateAuthority;
+use crate::AllowedIps;
 
 /// The async proxy engine.
 ///
@@ -30,6 +31,7 @@ pub struct ProxyEngine {
     placeholders: Arc<HashMap<String, String>>,
     ca: Arc<tokio::sync::Mutex<CertificateAuthority>>,
     upstream_ssl: SslConnector,
+    allowed_ips: AllowedIps,
 }
 
 impl ProxyEngine {
@@ -39,6 +41,7 @@ impl ProxyEngine {
         cmd_tx: mpsc::UnboundedSender<StackCommand>,
         ca: CertificateAuthority,
         placeholders: HashMap<String, String>,
+        allowed_ips: AllowedIps,
     ) -> Self {
         // BoringSSL upstream connector — Chrome's TLS stack so Cloudflare
         // doesn't reject our MITM connections based on JA3/JA4 fingerprint.
@@ -56,6 +59,7 @@ impl ProxyEngine {
             placeholders: Arc::new(placeholders),
             ca: Arc::new(tokio::sync::Mutex::new(ca)),
             upstream_ssl,
+            allowed_ips,
         }
     }
 
@@ -80,8 +84,9 @@ impl ProxyEngine {
                 StackEvent::DnsQuery { src, payload } => {
                     let cmd_tx = self.cmd_tx.clone();
                     let config = self.config.clone();
+                    let allowed_ips = self.allowed_ips.clone();
                     tokio::spawn(async move {
-                        dns::handle_dns_query(src, payload, cmd_tx, &config).await;
+                        dns::handle_dns_query(src, payload, cmd_tx, &config, &allowed_ips).await;
                     });
                 }
             }
@@ -97,6 +102,7 @@ impl ProxyEngine {
         let ca = self.ca.clone();
         let placeholders = self.placeholders.clone();
         let upstream_ssl = self.upstream_ssl.clone();
+        let allowed_ips = self.allowed_ips.clone();
 
         tokio::spawn(async move {
             if let Err(e) = handle_connection(
@@ -108,6 +114,7 @@ impl ProxyEngine {
                 ca,
                 &placeholders,
                 upstream_ssl,
+                &allowed_ips,
             )
             .await
             {
@@ -127,6 +134,7 @@ async fn handle_connection(
     ca: Arc<tokio::sync::Mutex<CertificateAuthority>>,
     placeholders: &HashMap<String, String>,
     upstream_ssl: SslConnector,
+    allowed_ips: &AllowedIps,
 ) -> anyhow::Result<()> {
     // Check if this is a connection to an exposed host port (host.shuru.internal).
     if let std::net::IpAddr::V4(ipv4) = dst.ip() {
@@ -139,6 +147,22 @@ async fn handle_connection(
             let upstream = TcpStream::connect(local_dst).await?;
             let (mut upstream_rd, mut upstream_wr) = upstream.into_split();
             return blind_relay(id, &mut upstream_rd, &mut upstream_wr, data_rx, cmd_tx).await;
+        }
+    }
+
+    // When a domain allowlist is active, only allow connections to IPs that
+    // were resolved via the DNS handler. This prevents bypass via hardcoded IPs.
+    if config.network.has_allowlist() {
+        if let std::net::IpAddr::V4(ipv4) = dst.ip() {
+            let is_allowed = allowed_ips
+                .read()
+                .expect("allowed_ips lock poisoned")
+                .contains(&ipv4);
+            if !is_allowed {
+                debug!("IP not in DNS-pinned set, rejecting: {dst}");
+                let _ = cmd_tx.send(StackCommand::Close { id });
+                return Err(anyhow::anyhow!("connection to {dst} blocked: IP not resolved via allowed DNS"));
+            }
         }
     }
 
@@ -167,6 +191,25 @@ async fn handle_connection(
 
         let sni = extract_sni(&tls_buf);
         debug!("TLS to {dst}, SNI: {sni:?}");
+
+        // When a domain allowlist is active, verify the SNI matches an
+        // allowed domain. This prevents connecting to non-allowed services
+        // that happen to share an IP with an allowed domain (e.g. CDN/Cloudflare).
+        if config.network.has_allowlist() {
+            match &sni {
+                Some(domain) if !config.is_domain_allowed(domain) => {
+                    debug!("SNI not in allowlist, rejecting: {domain}");
+                    let _ = cmd_tx.send(StackCommand::Close { id });
+                    return Err(anyhow::anyhow!("TLS to {dst} blocked: SNI '{domain}' not in allowlist"));
+                }
+                None => {
+                    debug!("no SNI in ClientHello, rejecting connection to {dst}");
+                    let _ = cmd_tx.send(StackCommand::Close { id });
+                    return Err(anyhow::anyhow!("TLS to {dst} blocked: no SNI"));
+                }
+                _ => {}
+            }
+        }
 
         if let Some(domain) = sni {
             let substitutions = config.secrets_for_domain(&domain, placeholders);

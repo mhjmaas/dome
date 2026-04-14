@@ -43,6 +43,13 @@ pub struct NetworkConfig {
     pub allow: Vec<String>,
 }
 
+impl NetworkConfig {
+    /// Returns true if a domain allowlist is configured.
+    pub fn has_allowlist(&self) -> bool {
+        !self.allow.is_empty()
+    }
+}
+
 impl ProxyConfig {
     /// Check if a domain is allowed by the network policy.
     /// Empty allowlist means all domains are allowed.
@@ -144,5 +151,16 @@ mod tests {
         assert!(domain_matches("*.example.com", "deep.api.example.com"));
         assert!(!domain_matches("*.example.com", "example.com"));
         assert!(!domain_matches("*.example.com", "notexample.com"));
+    }
+
+    #[test]
+    fn test_has_allowlist() {
+        let empty = NetworkConfig::default();
+        assert!(!empty.has_allowlist());
+
+        let with_entries = NetworkConfig {
+            allow: vec!["api.example.com".into()],
+        };
+        assert!(with_entries.has_allowlist());
     }
 }
