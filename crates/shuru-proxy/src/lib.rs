@@ -8,14 +8,22 @@ mod tls;
 
 pub use config::ProxyConfig;
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
+use std::net::Ipv4Addr;
 use std::os::unix::io::RawFd;
+use std::sync::{Arc, RwLock};
 
 use proxy::ProxyEngine;
 use stack::NetworkStack;
 use tls::CertificateAuthority;
 use tokio::sync::mpsc;
 use tracing::info;
+
+/// Set of IPs that the proxy is allowed to connect to.
+/// Populated by DNS resolution of allowed domains. When the domain allowlist
+/// is active, TCP connections to IPs not in this set are rejected — closing
+/// the bypass where a guest connects directly to a hardcoded IP.
+pub type AllowedIps = Arc<RwLock<HashSet<Ipv4Addr>>>;
 
 /// Handle to a running proxy. Shuts down on drop.
 pub struct ProxyHandle {
@@ -94,6 +102,11 @@ pub fn start(host_fd: RawFd, config: ProxyConfig) -> anyhow::Result<ProxyHandle>
         placeholders.insert(name.clone(), generate_placeholder());
     }
 
+    // Seed allowed IPs with the gateway so expose-host always works.
+    let mut initial_ips = HashSet::new();
+    initial_ips.insert(Ipv4Addr::new(10, 0, 0, 1));
+    let allowed_ips: AllowedIps = Arc::new(RwLock::new(initial_ips));
+
     let (event_tx, event_rx) = mpsc::unbounded_channel();
     let (cmd_tx, cmd_rx) = mpsc::unbounded_channel();
 
@@ -106,6 +119,7 @@ pub fn start(host_fd: RawFd, config: ProxyConfig) -> anyhow::Result<ProxyHandle>
 
     let proxy_config = config;
     let proxy_placeholders = placeholders.clone();
+    let proxy_allowed_ips = allowed_ips.clone();
     let runtime_thread = std::thread::Builder::new()
         .name("shuru-proxy".into())
         .spawn(move || {
@@ -117,7 +131,7 @@ pub fn start(host_fd: RawFd, config: ProxyConfig) -> anyhow::Result<ProxyHandle>
 
             rt.block_on(async move {
                 let mut engine =
-                    ProxyEngine::new(proxy_config, event_rx, cmd_tx, ca, proxy_placeholders);
+                    ProxyEngine::new(proxy_config, event_rx, cmd_tx, ca, proxy_placeholders, proxy_allowed_ips);
                 engine.run().await;
             });
         })?;

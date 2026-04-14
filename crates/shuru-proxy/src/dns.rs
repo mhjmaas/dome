@@ -1,4 +1,4 @@
-use std::net::UdpSocket;
+use std::net::{Ipv4Addr, UdpSocket};
 
 use simple_dns::Packet;
 use smoltcp::wire::IpEndpoint;
@@ -7,17 +7,21 @@ use tracing::debug;
 
 use crate::config::ProxyConfig;
 use crate::stack::StackCommand;
+use crate::AllowedIps;
 
 /// Handle a DNS query from the guest.
 ///
 /// Resolves the query on the host and sends the response back via the stack.
+/// When the domain allowlist is active, resolved IPs are added to the
+/// allowed set so the proxy can enforce IP-level filtering.
 pub async fn handle_dns_query(
     src: IpEndpoint,
     payload: Vec<u8>,
     cmd_tx: mpsc::UnboundedSender<StackCommand>,
     config: &ProxyConfig,
+    allowed_ips: &AllowedIps,
 ) {
-    let response = match resolve_query(&payload, &config).await {
+    let response = match resolve_query(&payload, config, allowed_ips).await {
         Ok(resp) => resp,
         Err(e) => {
             debug!("DNS resolution failed: {e}");
@@ -31,7 +35,11 @@ pub async fn handle_dns_query(
     });
 }
 
-async fn resolve_query(query_bytes: &[u8], config: &ProxyConfig) -> anyhow::Result<Vec<u8>> {
+async fn resolve_query(
+    query_bytes: &[u8],
+    config: &ProxyConfig,
+    allowed_ips: &AllowedIps,
+) -> anyhow::Result<Vec<u8>> {
     let query = Packet::parse(query_bytes)?;
 
     let question = query
@@ -56,7 +64,7 @@ async fn resolve_query(query_bytes: &[u8], config: &ProxyConfig) -> anyhow::Resu
     // reach exposed host ports without knowing the raw IP.
     if domain == "host.shuru.internal" {
         debug!("DNS host.shuru.internal -> 10.0.0.1");
-        return build_a_response(query_bytes, std::net::Ipv4Addr::new(10, 0, 0, 1));
+        return build_a_response(query_bytes, Ipv4Addr::new(10, 0, 0, 1));
     }
 
     debug!("DNS query: {domain}");
@@ -73,7 +81,35 @@ async fn resolve_query(query_bytes: &[u8], config: &ProxyConfig) -> anyhow::Resu
     })
     .await??;
 
+    // Pin resolved IPs so the proxy allows direct connections to them.
+    if config.network.has_allowlist() {
+        pin_resolved_ips(&response_bytes, allowed_ips);
+    }
+
     Ok(response_bytes)
+}
+
+/// Extract A record IPs from a DNS response and add them to the allowed set.
+fn pin_resolved_ips(response: &[u8], allowed_ips: &AllowedIps) {
+    let packet = match Packet::parse(response) {
+        Ok(p) => p,
+        Err(_) => return,
+    };
+
+    let mut ips = Vec::new();
+    for answer in &packet.answers {
+        if let simple_dns::rdata::RData::A(a) = &answer.rdata {
+            ips.push(Ipv4Addr::from(a.address));
+        }
+    }
+
+    if !ips.is_empty() {
+        let mut set = allowed_ips.write().expect("allowed_ips lock poisoned");
+        for ip in &ips {
+            debug!("DNS pin: {ip}");
+            set.insert(*ip);
+        }
+    }
 }
 
 /// Forward a raw DNS query to the system resolver and return the raw response.
@@ -103,7 +139,7 @@ fn build_empty_response(query_bytes: &[u8]) -> anyhow::Result<Vec<u8>> {
 }
 
 /// Build a DNS A-record response pointing to the given IPv4 address.
-fn build_a_response(query_bytes: &[u8], addr: std::net::Ipv4Addr) -> anyhow::Result<Vec<u8>> {
+fn build_a_response(query_bytes: &[u8], addr: Ipv4Addr) -> anyhow::Result<Vec<u8>> {
     use simple_dns::{rdata, ResourceRecord, CLASS};
 
     let query = Packet::parse(query_bytes)?;
@@ -127,4 +163,58 @@ fn build_a_response(query_bytes: &[u8], addr: std::net::Ipv4Addr) -> anyhow::Res
 
 fn build_refused_response(query_bytes: &[u8]) -> anyhow::Result<Vec<u8>> {
     build_response_with_rcode(query_bytes, 5)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::collections::HashSet;
+    use std::sync::{Arc, RwLock};
+
+    /// Build a minimal DNS A query for testing.
+    fn build_a_query(domain: &str) -> Vec<u8> {
+        use simple_dns::{Name, Packet, Question, QCLASS, QTYPE};
+        let mut packet = Packet::new_query(1);
+        packet.questions.push(Question::new(
+            Name::new_unchecked(domain),
+            QTYPE::TYPE(simple_dns::TYPE::A),
+            QCLASS::CLASS(simple_dns::CLASS::IN),
+            false,
+        ));
+        packet.build_bytes_vec().unwrap()
+    }
+
+    #[test]
+    fn pin_resolved_ips_extracts_a_records() {
+        let query = build_a_query("example.com");
+        let response = build_a_response(&query, Ipv4Addr::new(93, 184, 216, 34)).unwrap();
+
+        let allowed: AllowedIps = Arc::new(RwLock::new(HashSet::new()));
+        pin_resolved_ips(&response, &allowed);
+
+        let set = allowed.read().unwrap();
+        assert!(set.contains(&Ipv4Addr::new(93, 184, 216, 34)));
+        assert_eq!(set.len(), 1);
+    }
+
+    #[test]
+    fn pin_resolved_ips_ignores_invalid_response() {
+        let allowed: AllowedIps = Arc::new(RwLock::new(HashSet::new()));
+        pin_resolved_ips(b"not a dns packet", &allowed);
+
+        let set = allowed.read().unwrap();
+        assert!(set.is_empty());
+    }
+
+    #[test]
+    fn pin_resolved_ips_ignores_empty_response() {
+        let query = build_a_query("example.com");
+        let response = build_empty_response(&query).unwrap();
+
+        let allowed: AllowedIps = Arc::new(RwLock::new(HashSet::new()));
+        pin_resolved_ips(&response, &allowed);
+
+        let set = allowed.read().unwrap();
+        assert!(set.is_empty());
+    }
 }
