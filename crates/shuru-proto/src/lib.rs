@@ -106,6 +106,12 @@ pub struct DownloadRequest {
     /// If true, decompress .tar.gz and extract to `path` as a directory.
     #[serde(default)]
     pub extract: bool,
+    /// When extracting, strip N leading path components from each entry,
+    /// mirroring `tar --strip-components=N`. Defaults to 0 (keep paths as-is).
+    /// Use `1` for releases wrapped in a single top-level directory
+    /// (Node.js, Pi, etc.) so `node-v22/bin/node` becomes `bin/node`.
+    #[serde(default)]
+    pub strip_components: u32,
 }
 
 #[derive(Serialize, Deserialize)]

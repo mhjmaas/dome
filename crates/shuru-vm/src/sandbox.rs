@@ -449,6 +449,7 @@ impl Sandbox {
         url: &str,
         path: &str,
         extract: bool,
+        strip_components: u32,
         on_progress: impl Fn(shuru_proto::DownloadProgress),
     ) -> Result<()> {
         let stream = self.connect_vsock()?;
@@ -461,6 +462,7 @@ impl Sandbox {
             url: url.to_string(),
             path: path.to_string(),
             extract,
+            strip_components,
         };
         frame::send_json(&mut writer, frame::DOWNLOAD_REQ, &req)?;
 

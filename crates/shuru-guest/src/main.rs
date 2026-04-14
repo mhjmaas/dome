@@ -595,7 +595,9 @@ mod guest {
 
         if req.extract {
             // Stream through gzip + tar, reporting progress.
-            // Strip one leading path component so e.g. node-v22/bin/node -> bin/node.
+            // `strip_components` mirrors `tar --strip-components=N` — the caller
+            // knows whether their tarball is directory-wrapped (Node, Pi → strip 1)
+            // or flat (Codex → strip 0). The guest doesn't inspect structure.
             let progress_writer = DownloadProgressWriter { writer, bytes: 0, total_bytes, last_report: 0 };
             let tee = TeeReader::new(&mut body, progress_writer);
             let decoder = flate2::read::GzDecoder::new(tee);
@@ -607,6 +609,7 @@ mod guest {
             }
 
             let dest = std::path::Path::new(&req.path);
+            let strip = req.strip_components as usize;
             let entries = match archive.entries() {
                 Ok(e) => e,
                 Err(e) => {
@@ -629,17 +632,16 @@ mod guest {
                         return;
                     }
                 };
-                // Strip the first path component (e.g. "node-v22.16.0-linux-arm64/")
-                let stripped = path.components().skip(1).collect::<std::path::PathBuf>();
-                if stripped.as_os_str().is_empty() {
-                    continue; // skip the top-level directory entry itself
+                let out_rel: std::path::PathBuf = path.components().skip(strip).collect();
+                if out_rel.as_os_str().is_empty() {
+                    continue; // e.g. the top-level directory entry when strip >= 1
                 }
-                let out_path = dest.join(&stripped);
+                let out_path = dest.join(&out_rel);
                 if let Some(parent) = out_path.parent() {
                     let _ = std::fs::create_dir_all(parent);
                 }
                 if let Err(e) = entry.unpack(&out_path) {
-                    send_fs_err(writer, format!("extract {}: {e}", stripped.display()));
+                    send_fs_err(writer, format!("extract {}: {e}", out_rel.display()));
                     return;
                 }
             }

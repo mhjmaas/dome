@@ -219,6 +219,7 @@ enum SandboxCmd {
         url: String,
         path: String,
         extract: bool,
+        strip_components: u32,
         progress_tx: std::sync::mpsc::Sender<shuru_proto::DownloadProgress>,
         reply: oneshot::Sender<Result<()>>,
     },
@@ -521,12 +522,16 @@ impl AsyncSandbox {
 
     /// Download a URL into the sandbox. If `extract` is true, the download
     /// is treated as a .tar.gz and extracted to `path` as a directory.
+    /// `strip_components` mirrors `tar --strip-components=N` — set to `1`
+    /// for tarballs wrapped in a single top-level directory (Node, Pi)
+    /// and `0` for flat tarballs (single binary at root).
     /// Returns a channel that receives progress updates.
     pub async fn download(
         &self,
         url: &str,
         path: &str,
         extract: bool,
+        strip_components: u32,
     ) -> Result<(tokio::sync::oneshot::Receiver<Result<()>>, std::sync::mpsc::Receiver<shuru_proto::DownloadProgress>)> {
         let (reply_tx, reply_rx) = oneshot::channel();
         let (progress_tx, progress_rx) = std::sync::mpsc::channel();
@@ -535,6 +540,7 @@ impl AsyncSandbox {
                 url: url.to_string(),
                 path: path.to_string(),
                 extract,
+                strip_components,
                 progress_tx,
                 reply: reply_tx,
             })
@@ -941,8 +947,8 @@ fn run_vm_loop(
             SandboxCmd::Chmod { path, mode, reply } => {
                 let _ = reply.send(sandbox.chmod(&path, mode));
             }
-            SandboxCmd::Download { url, path, extract, progress_tx, reply } => {
-                let result = sandbox.download(&url, &path, extract, |p| {
+            SandboxCmd::Download { url, path, extract, strip_components, progress_tx, reply } => {
+                let result = sandbox.download(&url, &path, extract, strip_components, |p| {
                     let _ = progress_tx.send(p);
                 });
                 let _ = reply.send(result);
