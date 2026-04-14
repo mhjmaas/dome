@@ -104,10 +104,10 @@ fn pin_resolved_ips(response: &[u8], allowed_ips: &AllowedIps) {
     }
 
     if !ips.is_empty() {
-        let mut set = allowed_ips.write().expect("allowed_ips lock poisoned");
+        let mut cache = allowed_ips.write().expect("allowed_ips lock poisoned");
         for ip in &ips {
             debug!("DNS pin: {ip}");
-            set.insert(*ip);
+            cache.put(*ip, ());
         }
     }
 }
@@ -168,8 +168,15 @@ fn build_refused_response(query_bytes: &[u8]) -> anyhow::Result<Vec<u8>> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::collections::HashSet;
+    use lru::LruCache;
+    use std::num::NonZeroUsize;
     use std::sync::{Arc, RwLock};
+
+    fn new_allowed(cap: usize) -> AllowedIps {
+        Arc::new(RwLock::new(LruCache::new(
+            NonZeroUsize::new(cap).unwrap(),
+        )))
+    }
 
     /// Build a minimal DNS A query for testing.
     fn build_a_query(domain: &str) -> Vec<u8> {
@@ -189,21 +196,20 @@ mod tests {
         let query = build_a_query("example.com");
         let response = build_a_response(&query, Ipv4Addr::new(93, 184, 216, 34)).unwrap();
 
-        let allowed: AllowedIps = Arc::new(RwLock::new(HashSet::new()));
+        let allowed = new_allowed(16);
         pin_resolved_ips(&response, &allowed);
 
-        let set = allowed.read().unwrap();
-        assert!(set.contains(&Ipv4Addr::new(93, 184, 216, 34)));
-        assert_eq!(set.len(), 1);
+        let cache = allowed.read().unwrap();
+        assert!(cache.contains(&Ipv4Addr::new(93, 184, 216, 34)));
+        assert_eq!(cache.len(), 1);
     }
 
     #[test]
     fn pin_resolved_ips_ignores_invalid_response() {
-        let allowed: AllowedIps = Arc::new(RwLock::new(HashSet::new()));
+        let allowed = new_allowed(16);
         pin_resolved_ips(b"not a dns packet", &allowed);
 
-        let set = allowed.read().unwrap();
-        assert!(set.is_empty());
+        assert!(allowed.read().unwrap().is_empty());
     }
 
     #[test]
@@ -211,10 +217,29 @@ mod tests {
         let query = build_a_query("example.com");
         let response = build_empty_response(&query).unwrap();
 
-        let allowed: AllowedIps = Arc::new(RwLock::new(HashSet::new()));
+        let allowed = new_allowed(16);
         pin_resolved_ips(&response, &allowed);
 
-        let set = allowed.read().unwrap();
-        assert!(set.is_empty());
+        assert!(allowed.read().unwrap().is_empty());
+    }
+
+    #[test]
+    fn pin_resolved_ips_evicts_oldest_when_full() {
+        let allowed = new_allowed(2);
+        let q = build_a_query("example.com");
+
+        let r1 = build_a_response(&q, Ipv4Addr::new(1, 1, 1, 1)).unwrap();
+        let r2 = build_a_response(&q, Ipv4Addr::new(2, 2, 2, 2)).unwrap();
+        let r3 = build_a_response(&q, Ipv4Addr::new(3, 3, 3, 3)).unwrap();
+
+        pin_resolved_ips(&r1, &allowed);
+        pin_resolved_ips(&r2, &allowed);
+        pin_resolved_ips(&r3, &allowed);
+
+        let cache = allowed.read().unwrap();
+        assert_eq!(cache.len(), 2);
+        assert!(!cache.contains(&Ipv4Addr::new(1, 1, 1, 1)));
+        assert!(cache.contains(&Ipv4Addr::new(2, 2, 2, 2)));
+        assert!(cache.contains(&Ipv4Addr::new(3, 3, 3, 3)));
     }
 }

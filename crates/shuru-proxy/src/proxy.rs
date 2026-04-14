@@ -152,12 +152,20 @@ async fn handle_connection(
 
     // When a domain allowlist is active, only allow connections to IPs that
     // were resolved via the DNS handler. This prevents bypass via hardcoded IPs.
+    // Gateway IP is always allowed so the expose-host fallback path still works;
+    // unexposed gateway ports will fail later at connect().
+    //
+    // Uses write lock + get() so the LRU bumps recency for active IPs, keeping
+    // them warm against eviction when the cache is full.
     if config.network.has_allowlist() {
         if let std::net::IpAddr::V4(ipv4) = dst.ip() {
-            let is_allowed = allowed_ips
-                .read()
-                .expect("allowed_ips lock poisoned")
-                .contains(&ipv4);
+            const GATEWAY: std::net::Ipv4Addr = std::net::Ipv4Addr::new(10, 0, 0, 1);
+            let is_allowed = ipv4 == GATEWAY
+                || allowed_ips
+                    .write()
+                    .expect("allowed_ips lock poisoned")
+                    .get(&ipv4)
+                    .is_some();
             if !is_allowed {
                 debug!("IP not in DNS-pinned set, rejecting: {dst}");
                 let _ = cmd_tx.send(StackCommand::Close { id });
