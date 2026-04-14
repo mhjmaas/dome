@@ -1512,7 +1512,7 @@ dependencies = [
 
 [[package]]
 name = "shuru-guest"
-version = "0.3.3"
+version = "0.3.4"
 dependencies = [
  "flate2",
  "ignore",
@@ -1567,7 +1567,7 @@ dependencies = [
 
 [[package]]
 name = "shuru-sdk"
-version = "0.3.3"
+version = "0.3.4"
 dependencies = [
  "anyhow",
  "blake3",
