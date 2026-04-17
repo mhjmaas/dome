@@ -167,6 +167,93 @@ impl MmioDevice for Pl011 {
 }
 
 // ===========================================================================
+// PL031 RTC (read-only wall clock from host, no alarm/IRQ support)
+// ===========================================================================
+
+const RTCDR: u64 = 0x000; // Data register: seconds since Unix epoch
+const RTCMR: u64 = 0x004; // Match register
+const RTCLR: u64 = 0x008; // Load register
+const RTCCR: u64 = 0x00C; // Control register (bit 0: enable)
+const RTCIMSC: u64 = 0x010; // Interrupt mask
+const RTCRIS: u64 = 0x014; // Raw interrupt status
+const RTCMIS: u64 = 0x018; // Masked interrupt status
+const RTCICR: u64 = 0x01C; // Interrupt clear
+
+const RTCPERIPHID0: u64 = 0xFE0;
+const RTCPERIPHID1: u64 = 0xFE4;
+const RTCPERIPHID2: u64 = 0xFE8;
+const RTCPERIPHID3: u64 = 0xFEC;
+const RTCPCELLID0: u64 = 0xFF0;
+const RTCPCELLID1: u64 = 0xFF4;
+const RTCPCELLID2: u64 = 0xFF8;
+const RTCPCELLID3: u64 = 0xFFC;
+
+pub struct Pl031 {
+    mr: u32,
+    cr: u32,
+    imsc: u32,
+}
+
+impl Pl031 {
+    pub fn new() -> Self {
+        Pl031 {
+            mr: 0,
+            cr: 1, // enabled
+            imsc: 0,
+        }
+    }
+
+    fn now_unix(&self) -> u32 {
+        use std::time::{SystemTime, UNIX_EPOCH};
+        SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .map(|d| d.as_secs() as u32)
+            .unwrap_or(0)
+    }
+}
+
+impl MmioDevice for Pl031 {
+    fn read(&mut self, offset: u64, data: &mut [u8]) {
+        let val: u32 = match offset {
+            RTCDR => self.now_unix(),
+            RTCMR => self.mr,
+            RTCLR => self.now_unix(),
+            RTCCR => self.cr,
+            RTCIMSC => self.imsc,
+            RTCRIS => 0,
+            RTCMIS => 0,
+            // PrimeCell ID: PL031, revision 1
+            RTCPERIPHID0 => 0x31,
+            RTCPERIPHID1 => 0x10,
+            RTCPERIPHID2 => 0x04,
+            RTCPERIPHID3 => 0x00,
+            RTCPCELLID0 => 0x0D,
+            RTCPCELLID1 => 0xF0,
+            RTCPCELLID2 => 0x05,
+            RTCPCELLID3 => 0xB1,
+            _ => 0,
+        };
+        let len = data.len().min(4);
+        data[..len].copy_from_slice(&val.to_le_bytes()[..len]);
+    }
+
+    fn write(&mut self, offset: u64, data: &[u8]) {
+        let mut bytes = [0u8; 4];
+        let len = data.len().min(4);
+        bytes[..len].copy_from_slice(&data[..len]);
+        let val = u32::from_le_bytes(bytes);
+        match offset {
+            RTCMR => self.mr = val,
+            RTCLR => {} // guest attempts to set time - ignore, host clock is authoritative
+            RTCCR => self.cr = val & 1,
+            RTCIMSC => self.imsc = val & 1,
+            RTCICR => {}
+            _ => {}
+        }
+    }
+}
+
+// ===========================================================================
 // Virtio MMIO transport (v2)
 // ===========================================================================
 

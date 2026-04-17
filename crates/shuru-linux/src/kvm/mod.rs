@@ -134,6 +134,10 @@ impl KvmVm {
             Box::new(Pl011::new(config.serial_write_fd, config.serial_read_fd)),
         );
 
+        // PL031 RTC - needed so the guest boots with the host wall clock
+        // (otherwise TLS certs are "not yet valid" since 1970-01-01).
+        bus.add(RTC_BASE, RTC_SIZE, Box::new(Pl031::new()));
+
         // Virtio block
         if let Some(ref disk_path) = config.disk_path {
             let blk = BlockBackend::new(disk_path, config.disk_read_only)
@@ -475,6 +479,17 @@ fn generate_fdt(
     ]).unwrap();
     fdt.property_array_u32("clocks", &[2, 2]).unwrap();
     fdt.end_node(uart).unwrap();
+
+    // /pl031 RTC (no IRQ — we only expose the data register, no alarm)
+    let rtc = fdt.begin_node(&format!("pl031@{:x}", RTC_BASE)).unwrap();
+    fdt.property_string_list("compatible", vec![
+        "arm,pl031".into(),
+        "arm,primecell".into(),
+    ]).unwrap();
+    fdt.property_array_u64("reg", &[RTC_BASE, RTC_SIZE]).unwrap();
+    fdt.property_string("clock-names", "apb_pclk").unwrap();
+    fdt.property_u32("clocks", 2).unwrap();
+    fdt.end_node(rtc).unwrap();
 
     // Virtio MMIO devices
     for i in 0..virtio_device_count {
