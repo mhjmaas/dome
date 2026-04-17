@@ -4,7 +4,8 @@ Local-first microVM sandbox for AI agents on macOS, with experimental Linux supp
 
 Shuru boots lightweight Linux VMs for AI agents. On macOS it uses Apple's Virtualization.framework. On Linux it uses a KVM backend that is now available as an experimental release build for ARM64 hosts. Every sandbox is ephemeral: the rootfs resets on every run, giving agents a disposable environment to execute code, install packages, and run tools without touching your host.
 
-> **Experimental Linux support:** Linux builds are available for testing, but they are not ready for production use yet. Expect rough edges, missing polish, and compatibility gaps.
+> [!WARNING]
+> **Experimental Linux support.** Linux builds are available for testing, but they are not ready for production use yet. Expect rough edges, missing polish, and compatibility gaps.
 
 ## Requirements
 
@@ -25,7 +26,8 @@ curl -fsSL https://raw.githubusercontent.com/superhq-ai/shuru/main/install.sh | 
 
 The install script supports macOS on Apple Silicon and experimental Linux ARM64. Linux users can also download the `linux-aarch64` release tarball manually from GitHub Releases if they prefer.
 
-> **Note:** Homebrew remains macOS-only. Linux installs via the script are still experimental and not ready for production use.
+> [!NOTE]
+> Homebrew remains macOS-only. Linux installs via the script are still experimental and not ready for production use.
 
 ## Usage
 
@@ -65,7 +67,8 @@ shuru run --mount ./src:/workspace --mount ./data:/data -- sh
 
 Mounts can also be set in `shuru.json` (see [Config file](#config-file)).
 
-> **Note:** Directory mounts require checkpoints created on v0.1.11+. Existing checkpoints work normally for all other features. Run `shuru upgrade` to get the latest version.
+> [!NOTE]
+> Directory mounts require checkpoints created on v0.1.11+. Existing checkpoints work normally for all other features. Run `shuru upgrade` to get the latest version.
 
 ### Port forwarding
 
