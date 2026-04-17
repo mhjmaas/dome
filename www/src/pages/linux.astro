@@ -1,0 +1,259 @@
+---
+import Layout from "../layouts/Layout.astro";
+import Nav from "../components/landing/Nav.astro";
+import Footer from "../components/landing/Footer.astro";
+import CodeBlock from "../components/CodeBlock.astro";
+
+const quickCheckCode = `uname -m           # expect: aarch64
+ls -l /dev/kvm     # expect: crw-rw---- root kvm
+groups | tr ' ' '\\n' | grep -x kvm`;
+
+const installCode = `curl -fsSL https://shuru.run/install.sh | sh`;
+
+const grantKvmCode = `sudo usermod -aG kvm "$USER"
+# log out and back in, then:
+groups | tr ' ' '\\n' | grep -x kvm`;
+
+const firstRunCode = `# Interactive shell
+shuru run
+
+# Run a command
+shuru run -- echo hello
+
+# With network access
+shuru run --allow-net -- curl https://example.com
+
+# Custom resources
+shuru run --cpus 4 --memory 4096 -- sh`;
+---
+
+<Layout
+  title="shuru on Linux (setup guide)"
+  description="How to install and run shuru on Linux ARM64 with the KVM backend. Prerequisites, install script, permissions, first run, and troubleshooting."
+>
+  <div class="dot-grid min-h-screen">
+    <Nav />
+
+    <main class="mx-auto max-w-6xl px-6">
+      <article class="relative border-x border-border pt-36 pb-0 md:pt-48">
+        <span class="section-label article-label">Setup</span>
+
+        <div class="px-8 pt-8 pb-6 md:px-16 md:pt-12 md:pb-8">
+          <div class="font-mono text-[10px] uppercase tracking-widest text-dim">Linux ARM64 &middot; Experimental</div>
+          <h1 class="mt-4 text-3xl font-semibold leading-tight tracking-tight md:text-5xl lg:text-6xl">
+            Run shuru on Linux.
+            <br />
+            <span class="text-muted">ARM64 servers and workstations, with KVM.</span>
+          </h1>
+        </div>
+
+        <div class="prose-section border-t border-dashed border-border px-8 pt-8 pb-4 md:px-16 md:pt-12 md:pb-6">
+          <p>
+            Shuru on Linux runs lightweight ARM64 Linux guests through a KVM backend, giving AI agents the same
+            ephemeral, disposable sandbox they get on macOS. The Linux backend is available as an experimental build
+            for testing. It is not ready for production use yet.
+          </p>
+        </div>
+
+        <div class="prose-section border-t border-dashed border-border px-8 pt-8 pb-4 md:px-16 md:pt-12 md:pb-6">
+          <h2>Prerequisites</h2>
+          <ul>
+            <li>Linux ARM64 (aarch64) host. x86_64 Linux is not supported.</li>
+            <li>KVM enabled in the kernel, with a readable and writable <code>/dev/kvm</code>.</li>
+            <li>Membership in the <code>kvm</code> group (or equivalent) so your user can open <code>/dev/kvm</code>.</li>
+            <li><code>curl</code> and <code>tar</code> available on <code>PATH</code> for the install script.</li>
+          </ul>
+          <p>Quick check:</p>
+          <div class="code-wrap">
+            <CodeBlock code={quickCheckCode} lang="bash" title="quick-check.sh" />
+          </div>
+          <p>
+            If <code>/dev/kvm</code> is missing, your host does not have KVM available. On cloud VMs this usually means
+            the instance type does not expose nested virtualization. On bare metal, verify that virtualization is enabled
+            in firmware and that the <code>kvm</code> module is loaded.
+          </p>
+        </div>
+
+        <div class="prose-section border-t border-dashed border-border px-8 pt-8 pb-4 md:px-16 md:pt-12 md:pb-6">
+          <h2>Install</h2>
+          <p>One-line install script. It detects Linux ARM64 and downloads the matching release tarball.</p>
+          <div class="code-wrap">
+            <CodeBlock code={installCode} lang="bash" title="install" />
+          </div>
+          <p>
+            The binary lands at <code>~/.local/bin/shuru</code>. If that directory is not on your <code>PATH</code>,
+            the script prints a shell line to add. Put it in <code>~/.zshrc</code>, <code>~/.bashrc</code>,
+            or equivalent.
+          </p>
+          <p>
+            Prefer a manual install? Grab the <code>shuru-v&lt;version&gt;-linux-aarch64.tar.gz</code> tarball from
+            GitHub Releases, extract <code>shuru</code>, and drop it anywhere on your <code>PATH</code>.
+          </p>
+        </div>
+
+        <div class="prose-section border-t border-dashed border-border px-8 pt-8 pb-4 md:px-16 md:pt-12 md:pb-6">
+          <h2>Grant KVM access</h2>
+          <p>
+            If <code>shuru run</code> fails with a permission error on <code>/dev/kvm</code>, add your user to the
+            <code>kvm</code> group and log back in:
+          </p>
+          <div class="code-wrap">
+            <CodeBlock code={grantKvmCode} lang="bash" title="grant-kvm.sh" />
+          </div>
+          <p>
+            Some distributions use a different group name (for example <code>libvirt</code> or <code>qemu</code>).
+            Check the owning group of <code>/dev/kvm</code> with <code>ls -l /dev/kvm</code> and join that one.
+          </p>
+        </div>
+
+        <div class="prose-section border-t border-dashed border-border px-8 pt-8 pb-4 md:px-16 md:pt-12 md:pb-6">
+          <h2>First run</h2>
+          <div class="code-wrap">
+            <CodeBlock code={firstRunCode} lang="bash" title="first-run.sh" />
+          </div>
+          <p>
+            The first run downloads the kernel and rootfs assets. After that, boots take about a second on most
+            ARM64 hardware. Everything else works the same as on macOS: checkpoints, mounts, secrets, port
+            forwarding.
+          </p>
+        </div>
+
+        <div class="prose-section border-t border-dashed border-border px-8 pt-8 pb-4 md:px-16 md:pt-12 md:pb-6">
+          <h2>Troubleshooting</h2>
+          <ul>
+            <li>
+              <strong>permission denied on <code>/dev/kvm</code>.</strong> You are not in the <code>kvm</code> group,
+              or your session has not picked up the new group yet. Log out and back in.
+            </li>
+            <li>
+              <strong>no <code>/dev/kvm</code> device.</strong> The host does not expose KVM. On cloud providers,
+              use an instance type that supports nested virtualization (for example Scaleway or Hetzner bare metal
+              ARM).
+            </li>
+            <li>
+              <strong>unsupported architecture.</strong> Shuru Linux builds target ARM64 only. x86_64 Linux support
+              is not planned for the experimental track.
+            </li>
+            <li>
+              <strong>install script fails.</strong> Check you have <code>curl</code> and <code>tar</code> on
+              <code>PATH</code>, and that GitHub Releases is reachable from your network.
+            </li>
+          </ul>
+        </div>
+
+        <div class="prose-section border-t border-dashed border-border px-8 pt-8 pb-4 md:px-16 md:pt-12 md:pb-6">
+          <h2>What is still missing</h2>
+          <p>
+            Linux is experimental. Homebrew remains macOS-only, and we are still closing gaps between the macOS and
+            Linux backends around performance, device support, and upgrades. File issues or open PRs on GitHub if
+            something breaks for you.
+          </p>
+        </div>
+
+        <div class="border-t border-dashed border-border px-8 py-8 md:px-16 md:py-10">
+          <div class="flex flex-col items-start gap-3 font-mono text-sm">
+            <a
+              href="/blog/experimental-linux-builds"
+              class="text-muted transition-colors hover:text-amber"
+            >
+              Announcement post &rarr;
+            </a>
+            <a
+              href="https://github.com/superhq-ai/shuru/releases"
+              target="_blank"
+              rel="noopener"
+              class="text-muted transition-colors hover:text-amber"
+            >
+              GitHub Releases &rarr;
+            </a>
+            <a
+              href="https://github.com/superhq-ai/shuru/issues"
+              target="_blank"
+              rel="noopener"
+              class="text-muted transition-colors hover:text-amber"
+            >
+              Report a Linux issue &rarr;
+            </a>
+          </div>
+        </div>
+
+        <div class="flex items-center gap-2 px-8 py-6 md:px-16">
+          <span class="measure">setup</span>
+          <div class="h-px flex-1 border-t border-dashed border-dim"></div>
+        </div>
+      </article>
+    </main>
+
+    <Footer />
+
+    <div class="h-12"></div>
+  </div>
+</Layout>
+
+<style>
+  .article-label {
+    top: calc(9rem - 8px);
+  }
+  @media (min-width: 768px) {
+    .article-label {
+      top: calc(12rem - 8px);
+    }
+  }
+
+  .prose-section h2 {
+    color: var(--color-text);
+    font-size: 1.1rem;
+    font-weight: 600;
+    letter-spacing: -0.01em;
+    margin-bottom: 1rem;
+  }
+
+  .prose-section p {
+    color: var(--color-muted);
+    font-size: 1rem;
+    line-height: 1.85;
+    max-width: 640px;
+  }
+
+  .prose-section p + p {
+    margin-top: 1.5rem;
+  }
+
+  .prose-section ul {
+    color: var(--color-muted);
+    font-size: 1rem;
+    line-height: 1.85;
+    max-width: 640px;
+    list-style: disc;
+    padding-left: 1.25rem;
+    margin-top: 0.75rem;
+  }
+
+  .prose-section ul + p {
+    margin-top: 1.5rem;
+  }
+
+  .prose-section li + li {
+    margin-top: 0.4rem;
+  }
+
+  .prose-section code {
+    font-family: var(--font-mono);
+    font-size: 0.9em;
+    color: var(--color-text);
+  }
+
+  .prose-section strong {
+    color: var(--color-text);
+    font-weight: 600;
+  }
+
+  .code-wrap {
+    margin-top: 1.25rem;
+    max-width: 720px;
+  }
+
+  .code-wrap + p {
+    margin-top: 1.5rem;
+  }
+</style>

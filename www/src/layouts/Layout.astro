@@ -6,7 +6,10 @@ interface Props {
   description?: string;
 }
 
-const { title, description = "Local-first microVM sandbox for AI agents on macOS" } = Astro.props;
+const {
+  title,
+  description = "Local-first microVM sandbox for AI agents on macOS, with experimental Linux ARM64 support",
+} = Astro.props;
 ---
 
 <!doctype html>

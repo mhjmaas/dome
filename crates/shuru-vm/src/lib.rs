@@ -2,12 +2,11 @@
 
 mod sandbox;
 
+pub use sandbox::{MountConfig, PortForwardHandle, Sandbox, VmConfigBuilder};
 pub use shuru_proto::{
     frame, ExecRequest, ForwardRequest, ForwardResponse, MountRequest, MountResponse, PortMapping,
-    ReadFileRequest, WriteFileRequest, WriteFileResponse,
-    VSOCK_PORT, VSOCK_PORT_FORWARD,
+    ReadFileRequest, WriteFileRequest, WriteFileResponse, VSOCK_PORT, VSOCK_PORT_FORWARD,
 };
-pub use sandbox::{MountConfig, PortForwardHandle, Sandbox, VmConfigBuilder};
 
 // Re-exports from platform-specific backend for advanced/escape-hatch use
 #[cfg(target_os = "macos")]
@@ -17,11 +16,11 @@ pub use shuru_darwin::VmState;
 #[cfg(target_os = "macos")]
 pub use shuru_darwin::VzError;
 
-#[cfg(all(target_os = "linux", feature = "shuru-linux"))]
+#[cfg(target_os = "linux")]
 pub use shuru_linux::VirtualMachine;
-#[cfg(all(target_os = "linux", feature = "shuru-linux"))]
+#[cfg(target_os = "linux")]
 pub use shuru_linux::VmState;
-#[cfg(all(target_os = "linux", feature = "shuru-linux"))]
+#[cfg(target_os = "linux")]
 pub use shuru_linux::VzError;
 
 /// Reject checkpoint names that could escape the checkpoints directory.

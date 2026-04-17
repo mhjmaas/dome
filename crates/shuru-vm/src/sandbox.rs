@@ -10,25 +10,24 @@ use anyhow::{bail, Context, Result};
 use crossbeam_channel::Receiver;
 
 #[cfg(target_os = "macos")]
-use shuru_darwin::terminal;
-#[cfg(target_os = "macos")]
 use shuru_darwin::network::FileHandleNetworkAttachment;
+#[cfg(target_os = "macos")]
+use shuru_darwin::terminal;
 #[cfg(target_os = "macos")]
 use shuru_darwin::*;
 
-#[cfg(all(target_os = "linux", feature = "shuru-linux"))]
-use shuru_linux::terminal;
-#[cfg(all(target_os = "linux", feature = "shuru-linux"))]
+#[cfg(target_os = "linux")]
 use shuru_linux::network::FileHandleNetworkAttachment;
-#[cfg(all(target_os = "linux", feature = "shuru-linux"))]
+#[cfg(target_os = "linux")]
+use shuru_linux::terminal;
+#[cfg(target_os = "linux")]
 use shuru_linux::*;
 
 use shuru_proto::{
-    frame, ChmodRequest, CopyRequest, DiscardRequest, ExecRequest, ForwardRequest,
-    ForwardResponse, FsOkResponse, MkdirRequest, MountRequest, MountResponse, PortMapping,
-    ReadDirRequest, ReadDirResponse, ReadFileRequest, RemoveRequest, RenameRequest, StatRequest,
-    StatResponse, WatchRequest, WriteFileRequest, WriteFileResponse, VSOCK_PORT,
-    VSOCK_PORT_FORWARD,
+    frame, ChmodRequest, CopyRequest, DiscardRequest, ExecRequest, ForwardRequest, ForwardResponse,
+    FsOkResponse, MkdirRequest, MountRequest, MountResponse, PortMapping, ReadDirRequest,
+    ReadDirResponse, ReadFileRequest, RemoveRequest, RenameRequest, StatRequest, StatResponse,
+    WatchRequest, WriteFileRequest, WriteFileResponse, VSOCK_PORT, VSOCK_PORT_FORWARD,
 };
 
 // --- Mount types ---
@@ -259,15 +258,10 @@ impl Sandbox {
 
     /// Send pending mount requests over an established vsock connection.
     /// Drains the mount list so subsequent calls are no-ops.
-    fn send_mount_requests(
-        &self,
-        writer: &mut impl Write,
-        reader: &mut impl Read,
-    ) -> Result<()> {
+    fn send_mount_requests(&self, writer: &mut impl Write, reader: &mut impl Read) -> Result<()> {
         let mounts = std::mem::take(&mut *self.mounts.lock().unwrap());
         for req in &mounts {
-            frame::send_json(writer, frame::MOUNT_REQ, &req)
-                .context("sending mount request")?;
+            frame::send_json(writer, frame::MOUNT_REQ, &req).context("sending mount request")?;
             let (_msg_type, payload) = frame::read_frame(reader)
                 .context("reading mount response")?
                 .context("guest closed connection during mount init")?;
@@ -346,7 +340,7 @@ impl Sandbox {
                     exit_code = 1;
                     break;
                 }
-                Some(_) => {} // unknown type, skip
+                Some(_) => {}  // unknown type, skip
                 None => break, // EOF
             }
         }
@@ -361,7 +355,9 @@ impl Sandbox {
 
         self.send_mount_requests(&mut writer, &mut reader)?;
 
-        let req = ReadFileRequest { path: path.to_string() };
+        let req = ReadFileRequest {
+            path: path.to_string(),
+        };
         frame::send_json(&mut writer, frame::READ_FILE_REQ, &req)?;
 
         match frame::read_frame(&mut reader).context("reading read_file response")? {
@@ -370,7 +366,10 @@ impl Sandbox {
                 bail!("{}", String::from_utf8_lossy(&payload));
             }
             Some((other, _)) => {
-                bail!("unexpected frame type 0x{:02x} in read_file response", other);
+                bail!(
+                    "unexpected frame type 0x{:02x} in read_file response",
+                    other
+                );
             }
             None => bail!("guest closed connection during read_file"),
         }
@@ -394,8 +393,8 @@ impl Sandbox {
             .context("reading write_file response")?
             .context("guest closed connection during write_file")?;
 
-        let resp: WriteFileResponse = serde_json::from_slice(&payload)
-            .context("parsing write_file response")?;
+        let resp: WriteFileResponse =
+            serde_json::from_slice(&payload).context("parsing write_file response")?;
 
         if !resp.ok {
             bail!(
@@ -439,7 +438,10 @@ impl Sandbox {
     pub fn mkdir(&self, path: &str, recursive: bool) -> Result<()> {
         self.void_fs_op(
             frame::MKDIR_REQ,
-            &MkdirRequest { path: path.to_string(), recursive },
+            &MkdirRequest {
+                path: path.to_string(),
+                recursive,
+            },
         )
     }
 
@@ -470,7 +472,9 @@ impl Sandbox {
         loop {
             match frame::read_frame(&mut reader)? {
                 Some((frame::DOWNLOAD_PROGRESS, payload)) => {
-                    if let Ok(progress) = serde_json::from_slice::<shuru_proto::DownloadProgress>(&payload) {
+                    if let Ok(progress) =
+                        serde_json::from_slice::<shuru_proto::DownloadProgress>(&payload)
+                    {
                         on_progress(progress);
                     }
                 }
@@ -499,7 +503,9 @@ impl Sandbox {
 
         self.send_mount_requests(&mut writer, &mut reader)?;
 
-        let req = ReadDirRequest { path: path.to_string() };
+        let req = ReadDirRequest {
+            path: path.to_string(),
+        };
         frame::send_json(&mut writer, frame::READ_DIR_REQ, &req)?;
 
         match frame::read_frame(&mut reader).context("reading read_dir response")? {
@@ -523,7 +529,9 @@ impl Sandbox {
 
         self.send_mount_requests(&mut writer, &mut reader)?;
 
-        let req = StatRequest { path: path.to_string() };
+        let req = StatRequest {
+            path: path.to_string(),
+        };
         frame::send_json(&mut writer, frame::STAT_REQ, &req)?;
 
         match frame::read_frame(&mut reader).context("reading stat response")? {
@@ -543,7 +551,10 @@ impl Sandbox {
     pub fn remove(&self, path: &str, recursive: bool) -> Result<()> {
         self.void_fs_op(
             frame::REMOVE_REQ,
-            &RemoveRequest { path: path.to_string(), recursive },
+            &RemoveRequest {
+                path: path.to_string(),
+                recursive,
+            },
         )
     }
 
@@ -552,28 +563,40 @@ impl Sandbox {
     pub fn discard_overlay(&self, path: &str) -> Result<()> {
         self.void_fs_op(
             frame::DISCARD_REQ,
-            &DiscardRequest { path: path.to_string() },
+            &DiscardRequest {
+                path: path.to_string(),
+            },
         )
     }
 
     pub fn rename(&self, old_path: &str, new_path: &str) -> Result<()> {
         self.void_fs_op(
             frame::RENAME_REQ,
-            &RenameRequest { old_path: old_path.to_string(), new_path: new_path.to_string() },
+            &RenameRequest {
+                old_path: old_path.to_string(),
+                new_path: new_path.to_string(),
+            },
         )
     }
 
     pub fn copy(&self, src: &str, dst: &str, recursive: bool) -> Result<()> {
         self.void_fs_op(
             frame::COPY_REQ,
-            &CopyRequest { src: src.to_string(), dst: dst.to_string(), recursive },
+            &CopyRequest {
+                src: src.to_string(),
+                dst: dst.to_string(),
+                recursive,
+            },
         )
     }
 
     pub fn chmod(&self, path: &str, mode: u32) -> Result<()> {
         self.void_fs_op(
             frame::CHMOD_REQ,
-            &ChmodRequest { path: path.to_string(), mode },
+            &ChmodRequest {
+                path: path.to_string(),
+                mode,
+            },
         )
     }
 
@@ -668,11 +691,7 @@ impl Sandbox {
     /// Puts the host terminal in raw mode, relays I/O bidirectionally over
     /// vsock, and handles SIGWINCH for window resize.
     /// Returns the guest process exit code.
-    pub fn shell(
-        &self,
-        argv: &[impl AsRef<str>],
-        env: &HashMap<String, String>,
-    ) -> Result<i32> {
+    pub fn shell(&self, argv: &[impl AsRef<str>], env: &HashMap<String, String>) -> Result<i32> {
         let stdin_fd = std::io::stdin().as_raw_fd();
         let (rows, cols) = terminal::terminal_size(stdin_fd);
 
@@ -714,16 +733,14 @@ impl Sandbox {
                         if n == 0 {
                             break;
                         }
-                        if frame::write_frame(&mut vsock_writer, frame::STDIN, &buf[..n]).is_err()
-                        {
+                        if frame::write_frame(&mut vsock_writer, frame::STDIN, &buf[..n]).is_err() {
                             break;
                         }
                     }
                     terminal::StdinEvent::Resize => {
                         let (rows, cols) = terminal::terminal_size(stdin_fd);
                         let payload = frame::resize_payload(rows, cols);
-                        if frame::write_frame(&mut vsock_writer, frame::RESIZE, &payload).is_err()
-                        {
+                        if frame::write_frame(&mut vsock_writer, frame::RESIZE, &payload).is_err() {
                             break;
                         }
                     }
@@ -794,11 +811,15 @@ impl Sandbox {
                 .parse()
                 .with_context(|| format!("Invalid port {}", mapping.host_port))?;
             let socket = socket2::Socket::new(socket2::Domain::IPV4, socket2::Type::STREAM, None)
-                .with_context(|| format!("Failed to create socket for port {}", mapping.host_port))?;
+                .with_context(|| {
+                format!("Failed to create socket for port {}", mapping.host_port)
+            })?;
             socket.set_reuse_address(true)?;
-            socket.bind(&addr.into())
+            socket
+                .bind(&addr.into())
                 .with_context(|| format!("Failed to bind port {}", mapping.host_port))?;
-            socket.listen(128)
+            socket
+                .listen(128)
                 .with_context(|| format!("Failed to listen on port {}", mapping.host_port))?;
             socket.set_nonblocking(true)?;
             let tcp_listener: TcpListener = socket.into();
@@ -821,7 +842,9 @@ impl Sandbox {
                             let _ = tcp_stream.set_nonblocking(false);
                             let vm = Arc::clone(&vm);
                             std::thread::spawn(move || {
-                                if let Err(e) = handle_forward_connection(tcp_stream, &vm, guest_port) {
+                                if let Err(e) =
+                                    handle_forward_connection(tcp_stream, &vm, guest_port)
+                                {
                                     tracing::debug!("port forward error: {}", e);
                                 }
                             });
@@ -868,7 +891,11 @@ impl Sandbox {
                 }
                 Err(e) => {
                     if attempt == 50 {
-                        bail!("Failed to connect to guest after {} attempts: {}", attempt, e);
+                        bail!(
+                            "Failed to connect to guest after {} attempts: {}",
+                            attempt,
+                            e
+                        );
                     }
                     tracing::debug!("vsock connect attempt {} failed: {}", attempt, e);
                     std::thread::sleep(Duration::from_millis(200));

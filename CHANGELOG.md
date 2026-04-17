@@ -1,5 +1,39 @@
 # Changelog
 
+## 0.6.0
+
+### Experimental Linux ARM64 support
+
+Shuru now ships Linux ARM64 CLI builds using a KVM-based backend, alongside the
+existing macOS builds. Setup guide: https://shuru.run/linux
+
+Linux support is experimental, not production-ready yet. Homebrew remains
+macOS-only; on Linux, use the install script.
+
+### Linux backend (`shuru-linux` 0.1.0, new)
+
+- Initial release of the KVM-based backend crate, published to crates.io
+- Mirrors the `shuru-darwin` API surface (`VirtualMachine`, `VmState`, `VzError`,
+  network attachment, terminal)
+
+### VM (`shuru-vm` 0.3.5)
+
+- `shuru-linux` dependency wired in unconditionally on Linux targets (no longer
+  behind a `shuru-linux` feature flag)
+
+### CLI (`shuru-cli` 0.6.0)
+
+- `shuru upgrade` selects the correct tarball per host (`darwin-aarch64` or
+  `linux-aarch64`) instead of hard-coding darwin
+
+### Installer and CI
+
+- `install.sh` detects Linux ARM64 and installs the matching tarball; prints an
+  experimental-support warning on Linux
+- Release workflow builds both `darwin-aarch64` and `linux-aarch64` CLI tarballs
+  (adds `ubuntu-24.04-arm` runner for the Linux job)
+- Crates-publish workflow includes `shuru-linux`
+
 ## 0.5.5
 
 ### Store (`shuru-store` 0.1.1)

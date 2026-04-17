@@ -15,46 +15,95 @@ import CopyButton from "./CopyButton.astro";
       </p>
     </div>
 
-    <div class="mx-auto mt-12 max-w-2xl border border-border">
-      <div class="flex items-center border-b border-border">
-        <a href="#install-homebrew" class="install-tab px-4 py-2.5 font-mono text-[10px] uppercase tracking-widest" data-tab="install-homebrew">
-          <svg class="inline-block h-3 w-3 mr-1.5 -mt-px" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M17 11h1a3 3 0 0 1 0 6h-1"/><path d="M3 11h14v7a4 4 0 0 1-4 4H7a4 4 0 0 1-4-4Z"/><path d="m6 8 4-6"/><path d="m11 8 2-4"/></svg>
-          Homebrew
-        </a>
-        <a href="#install-script" class="install-tab px-4 py-2.5 font-mono text-[10px] uppercase tracking-widest" data-tab="install-script">
-          <svg class="inline-block h-3 w-3 mr-1.5 -mt-px" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><polyline points="4 17 10 11 4 5"/><line x1="12" x2="20" y1="19" y2="19"/></svg>
-          Script
-        </a>
+    <div class="mx-auto mt-12 flex max-w-2xl flex-col gap-10">
+      <!-- macOS -->
+      <div>
+        <div class="mb-3 flex items-baseline justify-between">
+          <h3 class="font-mono text-xs uppercase tracking-widest text-text">macOS</h3>
+          <span class="font-mono text-[10px] uppercase tracking-widest text-dim">Apple Silicon</span>
+        </div>
+        <div class="install-box border border-border">
+          <div class="flex items-center border-b border-border">
+            <a href="#macos-homebrew" class="install-tab px-4 py-2.5 font-mono text-[10px] uppercase tracking-widest" data-tab="macos-homebrew">
+              <svg class="inline-block h-3 w-3 mr-1.5 -mt-px" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M17 11h1a3 3 0 0 1 0 6h-1"/><path d="M3 11h14v7a4 4 0 0 1-4 4H7a4 4 0 0 1-4-4Z"/><path d="m6 8 4-6"/><path d="m11 8 2-4"/></svg>
+              Homebrew
+            </a>
+            <a href="#macos-script" class="install-tab px-4 py-2.5 font-mono text-[10px] uppercase tracking-widest" data-tab="macos-script">
+              <svg class="inline-block h-3 w-3 mr-1.5 -mt-px" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><polyline points="4 17 10 11 4 5"/><line x1="12" x2="20" y1="19" y2="19"/></svg>
+              Script
+            </a>
+          </div>
+
+          <div class="install-panel relative p-5 font-mono text-xs leading-[1.8] md:p-6 md:text-sm" data-tab="macos-homebrew">
+            <CopyButton text="brew tap superhq-ai/tap && brew install shuru" />
+            <p class="text-dim"># Install</p>
+            <p>
+              <span class="text-dim">$</span>
+              <span class="text-text"> brew tap superhq-ai/tap && brew install shuru</span>
+            </p>
+            <br />
+            <p class="text-dim"># Run your first sandbox</p>
+            <p>
+              <span class="text-dim">$</span>
+              <span class="text-text"> shuru run</span>
+            </p>
+          </div>
+
+          <div class="install-panel relative p-5 font-mono text-xs leading-[1.8] md:p-6 md:text-sm" data-tab="macos-script">
+            <CopyButton text="curl -fsSL https://shuru.run/install.sh | sh" />
+            <p class="text-dim"># Install</p>
+            <p>
+              <span class="text-dim">$</span>
+              <span class="text-text"> curl -fsSL https://shuru.run/install.sh | sh</span>
+            </p>
+            <br />
+            <p class="text-dim"># Run your first sandbox</p>
+            <p>
+              <span class="text-dim">$</span>
+              <span class="text-text"> shuru run</span>
+            </p>
+          </div>
+        </div>
       </div>
 
-      <div class="install-panel active relative p-5 font-mono text-xs leading-[1.8] md:p-6 md:text-sm" data-tab="install-homebrew">
-        <CopyButton text="brew tap superhq-ai/tap && brew install shuru" />
-        <p class="text-dim"># Install</p>
-        <p>
-          <span class="text-dim">$</span>
-          <span class="text-text"> brew tap superhq-ai/tap && brew install shuru</span>
-        </p>
-        <br />
-        <p class="text-dim"># Run your first sandbox</p>
-        <p>
-          <span class="text-dim">$</span>
-          <span class="text-text"> shuru run</span>
-        </p>
-      </div>
+      <!-- Linux -->
+      <div>
+        <div class="mb-3 flex items-baseline justify-between">
+          <h3 class="font-mono text-xs uppercase tracking-widest text-text">Linux</h3>
+          <span class="font-mono text-[10px] uppercase tracking-widest text-dim">ARM64 &middot; KVM</span>
+        </div>
+        <div class="install-box border border-border">
+          <div class="flex items-center border-b border-border">
+            <a href="#linux-script" class="install-tab px-4 py-2.5 font-mono text-[10px] uppercase tracking-widest" data-tab="linux-script">
+              <svg class="inline-block h-3 w-3 mr-1.5 -mt-px" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><polyline points="4 17 10 11 4 5"/><line x1="12" x2="20" y1="19" y2="19"/></svg>
+              Script
+            </a>
+            <a href="/linux" class="install-tab ml-auto px-4 py-2.5 font-mono text-[10px] uppercase tracking-widest">
+              Setup guide &rarr;
+            </a>
+          </div>
 
-      <div class="install-panel relative p-5 font-mono text-xs leading-[1.8] md:p-6 md:text-sm" data-tab="install-script">
-        <CopyButton text="curl -fsSL https://shuru.run/install.sh | sh" />
-        <p class="text-dim"># Install</p>
-        <p>
-          <span class="text-dim">$</span>
-          <span class="text-text"> curl -fsSL https://shuru.run/install.sh | sh</span>
-        </p>
-        <br />
-        <p class="text-dim"># Run your first sandbox</p>
-        <p>
-          <span class="text-dim">$</span>
-          <span class="text-text"> shuru run</span>
-        </p>
+          <div class="install-panel relative p-5 font-mono text-xs leading-[1.8] md:p-6 md:text-sm" data-tab="linux-script">
+            <CopyButton text="curl -fsSL https://shuru.run/install.sh | sh" />
+            <p class="text-dim"># Check KVM access</p>
+            <p>
+              <span class="text-dim">$</span>
+              <span class="text-text"> ls /dev/kvm && groups | grep -q kvm</span>
+            </p>
+            <br />
+            <p class="text-dim"># Install</p>
+            <p>
+              <span class="text-dim">$</span>
+              <span class="text-text"> curl -fsSL https://shuru.run/install.sh | sh</span>
+            </p>
+            <br />
+            <p class="text-dim"># Run your first sandbox</p>
+            <p>
+              <span class="text-dim">$</span>
+              <span class="text-text"> shuru run</span>
+            </p>
+          </div>
+        </div>
       </div>
     </div>
   </div>
@@ -89,25 +138,38 @@ import CopyButton from "./CopyButton.astro";
 </style>
 
 <script>
-  const INSTALL_TABS = ['install-homebrew', 'install-script'];
-  const DEFAULT_TAB = 'install-homebrew';
+  function activateTab(tab: Element) {
+    const box = tab.closest('.install-box');
+    if (!box) return;
+    const id = tab.getAttribute('data-tab');
+    if (!id) return;
 
-  function activateInstall(tab: string) {
-    if (!INSTALL_TABS.includes(tab)) tab = DEFAULT_TAB;
+    box.querySelectorAll('.install-tab[data-tab]').forEach((t) => t.classList.remove('active'));
+    box.querySelectorAll('.install-panel').forEach((p) => p.classList.remove('active'));
 
-    document.querySelectorAll('.install-tab').forEach((t) => t.classList.remove('active'));
-    document.querySelectorAll('.install-panel').forEach((p) => p.classList.remove('active'));
-
-    document.querySelector(`.install-tab[data-tab="${tab}"]`)?.classList.add('active');
-    document.querySelector(`.install-panel[data-tab="${tab}"]`)?.classList.add('active');
+    tab.classList.add('active');
+    box.querySelector(`.install-panel[data-tab="${id}"]`)?.classList.add('active');
   }
 
-  activateInstall(window.location.hash.replace('#', '') || DEFAULT_TAB);
-
-  window.addEventListener('hashchange', () => {
-    const hash = window.location.hash.replace('#', '');
-    if (INSTALL_TABS.includes(hash)) {
-      activateInstall(hash);
-    }
+  document.querySelectorAll('.install-tab[data-tab]').forEach((tab) => {
+    tab.addEventListener('click', (e) => {
+      e.preventDefault();
+      activateTab(tab);
+      const id = tab.getAttribute('data-tab');
+      if (id) history.replaceState(null, '', `#${id}`);
+    });
   });
+
+  function initFromHash() {
+    const hash = window.location.hash.replace('#', '');
+    document.querySelectorAll('.install-box').forEach((box) => {
+      let target: Element | null = null;
+      if (hash) target = box.querySelector(`.install-tab[data-tab="${hash}"]`);
+      if (!target) target = box.querySelector('.install-tab[data-tab]');
+      if (target) activateTab(target);
+    });
+  }
+
+  initFromHash();
+  window.addEventListener('hashchange', initFromHash);
 </script>

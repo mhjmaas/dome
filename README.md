@@ -1,12 +1,15 @@
 # shuru
 
-Local-first microVM sandbox for AI agents on macOS.
+Local-first microVM sandbox for AI agents on macOS, with experimental Linux support.
 
-Shuru boots lightweight Linux VMs using Apple's Virtualization.framework. Each sandbox is ephemeral: the rootfs resets on every run, giving agents a disposable environment to execute code, install packages, and run tools without touching your host.
+Shuru boots lightweight Linux VMs for AI agents. On macOS it uses Apple's Virtualization.framework. On Linux it uses a KVM backend that is now available as an experimental release build for ARM64 hosts. Every sandbox is ephemeral: the rootfs resets on every run, giving agents a disposable environment to execute code, install packages, and run tools without touching your host.
+
+> **Experimental Linux support:** Linux builds are available for testing, but they are not ready for production use yet. Expect rough edges, missing polish, and compatibility gaps.
 
 ## Requirements
 
 - macOS 14 (Sonoma) or later on Apple Silicon
+- Linux ARM64 with KVM access (`/dev/kvm`) for experimental testing only
 
 ## Install
 
@@ -19,6 +22,10 @@ Or via the install script:
 ```sh
 curl -fsSL https://raw.githubusercontent.com/superhq-ai/shuru/main/install.sh | sh
 ```
+
+The install script supports macOS on Apple Silicon and experimental Linux ARM64. Linux users can also download the `linux-aarch64` release tarball manually from GitHub Releases if they prefer.
+
+> **Note:** Homebrew remains macOS-only. Linux installs via the script are still experimental and not ready for production use.
 
 ## Usage
 

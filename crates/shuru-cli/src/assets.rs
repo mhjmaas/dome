@@ -74,8 +74,7 @@ fn download_os_image_version(data_dir: &str, version: &str) -> Result<()> {
 
     // Write VERSION file
     let version_file = format!("{}/VERSION", data_dir);
-    fs::write(&version_file, format!("{}\n", version))
-        .context("failed to write VERSION file")?;
+    fs::write(&version_file, format!("{}\n", version)).context("failed to write VERSION file")?;
 
     eprintln!("shuru: OS image ready ({})", version);
     Ok(())
@@ -84,6 +83,16 @@ fn download_os_image_version(data_dir: &str, version: &str) -> Result<()> {
 #[derive(Deserialize)]
 struct GithubRelease {
     tag_name: String,
+}
+
+fn cli_tarball_name(version: &str) -> Result<String> {
+    let platform = match (std::env::consts::OS, std::env::consts::ARCH) {
+        ("macos", "aarch64") => "darwin-aarch64",
+        ("linux", "aarch64") => "linux-aarch64",
+        (os, arch) => bail!("automatic upgrade is not supported on {}-{}", os, arch),
+    };
+
+    Ok(format!("shuru-v{}-{}.tar.gz", version, platform))
 }
 
 /// Check for a newer release and upgrade the CLI binary + OS image.
@@ -112,20 +121,20 @@ pub fn upgrade(data_dir: &str) -> Result<()> {
         .read_json()
         .context("failed to parse release info")?;
 
-    let latest = release.tag_name.strip_prefix('v').unwrap_or(&release.tag_name);
+    let latest = release
+        .tag_name
+        .strip_prefix('v')
+        .unwrap_or(&release.tag_name);
 
     if latest == CURRENT_VERSION {
         eprintln!("shuru: already on latest version ({})", CURRENT_VERSION);
         return Ok(());
     }
 
-    eprintln!(
-        "shuru: upgrading {} -> {}",
-        CURRENT_VERSION, latest
-    );
+    eprintln!("shuru: upgrading {} -> {}", CURRENT_VERSION, latest);
 
     // Update CLI binary
-    let cli_tarball = format!("shuru-v{}-darwin-aarch64.tar.gz", latest);
+    let cli_tarball = cli_tarball_name(latest)?;
     let cli_url = format!(
         "https://github.com/{}/releases/download/v{}/{}",
         GITHUB_REPO, latest, cli_tarball
@@ -155,8 +164,7 @@ pub fn upgrade(data_dir: &str) -> Result<()> {
     for entry in archive.entries().context("failed to read CLI archive")? {
         let mut entry = entry.context("failed to read archive entry")?;
         if entry.path()?.to_str() == Some("shuru") {
-            let mut out = fs::File::create(&tmp_path)
-                .context("failed to create temp binary")?;
+            let mut out = fs::File::create(&tmp_path).context("failed to create temp binary")?;
             io::copy(&mut entry, &mut out)?;
             break;
         }
@@ -226,7 +234,11 @@ impl<R: Read> Read for ProgressReader<R> {
             let mut stderr = io::stderr().lock();
             if let Some(total) = self.total_bytes {
                 let total_mb = total / (1024 * 1024);
-                let _ = write!(stderr, "\rshuru: downloaded {} / {} MB", current_mb, total_mb);
+                let _ = write!(
+                    stderr,
+                    "\rshuru: downloaded {} / {} MB",
+                    current_mb, total_mb
+                );
             } else {
                 let _ = write!(stderr, "\rshuru: downloaded {} MB", current_mb);
             }

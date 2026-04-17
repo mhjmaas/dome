@@ -3,21 +3,38 @@ set -eu
 
 REPO="superhq-ai/shuru"
 INSTALL_DIR="$HOME/.local/bin"
+PLATFORM=""
 
 ##### Platform checks
 
 OS="$(uname -s)"
 ARCH="$(uname -m)"
 
-if [ "$OS" != "Darwin" ]; then
-    echo "Error: shuru only supports macOS. Detected: $OS" >&2
-    exit 1
-fi
-
-if [ "$ARCH" != "arm64" ]; then
-    echo "Error: shuru requires Apple Silicon (arm64). Detected: $ARCH" >&2
-    exit 1
-fi
+case "$OS" in
+    Darwin)
+        if [ "$ARCH" != "arm64" ]; then
+            echo "Error: shuru requires Apple Silicon (arm64) on macOS. Detected: $ARCH" >&2
+            exit 1
+        fi
+        PLATFORM="darwin-aarch64"
+        ;;
+    Linux)
+        case "$ARCH" in
+            aarch64|arm64)
+                PLATFORM="linux-aarch64"
+                echo "Warning: Linux support is experimental and not ready for production use yet." >&2
+                ;;
+            *)
+                echo "Error: shuru Linux builds currently support ARM64 only. Detected: $ARCH" >&2
+                exit 1
+                ;;
+        esac
+        ;;
+    *)
+        echo "Error: shuru only supports macOS and Linux. Detected: $OS" >&2
+        exit 1
+        ;;
+esac
 
 ##### Fetch latest release tag
 
@@ -34,7 +51,7 @@ echo "Latest version: $VERSION"
 
 ##### Download and extract
 
-TARBALL="shuru-v${VERSION}-darwin-aarch64.tar.gz"
+TARBALL="shuru-v${VERSION}-${PLATFORM}.tar.gz"
 URL="https://github.com/${REPO}/releases/download/${TAG}/${TARBALL}"
 
 TMPDIR=$(mktemp -d)
@@ -46,7 +63,9 @@ curl -fsSL "$URL" -o "$TMPDIR/$TARBALL"
 mkdir -p "$INSTALL_DIR"
 tar -xzf "$TMPDIR/$TARBALL" -C "$INSTALL_DIR"
 chmod +x "$INSTALL_DIR/shuru"
-xattr -d com.apple.quarantine "$INSTALL_DIR/shuru" 2>/dev/null || true
+if [ "$OS" = "Darwin" ]; then
+    xattr -d com.apple.quarantine "$INSTALL_DIR/shuru" 2>/dev/null || true
+fi
 
 echo ""
 echo "Installed shuru $VERSION to $INSTALL_DIR/shuru"

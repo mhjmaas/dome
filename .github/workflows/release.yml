@@ -51,7 +51,7 @@ jobs:
           path: shuru-os-*.tar.gz
           retention-days: 1
 
-  build-cli:
+  build-cli-darwin:
     runs-on: macos-14
     steps:
       - uses: actions/checkout@v4
@@ -75,12 +75,37 @@ jobs:
       - name: Upload artifact
         uses: actions/upload-artifact@v4
         with:
-          name: cli-binary
+          name: cli-binary-darwin
+          path: shuru-*.tar.gz
+          retention-days: 1
+
+  build-cli-linux:
+    runs-on: ubuntu-24.04-arm
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Build CLI
+        run: cargo build -p shuru-cli --release
+
+      - name: Package CLI binary
+        run: |
+          VERSION="${GITHUB_REF_NAME}"
+          tar czf "shuru-${VERSION}-linux-aarch64.tar.gz" \
+            -C target/release \
+            shuru
+
+      - name: Upload artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: cli-binary-linux
           path: shuru-*.tar.gz
           retention-days: 1
 
   release:
-    needs: [build-os-image, build-cli]
+    needs: [build-os-image, build-cli-darwin, build-cli-linux]
     runs-on: ubuntu-latest
     steps:
       - uses: actions/download-artifact@v4
@@ -90,7 +115,12 @@ jobs:
 
       - uses: actions/download-artifact@v4
         with:
-          name: cli-binary
+          name: cli-binary-darwin
+          path: artifacts/
+
+      - uses: actions/download-artifact@v4
+        with:
+          name: cli-binary-linux
           path: artifacts/
 
       - name: Create release
@@ -112,7 +142,7 @@ jobs:
       - name: Download CLI artifact
         uses: actions/download-artifact@v4
         with:
-          name: cli-binary
+          name: cli-binary-darwin
           path: /tmp/artifact
 
       - name: Update formula

@@ -17,11 +17,5 @@ socket2 = "0.5"
 
 [target.'cfg(target_os = "macos")'.dependencies]
 shuru-darwin = { version = "0.1.1", path = "../shuru-darwin" }
-
-[lints.rust.unexpected_cfgs]
-level = "warn"
-check-cfg = ['cfg(feature, values("shuru-linux"))']
-
-# shuru-linux is not yet published; uncomment when ready
-# [target.'cfg(target_os = "linux")'.dependencies]
-# shuru-linux = { version = "0.1.0", path = "../shuru-linux" }
+[target.'cfg(target_os = "linux")'.dependencies]
+shuru-linux = { version = "0.1.0", path = "../shuru-linux" }
