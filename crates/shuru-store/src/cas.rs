@@ -64,7 +64,6 @@ impl ChunkStore for LocalChunkStore {
 
 /// Index mapping chunk positions to hashes. One index per disk image / checkpoint.
 /// ZERO entries mean "ask parent" — enables delta-only checkpoints.
-#[derive(Debug)]
 pub struct ChunkIndex {
     hashes: Vec<String>,
     disk_size: u64,
@@ -508,8 +507,10 @@ mod tests {
         f.write_all(&0u32.to_le_bytes()).unwrap(); // fallback_path len
         drop(f);
 
-        let err = ChunkIndex::load(idx_path.to_str().unwrap()).unwrap_err();
-        assert!(err.to_string().contains("chunk count"), "{}", err);
+        match ChunkIndex::load(idx_path.to_str().unwrap()) {
+            Err(e) => assert!(e.to_string().contains("chunk count")),
+            Ok(_) => panic!("expected load to fail for mismatched chunk count"),
+        }
     }
 
     #[test]
@@ -517,7 +518,9 @@ mod tests {
         let index = ChunkIndex::new(1024 * 1024); // 1MB
         assert!(index.check_size_against_backend(1024 * 1024, "test").is_ok());
         assert!(index.check_size_against_backend(2 * 1024 * 1024, "test").is_ok());
-        let err = index.check_size_against_backend(512 * 1024, "test").unwrap_err();
-        assert!(err.to_string().contains("exceeds"), "{}", err);
+        match index.check_size_against_backend(512 * 1024, "test") {
+            Err(e) => assert!(e.to_string().contains("exceeds")),
+            Ok(_) => panic!("expected size check to fail"),
+        }
     }
 }
