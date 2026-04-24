@@ -34,7 +34,9 @@ impl NbdHandle {
 
     /// Save the current disk state as a checkpoint index. Only works with CAS backend.
     pub fn save_checkpoint(&self, index_path: &str) -> Result<()> {
-        let backend = self.cas_backend.as_ref()
+        let backend = self
+            .cas_backend
+            .as_ref()
             .ok_or_else(|| anyhow::anyhow!("save_checkpoint requires CAS backend"))?;
         backend.save_index(index_path)
     }
@@ -53,7 +55,9 @@ impl Drop for NbdHandle {
         // Interrupt any active client read by shutting down the socket
         let fd = self.active_fd.load(Ordering::Acquire);
         if fd >= 0 {
-            unsafe { libc::shutdown(fd, libc::SHUT_RDWR); }
+            unsafe {
+                libc::shutdown(fd, libc::SHUT_RDWR);
+            }
         }
         // Unblock accept() with a dummy connection
         let _ = std::os::unix::net::UnixStream::connect(&self.socket_path);
@@ -136,9 +140,10 @@ pub fn start_cas_nbd_server(
         info!("loading CAS index from {}", index_path);
         let idx = ChunkIndex::load(index_path)?;
         // If the index has a fallback_path, open it and validate disk_size
-        let fb = idx.fallback_path.as_ref().and_then(|p| {
-            FlatFileBackend::open(p).ok()
-        });
+        let fb = idx
+            .fallback_path
+            .as_ref()
+            .and_then(|p| FlatFileBackend::open(p).ok());
         if let Some(ref fb) = fb {
             anyhow::ensure!(
                 fb.size() <= idx.disk_size(),
@@ -149,8 +154,9 @@ pub fn start_cas_nbd_server(
         (idx, fb, Some(index_path.to_string()))
     } else {
         // No index yet — create empty index with fallback to flat file for lazy ingestion
-        let fb = FlatFileBackend::open(rootfs_path)
-            .with_context(|| format!("failed to open rootfs for lazy ingestion: {}", rootfs_path))?;
+        let fb = FlatFileBackend::open(rootfs_path).with_context(|| {
+            format!("failed to open rootfs for lazy ingestion: {}", rootfs_path)
+        })?;
         let disk_size = fb.size();
         info!("CAS: lazy mode, {} MB rootfs", disk_size / (1024 * 1024));
         (ChunkIndex::new(disk_size), Some(fb), None)

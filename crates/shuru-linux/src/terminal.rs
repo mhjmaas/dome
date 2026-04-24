@@ -185,10 +185,7 @@ impl StdinRelay {
     /// is signaled.
     pub fn wait(&self) -> StdinEvent {
         unsafe {
-            let mut events = [libc::epoll_event {
-                events: 0,
-                u64: 0,
-            }; 4];
+            let mut events = [libc::epoll_event { events: 0, u64: 0 }; 4];
 
             let n = libc::epoll_wait(self.epoll_fd, events.as_mut_ptr(), 4, -1);
             if n < 1 {

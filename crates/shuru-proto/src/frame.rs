@@ -97,13 +97,8 @@ pub fn read_frame(r: &mut impl Read) -> io::Result<Option<(u8, Vec<u8>)>> {
 }
 
 /// Serialize `msg` as JSON and send it as a typed frame.
-pub fn send_json(
-    w: &mut impl Write,
-    msg_type: u8,
-    msg: &impl serde::Serialize,
-) -> io::Result<()> {
-    let payload =
-        serde_json::to_vec(msg).map_err(|e| io::Error::new(io::ErrorKind::Other, e))?;
+pub fn send_json(w: &mut impl Write, msg_type: u8, msg: &impl serde::Serialize) -> io::Result<()> {
+    let payload = serde_json::to_vec(msg).map_err(|e| io::Error::new(io::ErrorKind::Other, e))?;
     write_frame(w, msg_type, &payload)
 }
 
@@ -155,9 +150,6 @@ pub fn parse_exit_code(payload: &[u8]) -> Option<i32> {
         return None;
     }
     Some(i32::from_be_bytes([
-        payload[0],
-        payload[1],
-        payload[2],
-        payload[3],
+        payload[0], payload[1], payload[2], payload[3],
     ]))
 }

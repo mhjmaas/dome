@@ -1,5 +1,5 @@
-pub mod layout;
 pub mod devices;
+pub mod layout;
 pub mod virtio_fs;
 
 use std::fs::File;
@@ -10,19 +10,16 @@ use std::sync::{Arc, Mutex};
 use std::os::unix::thread::JoinHandleExt;
 
 use kvm_bindings::kvm_device_type_KVM_DEV_TYPE_ARM_VGIC_V3;
-use kvm_ioctls::{Kvm, VmFd, VcpuFd, DeviceFd};
-use vm_memory::{Address, GuestAddress, GuestMemory, GuestMemoryMmap, Bytes};
-use linux_loader::loader::{KernelLoader, pe::PE};
+use kvm_ioctls::{DeviceFd, Kvm, VcpuFd, VmFd};
+use linux_loader::loader::{pe::PE, KernelLoader};
+use vm_memory::{Address, Bytes, GuestAddress, GuestMemory, GuestMemoryMmap};
 
-use crate::error::VzError;
-use self::layout::*;
 use self::devices::*;
+use self::layout::*;
+use crate::error::VzError;
 
 // Use the actual constants from kvm-bindings (not our hand-defined ones)
-use kvm_bindings::{
-    KVM_DEV_ARM_VGIC_GRP_ADDR,
-    KVM_DEV_ARM_VGIC_GRP_CTRL,
-};
+use kvm_bindings::{KVM_DEV_ARM_VGIC_GRP_ADDR, KVM_DEV_ARM_VGIC_GRP_CTRL};
 
 // ===========================================================================
 // VM creation
@@ -62,8 +59,8 @@ pub struct VmCreateConfig {
 
 impl KvmVm {
     pub fn create(config: VmCreateConfig) -> Result<Self, VzError> {
-        let kvm = Kvm::new()
-            .map_err(|e| VzError::new(format!("failed to open /dev/kvm: {}", e)))?;
+        let kvm =
+            Kvm::new().map_err(|e| VzError::new(format!("failed to open /dev/kvm: {}", e)))?;
         let vm_fd = kvm
             .create_vm()
             .map_err(|e| VzError::new(format!("failed to create VM: {}", e)))?;
@@ -98,13 +95,8 @@ impl KvmVm {
             .map_err(|e| VzError::new(format!("failed to open kernel: {}", e)))?;
         // kernel_offset must be 2MB-aligned. The PE loader adds text_offset
         // from the image header internally, so pass DRAM_BASE (1 GiB aligned).
-        let kernel_result = PE::load(
-            &mem,
-            Some(GuestAddress(DRAM_BASE)),
-            &mut kernel_file,
-            None,
-        )
-        .map_err(|e| VzError::new(format!("failed to load kernel: {}", e)))?;
+        let kernel_result = PE::load(&mem, Some(GuestAddress(DRAM_BASE)), &mut kernel_file, None)
+            .map_err(|e| VzError::new(format!("failed to load kernel: {}", e)))?;
         let entry_addr = kernel_result.kernel_load.raw_value();
 
         // Load initrd
@@ -150,7 +142,12 @@ impl KvmVm {
             bus.add(
                 base,
                 VIRTIO_MMIO_SIZE,
-                Box::new(VirtioMmioDevice::new(Box::new(blk), spi, vm_fd.clone(), mem.clone())),
+                Box::new(VirtioMmioDevice::new(
+                    Box::new(blk),
+                    spi,
+                    vm_fd.clone(),
+                    mem.clone(),
+                )),
             );
             virtio_idx += 1;
         }
@@ -175,8 +172,12 @@ impl KvmVm {
 
         // Virtio-fs mounts (one device per mount)
         for (tag, host_path, read_only) in &config.mounts {
-            let fs = virtio_fs::VirtioFsBackend::new(tag, host_path, *read_only)
-                .map_err(|e| VzError::new(format!("failed to set up virtio-fs for tag '{}': {}", tag, e)))?;
+            let fs = virtio_fs::VirtioFsBackend::new(tag, host_path, *read_only).map_err(|e| {
+                VzError::new(format!(
+                    "failed to set up virtio-fs for tag '{}': {}",
+                    tag, e
+                ))
+            })?;
             let spi = VIRTIO_SPI_BASE + virtio_idx;
             let base = VIRTIO_MMIO_BASE + (virtio_idx as u64) * VIRTIO_MMIO_GAP;
             bus.add(
@@ -194,7 +195,9 @@ impl KvmVm {
 
         // Virtio net
         if let Some(net_fd) = config.network_fd {
-            let mac = config.network_mac.unwrap_or([0x02, 0x00, 0x00, 0x00, 0x00, 0x01]);
+            let mac = config
+                .network_mac
+                .unwrap_or([0x02, 0x00, 0x00, 0x00, 0x00, 0x01]);
             let spi = VIRTIO_SPI_BASE + virtio_idx;
             let base = VIRTIO_MMIO_BASE + (virtio_idx as u64) * VIRTIO_MMIO_GAP;
             bus.add(
@@ -360,12 +363,7 @@ fn create_gic(vm_fd: &VmFd, _vcpu_count: u64) -> Result<DeviceFd, VzError> {
 // vCPU init
 // ===========================================================================
 
-fn init_vcpu(
-    vm_fd: &VmFd,
-    vcpu: &VcpuFd,
-    cpu_id: usize,
-    entry_addr: u64,
-) -> Result<(), VzError> {
+fn init_vcpu(vm_fd: &VmFd, vcpu: &VcpuFd, cpu_id: usize, entry_addr: u64) -> Result<(), VzError> {
     let mut kvi = kvm_bindings::kvm_vcpu_init::default();
     vm_fd
         .get_preferred_target(&mut kvi)
@@ -406,11 +404,11 @@ fn generate_fdt(
 ) -> Result<Vec<u8>, VzError> {
     use vm_fdt::FdtWriter;
 
-    let mut fdt = FdtWriter::new()
-        .map_err(|e| VzError::new(format!("FdtWriter::new: {}", e)))?;
+    let mut fdt = FdtWriter::new().map_err(|e| VzError::new(format!("FdtWriter::new: {}", e)))?;
 
     let root = fdt.begin_node("").unwrap();
-    fdt.property_string("compatible", "linux,dummy-virt").unwrap();
+    fdt.property_string("compatible", "linux,dummy-virt")
+        .unwrap();
     fdt.property_u32("#address-cells", 2).unwrap();
     fdt.property_u32("#size-cells", 2).unwrap();
     fdt.property_u32("interrupt-parent", 1).unwrap();
@@ -418,17 +416,20 @@ fn generate_fdt(
     // /chosen
     let chosen = fdt.begin_node("chosen").unwrap();
     fdt.property_string("bootargs", cmdline).unwrap();
-    fdt.property_string("stdout-path", "/pl011@9000000").unwrap();
+    fdt.property_string("stdout-path", "/pl011@9000000")
+        .unwrap();
     if let Some(addr) = initrd_addr {
         fdt.property_u64("linux,initrd-start", addr).unwrap();
-        fdt.property_u64("linux,initrd-end", addr + initrd_size).unwrap();
+        fdt.property_u64("linux,initrd-end", addr + initrd_size)
+            .unwrap();
     }
     fdt.end_node(chosen).unwrap();
 
     // /memory
     let mem_node = fdt.begin_node(&format!("memory@{:x}", DRAM_BASE)).unwrap();
     fdt.property_string("device_type", "memory").unwrap();
-    fdt.property_array_u64("reg", &[DRAM_BASE, mem_size]).unwrap();
+    fdt.property_array_u64("reg", &[DRAM_BASE, mem_size])
+        .unwrap();
     fdt.end_node(mem_node).unwrap();
 
     // /cpus
@@ -447,36 +448,45 @@ fn generate_fdt(
 
     // /psci
     let psci = fdt.begin_node("psci").unwrap();
-    fdt.property_string_list("compatible", vec![
-        "arm,psci-1.0".into(),
-        "arm,psci-0.2".into(),
-    ]).unwrap();
+    fdt.property_string_list(
+        "compatible",
+        vec!["arm,psci-1.0".into(), "arm,psci-0.2".into()],
+    )
+    .unwrap();
     fdt.property_string("method", "hvc").unwrap();
     fdt.end_node(psci).unwrap();
 
     // /intc (GIC-v3)
     let redist_size = cpu_count as u64 * GIC_REDIST_SIZE_PER_CPU;
-    let gic = fdt.begin_node(&format!("intc@{:x}", GIC_DIST_BASE)).unwrap();
+    let gic = fdt
+        .begin_node(&format!("intc@{:x}", GIC_DIST_BASE))
+        .unwrap();
     fdt.property_string("compatible", "arm,gic-v3").unwrap();
     fdt.property_u32("#interrupt-cells", 3).unwrap();
     fdt.property_null("interrupt-controller").unwrap();
     fdt.property_u32("phandle", 1).unwrap();
-    fdt.property_array_u64("reg", &[
-        GIC_DIST_BASE, GIC_DIST_SIZE,
-        GIC_REDIST_BASE, redist_size,
-    ]).unwrap();
+    fdt.property_array_u64(
+        "reg",
+        &[GIC_DIST_BASE, GIC_DIST_SIZE, GIC_REDIST_BASE, redist_size],
+    )
+    .unwrap();
     fdt.end_node(gic).unwrap();
 
     // /timer
     let timer = fdt.begin_node("timer").unwrap();
-    fdt.property_string("compatible", "arm,armv8-timer").unwrap();
+    fdt.property_string("compatible", "arm,armv8-timer")
+        .unwrap();
     fdt.property_null("always-on").unwrap();
-    fdt.property_array_u32("interrupts", &[
-        1, 13, 8, // secure phys
-        1, 14, 8, // non-secure phys
-        1, 11, 8, // virtual
-        1, 10, 8, // hypervisor
-    ]).unwrap();
+    fdt.property_array_u32(
+        "interrupts",
+        &[
+            1, 13, 8, // secure phys
+            1, 14, 8, // non-secure phys
+            1, 11, 8, // virtual
+            1, 10, 8, // hypervisor
+        ],
+    )
+    .unwrap();
     fdt.end_node(timer).unwrap();
 
     // /pclk (fixed clock for PL011)
@@ -489,26 +499,29 @@ fn generate_fdt(
 
     // /pl011
     let uart = fdt.begin_node(&format!("pl011@{:x}", UART_BASE)).unwrap();
-    fdt.property_string_list("compatible", vec![
-        "arm,pl011".into(),
-        "arm,primecell".into(),
-    ]).unwrap();
-    fdt.property_array_u64("reg", &[UART_BASE, UART_SIZE]).unwrap();
-    fdt.property_array_u32("interrupts", &[0, UART_SPI, 4]).unwrap();
-    fdt.property_string_list("clock-names", vec![
-        "uartclk".into(),
-        "apb_pclk".into(),
-    ]).unwrap();
+    fdt.property_string_list(
+        "compatible",
+        vec!["arm,pl011".into(), "arm,primecell".into()],
+    )
+    .unwrap();
+    fdt.property_array_u64("reg", &[UART_BASE, UART_SIZE])
+        .unwrap();
+    fdt.property_array_u32("interrupts", &[0, UART_SPI, 4])
+        .unwrap();
+    fdt.property_string_list("clock-names", vec!["uartclk".into(), "apb_pclk".into()])
+        .unwrap();
     fdt.property_array_u32("clocks", &[2, 2]).unwrap();
     fdt.end_node(uart).unwrap();
 
     // /pl031 RTC (no IRQ — we only expose the data register, no alarm)
     let rtc = fdt.begin_node(&format!("pl031@{:x}", RTC_BASE)).unwrap();
-    fdt.property_string_list("compatible", vec![
-        "arm,pl031".into(),
-        "arm,primecell".into(),
-    ]).unwrap();
-    fdt.property_array_u64("reg", &[RTC_BASE, RTC_SIZE]).unwrap();
+    fdt.property_string_list(
+        "compatible",
+        vec!["arm,pl031".into(), "arm,primecell".into()],
+    )
+    .unwrap();
+    fdt.property_array_u64("reg", &[RTC_BASE, RTC_SIZE])
+        .unwrap();
     fdt.property_string("clock-names", "apb_pclk").unwrap();
     fdt.property_u32("clocks", 2).unwrap();
     fdt.end_node(rtc).unwrap();
@@ -519,24 +532,22 @@ fn generate_fdt(
         let spi = VIRTIO_SPI_BASE + i;
         let node = fdt.begin_node(&format!("virtio_mmio@{:x}", base)).unwrap();
         fdt.property_string("compatible", "virtio,mmio").unwrap();
-        fdt.property_array_u64("reg", &[base, VIRTIO_MMIO_SIZE]).unwrap();
+        fdt.property_array_u64("reg", &[base, VIRTIO_MMIO_SIZE])
+            .unwrap();
         fdt.property_array_u32("interrupts", &[0, spi, 4]).unwrap(); // SPI, level-high
         fdt.end_node(node).unwrap();
     }
 
     fdt.end_node(root).unwrap();
-    fdt.finish().map_err(|e| VzError::new(format!("FDT finish: {}", e)))
+    fdt.finish()
+        .map_err(|e| VzError::new(format!("FDT finish: {}", e)))
 }
 
 // ===========================================================================
 // vCPU run loop
 // ===========================================================================
 
-fn vcpu_run_loop(
-    mut vcpu: VcpuFd,
-    bus: Arc<Mutex<MmioBus>>,
-    running: Arc<AtomicBool>,
-) {
+fn vcpu_run_loop(mut vcpu: VcpuFd, bus: Arc<Mutex<MmioBus>>, running: Arc<AtomicBool>) {
     // Install empty handler for SIGRTMIN so KVM_RUN returns EINTR on stop
     unsafe {
         let mut sa: libc::sigaction = std::mem::zeroed();

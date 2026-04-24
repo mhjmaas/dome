@@ -173,9 +173,7 @@ mod tests {
     use std::sync::{Arc, RwLock};
 
     fn new_allowed(cap: usize) -> AllowedIps {
-        Arc::new(RwLock::new(LruCache::new(
-            NonZeroUsize::new(cap).unwrap(),
-        )))
+        Arc::new(RwLock::new(LruCache::new(NonZeroUsize::new(cap).unwrap())))
     }
 
     /// Build a minimal DNS A query for testing.

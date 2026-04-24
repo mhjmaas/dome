@@ -61,7 +61,12 @@ mod guest {
         mount_fs("sysfs", "/sys", "sysfs", None);
         mount_fs("devtmpfs", "/dev", "devtmpfs", None);
         std::fs::create_dir_all("/dev/pts").ok();
-        mount_fs("devpts", "/dev/pts", "devpts", Some("newinstance,ptmxmode=0666"));
+        mount_fs(
+            "devpts",
+            "/dev/pts",
+            "devpts",
+            Some("newinstance,ptmxmode=0666"),
+        );
         mount_fs("tmpfs", "/tmp", "tmpfs", None);
     }
 
@@ -70,7 +75,10 @@ mod guest {
             return MountResponse {
                 tag: req.tag.clone(),
                 ok: false,
-                error: Some(format!("failed to create mount point {}: {}", req.guest_path, e)),
+                error: Some(format!(
+                    "failed to create mount point {}: {}",
+                    req.guest_path, e
+                )),
             };
         }
 
@@ -131,7 +139,10 @@ mod guest {
 
     fn mount_direct(tag: &str, guest_path: &str) -> Result<(), String> {
         if !mount_fs(tag, guest_path, "virtiofs", None) {
-            return Err(format!("failed to mount virtiofs device '{}' at {}", tag, guest_path));
+            return Err(format!(
+                "failed to mount virtiofs device '{}' at {}",
+                tag, guest_path
+            ));
         }
         eprintln!("shuru-guest: mounted {} -> {} (direct rw)", tag, guest_path);
         Ok(())
@@ -505,11 +516,7 @@ mod guest {
         }
     }
 
-    fn handle_write_file(
-        req: &WriteFileRequest,
-        reader: &mut impl Read,
-        writer: &mut impl Write,
-    ) {
+    fn handle_write_file(req: &WriteFileRequest, reader: &mut impl Read, writer: &mut impl Write) {
         let data = match frame::read_frame(reader) {
             Ok(Some((frame::WRITE_FILE_DATA, payload))) => payload,
             _ => {
@@ -541,8 +548,13 @@ mod guest {
 
         match std::fs::write(&req.path, &data) {
             Ok(()) => {
-                unsafe { libc::sync(); }
-                let resp = WriteFileResponse { ok: true, error: None };
+                unsafe {
+                    libc::sync();
+                }
+                let resp = WriteFileResponse {
+                    ok: true,
+                    error: None,
+                };
                 let _ = frame::send_json(writer, frame::WRITE_FILE_RESP, &resp);
             }
             Err(e) => {
@@ -556,7 +568,10 @@ mod guest {
     }
 
     fn send_fs_ok(writer: &mut impl Write) {
-        let resp = FsOkResponse { ok: true, error: None };
+        let resp = FsOkResponse {
+            ok: true,
+            error: None,
+        };
         let _ = frame::send_json(writer, frame::FS_OK_RESP, &resp);
     }
 
@@ -598,7 +613,12 @@ mod guest {
             // `strip_components` mirrors `tar --strip-components=N` — the caller
             // knows whether their tarball is directory-wrapped (Node, Pi → strip 1)
             // or flat (Codex → strip 0). The guest doesn't inspect structure.
-            let progress_writer = DownloadProgressWriter { writer, bytes: 0, total_bytes, last_report: 0 };
+            let progress_writer = DownloadProgressWriter {
+                writer,
+                bytes: 0,
+                total_bytes,
+                last_report: 0,
+            };
             let tee = TeeReader::new(&mut body, progress_writer);
             let decoder = flate2::read::GzDecoder::new(tee);
             let mut archive = tar::Archive::new(decoder);
@@ -672,7 +692,10 @@ mod guest {
                         bytes_downloaded += n as u64;
                         if bytes_downloaded - last_report >= 65536 {
                             last_report = bytes_downloaded;
-                            let progress = DownloadProgress { bytes_downloaded, total_bytes };
+                            let progress = DownloadProgress {
+                                bytes_downloaded,
+                                total_bytes,
+                            };
                             let _ = frame::send_json(writer, frame::DOWNLOAD_PROGRESS, &progress);
                         }
                     }
@@ -863,7 +886,9 @@ mod guest {
     /// Check if a directory has the overlay opaque xattr (trusted.overlay.opaque=y).
     fn is_overlay_opaque(path: &str) -> bool {
         use std::ffi::CString;
-        let Ok(c_path) = CString::new(path) else { return false };
+        let Ok(c_path) = CString::new(path) else {
+            return false;
+        };
         let attr = c"trusted.overlay.opaque";
         let mut buf = [0u8; 2];
         let ret = unsafe {
@@ -880,13 +905,19 @@ mod guest {
     fn handle_rename(req: &RenameRequest, writer: &mut impl Write) {
         match std::fs::rename(&req.old_path, &req.new_path) {
             Ok(()) => send_fs_ok(writer),
-            Err(e) => send_fs_err(writer, format!("rename {} -> {}: {}", req.old_path, req.new_path, e)),
+            Err(e) => send_fs_err(
+                writer,
+                format!("rename {} -> {}: {}", req.old_path, req.new_path, e),
+            ),
         }
     }
 
     fn handle_copy(req: &CopyRequest, writer: &mut impl Write) {
         let result = if req.recursive {
-            copy_dir_recursive(std::path::Path::new(&req.src), std::path::Path::new(&req.dst))
+            copy_dir_recursive(
+                std::path::Path::new(&req.src),
+                std::path::Path::new(&req.dst),
+            )
         } else {
             std::fs::copy(&req.src, &req.dst).map(|_| ())
         };
@@ -951,7 +982,11 @@ mod guest {
         }
     }
 
-    fn handle_piped_exec(req: &ExecRequest, vsock_reader: std::net::TcpStream, vsock_writer: std::net::TcpStream) {
+    fn handle_piped_exec(
+        req: &ExecRequest,
+        vsock_reader: std::net::TcpStream,
+        vsock_writer: std::net::TcpStream,
+    ) {
         let mut cmd = Command::new(&req.argv[0]);
         if req.argv.len() > 1 {
             cmd.args(&req.argv[1..]);
@@ -1057,7 +1092,9 @@ mod guest {
                 let status = child.wait().expect("failed to wait on child");
                 let exit_code = status.code().unwrap_or(-1);
 
-                unsafe { libc::sync(); }
+                unsafe {
+                    libc::sync();
+                }
 
                 let _ = tx.send((frame::EXIT, frame::exit_payload(exit_code).to_vec()));
                 drop(tx);
@@ -1080,15 +1117,19 @@ mod guest {
         let mounts = std::fs::read_to_string("/proc/mounts").ok()?;
         for line in mounts.lines() {
             let parts: Vec<&str> = line.split_whitespace().collect();
-            if parts.len() < 4 { continue; }
-            if parts[0] != "overlay" || parts[1] != mount_point { continue; }
+            if parts.len() < 4 {
+                continue;
+            }
+            if parts[0] != "overlay" || parts[1] != mount_point {
+                continue;
+            }
             // Parse mount options to find upperdir=...
             for opt in parts[3].split(',') {
                 if let Some(upper) = opt.strip_prefix("upperdir=") {
                     return Some((
                         upper.to_string(),       // watch this path
-                        upper.to_string(),        // strip this prefix from events
-                        mount_point.to_string(),  // replace with this
+                        upper.to_string(),       // strip this prefix from events
+                        mount_point.to_string(), // replace with this
                     ));
                 }
             }
@@ -1097,8 +1138,8 @@ mod guest {
     }
 
     fn handle_watch(req: &WatchRequest, mut writer: std::net::TcpStream) {
-        use std::os::unix::io::AsRawFd;
         use notify::{RecursiveMode, Watcher};
+        use std::os::unix::io::AsRawFd;
 
         // Watch the overlay mount directly. Linux >= 5.11 propagates inotify
         // events from the upper layer through to the merged mount, so we see
@@ -1108,21 +1149,20 @@ mod guest {
 
         let (tx, rx) = std::sync::mpsc::channel();
 
-        let mut watcher = match notify::recommended_watcher(
-            move |res: Result<notify::Event, notify::Error>| {
+        let mut watcher =
+            match notify::recommended_watcher(move |res: Result<notify::Event, notify::Error>| {
                 if let Ok(event) = res {
                     let _ = tx.send(event);
                 }
-            },
-        ) {
-            Ok(w) => w,
-            Err(_) => return,
-        };
+            }) {
+                Ok(w) => w,
+                Err(_) => return,
+            };
 
-        if watcher.watch(
-            std::path::Path::new(&watch_dir),
-            RecursiveMode::Recursive,
-        ).is_err() {
+        if watcher
+            .watch(std::path::Path::new(&watch_dir), RecursiveMode::Recursive)
+            .is_err()
+        {
             return;
         }
 
@@ -1172,8 +1212,13 @@ mod guest {
                             } else {
                                 shuru_proto::watch_kind::MODIFY
                             };
-                            let evt = WatchEvent { kind, path: path_str.to_string() };
-                            if frame::write_frame(&mut writer, frame::WATCH_EVENT, &evt.encode()).is_err() {
+                            let evt = WatchEvent {
+                                kind,
+                                path: path_str.to_string(),
+                            };
+                            if frame::write_frame(&mut writer, frame::WATCH_EVENT, &evt.encode())
+                                .is_err()
+                            {
                                 return;
                             }
                         }
@@ -1351,8 +1396,7 @@ mod guest {
                 vsock_buf.extend_from_slice(&read_buf[..n as usize]);
 
                 // Process complete binary frames
-                while let Some((msg_type, payload_start, total_len)) =
-                    frame::try_parse(&vsock_buf)
+                while let Some((msg_type, payload_start, total_len)) = frame::try_parse(&vsock_buf)
                 {
                     let payload = &vsock_buf[payload_start..total_len];
                     match msg_type {
@@ -1448,9 +1492,8 @@ mod guest {
 
     fn forward_accept_loop(listener_fd: i32) {
         loop {
-            let client_fd = unsafe {
-                libc::accept(listener_fd, std::ptr::null_mut(), std::ptr::null_mut())
-            };
+            let client_fd =
+                unsafe { libc::accept(listener_fd, std::ptr::null_mut(), std::ptr::null_mut()) };
 
             if client_fd < 0 {
                 continue;
@@ -1544,7 +1587,10 @@ mod guest {
         eprintln!("shuru-guest: starting as PID 1");
 
         // Set PATH early so all child processes inherit it
-        std::env::set_var("PATH", "/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin");
+        std::env::set_var(
+            "PATH",
+            "/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin",
+        );
 
         mount_filesystems();
         eprintln!("shuru-guest: filesystems mounted");
@@ -1560,9 +1606,18 @@ mod guest {
 
         // Register signal handlers (PID 1 has no default signal dispositions)
         unsafe {
-            libc::signal(libc::SIGCHLD, sigchld_handler as *const () as libc::sighandler_t);
-            libc::signal(libc::SIGTERM, sigterm_handler as *const () as libc::sighandler_t);
-            libc::signal(libc::SIGINT, sigterm_handler as *const () as libc::sighandler_t);
+            libc::signal(
+                libc::SIGCHLD,
+                sigchld_handler as *const () as libc::sighandler_t,
+            );
+            libc::signal(
+                libc::SIGTERM,
+                sigterm_handler as *const () as libc::sighandler_t,
+            );
+            libc::signal(
+                libc::SIGINT,
+                sigterm_handler as *const () as libc::sighandler_t,
+            );
         }
 
         let listener_fd = create_vsock_listener(VSOCK_PORT);
@@ -1578,9 +1633,8 @@ mod guest {
         });
 
         loop {
-            let client_fd = unsafe {
-                libc::accept(listener_fd, std::ptr::null_mut(), std::ptr::null_mut())
-            };
+            let client_fd =
+                unsafe { libc::accept(listener_fd, std::ptr::null_mut(), std::ptr::null_mut()) };
 
             if client_fd < 0 {
                 reap_zombies();

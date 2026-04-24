@@ -6,9 +6,8 @@ use std::process::Command;
 use tempfile::tempdir;
 
 fn shuru_bin() -> String {
-    std::env::var("SHURU_BIN").expect(
-        "SHURU_BIN not set — point it at a codesigned shuru binary (e.g. just build)",
-    )
+    std::env::var("SHURU_BIN")
+        .expect("SHURU_BIN not set — point it at a codesigned shuru binary (e.g. just build)")
 }
 
 fn run_in_vm(mount_spec: &str, guest_cmd: &str) -> std::process::Output {

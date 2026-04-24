@@ -15,8 +15,11 @@ impl SharedDirectory {
         unsafe {
             let ns_path = NSString::from_str(path);
             let url = NSURL::fileURLWithPath_isDirectory(&ns_path, true);
-            let inner =
-                VZSharedDirectory::initWithURL_readOnly(VZSharedDirectory::alloc(), &url, read_only);
+            let inner = VZSharedDirectory::initWithURL_readOnly(
+                VZSharedDirectory::alloc(),
+                &url,
+                read_only,
+            );
             SharedDirectory { inner }
         }
     }
@@ -35,12 +38,11 @@ impl VirtioFileSystemDevice {
                 &ns_tag,
             );
 
-            let single_share: Retained<VZDirectoryShare> = Retained::cast_unchecked(
-                VZSingleDirectoryShare::initWithDirectory(
+            let single_share: Retained<VZDirectoryShare> =
+                Retained::cast_unchecked(VZSingleDirectoryShare::initWithDirectory(
                     VZSingleDirectoryShare::alloc(),
                     &directory.inner,
-                ),
-            );
+                ));
             inner.setShare(Some(&*single_share));
 
             VirtioFileSystemDevice { inner }

@@ -169,18 +169,15 @@ impl VirtualMachine {
 
         let dispatch_block = RcBlock::new(move || {
             let inner_tx = tx.clone();
-            let completion_handler =
-                RcBlock::new(move |err: *mut objc2_foundation::NSError| {
-                    if err.is_null() {
-                        inner_tx.send(Ok(())).unwrap();
-                    } else {
-                        inner_tx
-                            .send(Err(unsafe {
-                                VzError::from_ns_error(&*err)
-                            }))
-                            .unwrap();
-                    }
-                });
+            let completion_handler = RcBlock::new(move |err: *mut objc2_foundation::NSError| {
+                if err.is_null() {
+                    inner_tx.send(Ok(())).unwrap();
+                } else {
+                    inner_tx
+                        .send(Err(unsafe { VzError::from_ns_error(&*err) }))
+                        .unwrap();
+                }
+            });
 
             unsafe {
                 machine.startWithCompletionHandler(&completion_handler);
@@ -200,18 +197,15 @@ impl VirtualMachine {
 
         let dispatch_block = RcBlock::new(move || {
             let inner_tx = tx.clone();
-            let completion_handler =
-                RcBlock::new(move |err: *mut objc2_foundation::NSError| {
-                    if err.is_null() {
-                        inner_tx.send(Ok(())).unwrap();
-                    } else {
-                        inner_tx
-                            .send(Err(unsafe {
-                                VzError::from_ns_error(&*err)
-                            }))
-                            .unwrap();
-                    }
-                });
+            let completion_handler = RcBlock::new(move |err: *mut objc2_foundation::NSError| {
+                if err.is_null() {
+                    inner_tx.send(Ok(())).unwrap();
+                } else {
+                    inner_tx
+                        .send(Err(unsafe { VzError::from_ns_error(&*err) }))
+                        .unwrap();
+                }
+            });
 
             unsafe {
                 machine.stopWithCompletionHandler(&completion_handler);
@@ -267,14 +261,12 @@ impl VirtualMachine {
 
             let device_obj = devices.objectAtIndex(0);
             // Downcast VZSocketDevice to VZVirtioSocketDevice
-            let device: &VZVirtioSocketDevice = unsafe {
-                &*(&*device_obj as *const _ as *const VZVirtioSocketDevice)
-            };
+            let device: &VZVirtioSocketDevice =
+                unsafe { &*(&*device_obj as *const _ as *const VZVirtioSocketDevice) };
 
             let inner_tx = tx.clone();
             let completion_handler = RcBlock::new(
-                move |conn: *mut VZVirtioSocketConnection,
-                      err: *mut objc2_foundation::NSError| {
+                move |conn: *mut VZVirtioSocketConnection, err: *mut objc2_foundation::NSError| {
                     if !err.is_null() {
                         let error = unsafe { VzError::from_ns_error(&*err) };
                         inner_tx.send(Err(error)).ok();

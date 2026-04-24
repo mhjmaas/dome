@@ -22,9 +22,7 @@ use std::sync::{Arc, Mutex};
 use kvm_ioctls::VmFd;
 use vm_memory::{Address, Bytes, GuestAddress, GuestMemoryMmap};
 
-use super::devices::{
-    avail_idx, avail_ring_entry, write_used, VirtioBackend, VirtioQueueState,
-};
+use super::devices::{avail_idx, avail_ring_entry, write_used, VirtioBackend, VirtioQueueState};
 
 // ===========================================================================
 // FUSE wire protocol (subset)
@@ -385,12 +383,8 @@ fn collect_desc_chain(
     let mut idx = head;
     for _ in 0..max_descs {
         let off = idx as u64 * 16;
-        let addr: u64 = mem
-            .read_obj(GuestAddress(desc_addr + off))
-            .unwrap_or(0);
-        let len: u32 = mem
-            .read_obj(GuestAddress(desc_addr + off + 8))
-            .unwrap_or(0);
+        let addr: u64 = mem.read_obj(GuestAddress(desc_addr + off)).unwrap_or(0);
+        let len: u32 = mem.read_obj(GuestAddress(desc_addr + off + 8)).unwrap_or(0);
         let flags: u16 = mem
             .read_obj(GuestAddress(desc_addr + off + 12))
             .unwrap_or(0);
@@ -467,11 +461,7 @@ impl<'a> RequestReader<'a> {
         }
         let mut val = T::default();
         unsafe {
-            std::ptr::copy_nonoverlapping(
-                buf.as_ptr(),
-                &mut val as *mut T as *mut u8,
-                size,
-            );
+            std::ptr::copy_nonoverlapping(buf.as_ptr(), &mut val as *mut T as *mut u8, size);
         }
         Some(val)
     }
@@ -566,9 +556,7 @@ impl<'a> ResponseWriter<'a> {
 
     fn write_struct<T: Copy>(&mut self, val: &T) -> bool {
         let size = std::mem::size_of::<T>();
-        let bytes = unsafe {
-            std::slice::from_raw_parts(val as *const T as *const u8, size)
-        };
+        let bytes = unsafe { std::slice::from_raw_parts(val as *const T as *const u8, size) };
         self.write_bytes(bytes)
     }
 
@@ -581,9 +569,7 @@ impl<'a> ResponseWriter<'a> {
                     std::mem::size_of::<FuseOutHeader>(),
                 )
             };
-            let _ = self
-                .mem
-                .write_slice(bytes, GuestAddress(span.addr));
+            let _ = self.mem.write_slice(bytes, GuestAddress(span.addr));
         }
     }
 }
@@ -671,8 +657,7 @@ impl InodeTable {
         };
         if drop_it {
             if let Some(entry) = self.by_id.remove(&nodeid) {
-                self.by_hostid
-                    .remove(&(entry.host_dev, entry.host_ino));
+                self.by_hostid.remove(&(entry.host_dev, entry.host_ino));
             }
         }
     }
@@ -806,17 +791,19 @@ impl VirtioBackend for VirtioFsBackend {
 
             let current_avail = avail_idx(mem, q.avail_addr);
             while q.last_avail_idx != current_avail {
-                let head = avail_ring_entry(
-                    mem,
-                    q.avail_addr,
-                    q.size,
-                    q.last_avail_idx,
-                );
+                let head = avail_ring_entry(mem, q.avail_addr, q.size, q.last_avail_idx);
                 let spans = collect_desc_chain(mem, q.desc_addr, head, q.size);
 
                 let written = self.handle_request(mem, &spans);
 
-                write_used(mem, q.used_addr, q.size, q.last_avail_idx, head as u32, written);
+                write_used(
+                    mem,
+                    q.used_addr,
+                    q.size,
+                    q.last_avail_idx,
+                    head as u32,
+                    written,
+                );
                 q.last_avail_idx = q.last_avail_idx.wrapping_add(1);
             }
         }
@@ -877,7 +864,9 @@ impl VirtioFsBackend {
             FUSE_UNLINK => self.op_unlink(hdr.nodeid, &mut reader, false),
             FUSE_RMDIR => self.op_unlink(hdr.nodeid, &mut reader, true),
             FUSE_MKDIR => self.op_mkdir(hdr.nodeid, &mut reader, &mut writer),
-            FUSE_RENAME | FUSE_RENAME2 => self.op_rename(hdr.nodeid, &mut reader, hdr.opcode == FUSE_RENAME2),
+            FUSE_RENAME | FUSE_RENAME2 => {
+                self.op_rename(hdr.nodeid, &mut reader, hdr.opcode == FUSE_RENAME2)
+            }
             FUSE_GETXATTR | FUSE_LISTXATTR => (-libc::ENOSYS, 0),
             FUSE_SETXATTR | FUSE_REMOVEXATTR => (-libc::ENOSYS, 0),
             FUSE_SYMLINK | FUSE_LINK | FUSE_MKNOD | FUSE_READLINK => (-libc::ENOSYS, 0),
@@ -1053,8 +1042,16 @@ impl VirtioFsBackend {
             }
         }
         if req.valid & (FATTR_UID | FATTR_GID) != 0 {
-            let uid = if req.valid & FATTR_UID != 0 { req.uid } else { u32::MAX };
-            let gid = if req.valid & FATTR_GID != 0 { req.gid } else { u32::MAX };
+            let uid = if req.valid & FATTR_UID != 0 {
+                req.uid
+            } else {
+                u32::MAX
+            };
+            let gid = if req.valid & FATTR_GID != 0 {
+                req.gid
+            } else {
+                u32::MAX
+            };
             if unsafe { libc::chown(cpath.as_ptr(), uid, gid) } < 0 {
                 return (-errno(), 0);
             }
@@ -1273,7 +1270,9 @@ impl VirtioFsBackend {
             Some(p) => p,
             None => return (-libc::ENOENT, 0),
         };
-        let wants_write = req.flags as i32 & (libc::O_WRONLY | libc::O_RDWR | libc::O_APPEND | libc::O_TRUNC) != 0;
+        let wants_write = req.flags as i32
+            & (libc::O_WRONLY | libc::O_RDWR | libc::O_APPEND | libc::O_TRUNC)
+            != 0;
         if wants_write && inodes.read_only {
             return (-libc::EROFS, 0);
         }
@@ -1520,12 +1519,7 @@ impl VirtioFsBackend {
         (0, std::mem::size_of::<FuseStatfsOut>() as u32)
     }
 
-    fn op_unlink(
-        &self,
-        parent: u64,
-        reader: &mut RequestReader,
-        is_dir: bool,
-    ) -> (i32, u32) {
+    fn op_unlink(&self, parent: u64, reader: &mut RequestReader, is_dir: bool) -> (i32, u32) {
         let name = match reader.read_cstr() {
             Some(n) => n,
             None => return (-libc::EIO, 0),

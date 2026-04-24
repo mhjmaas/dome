@@ -12,17 +12,33 @@ pub trait NbdBackend: Send + Sync {
 }
 
 impl NbdBackend for crate::backend::FlatFileBackend {
-    fn size(&self) -> u64 { self.size() }
-    fn read(&self, offset: u64, buf: &mut [u8]) -> std::io::Result<usize> { self.read(offset, buf) }
-    fn write(&self, offset: u64, buf: &[u8]) -> std::io::Result<usize> { self.write(offset, buf) }
-    fn flush(&self) -> std::io::Result<()> { self.flush() }
+    fn size(&self) -> u64 {
+        self.size()
+    }
+    fn read(&self, offset: u64, buf: &mut [u8]) -> std::io::Result<usize> {
+        self.read(offset, buf)
+    }
+    fn write(&self, offset: u64, buf: &[u8]) -> std::io::Result<usize> {
+        self.write(offset, buf)
+    }
+    fn flush(&self) -> std::io::Result<()> {
+        self.flush()
+    }
 }
 
 impl NbdBackend for crate::cas::CasBackend {
-    fn size(&self) -> u64 { self.size() }
-    fn read(&self, offset: u64, buf: &mut [u8]) -> std::io::Result<usize> { self.read(offset, buf) }
-    fn write(&self, offset: u64, buf: &[u8]) -> std::io::Result<usize> { self.write(offset, buf) }
-    fn flush(&self) -> std::io::Result<()> { self.flush() }
+    fn size(&self) -> u64 {
+        self.size()
+    }
+    fn read(&self, offset: u64, buf: &mut [u8]) -> std::io::Result<usize> {
+        self.read(offset, buf)
+    }
+    fn write(&self, offset: u64, buf: &[u8]) -> std::io::Result<usize> {
+        self.write(offset, buf)
+    }
+    fn flush(&self) -> std::io::Result<()> {
+        self.flush()
+    }
 }
 
 // NBD magic values
@@ -124,7 +140,10 @@ fn handshake(
                     stream.write_all(&[0u8; 124])?;
                 }
                 stream.flush()?;
-                debug!("NBD handshake complete (EXPORT_NAME), size={}", backend.size());
+                debug!(
+                    "NBD handshake complete (EXPORT_NAME), size={}",
+                    backend.size()
+                );
                 return Ok(());
             }
             NBD_OPT_INFO | NBD_OPT_GO => {
@@ -218,7 +237,12 @@ fn transmission(
                         NBD_EIO
                     }
                 };
-                send_reply(stream, error, handle, if error == NBD_OK { Some(&buf) } else { None })?;
+                send_reply(
+                    stream,
+                    error,
+                    handle,
+                    if error == NBD_OK { Some(&buf) } else { None },
+                )?;
             }
             NBD_CMD_WRITE => {
                 let mut data = vec![0u8; length as usize];
@@ -273,8 +297,8 @@ fn send_reply(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::io::Write;
     use crate::FlatFileBackend;
+    use std::io::Write;
 
     fn create_test_backend() -> (tempfile::NamedTempFile, Arc<FlatFileBackend>) {
         let mut tmp = tempfile::NamedTempFile::new().unwrap();

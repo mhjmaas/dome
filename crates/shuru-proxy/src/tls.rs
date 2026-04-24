@@ -2,8 +2,8 @@ use std::sync::Arc;
 
 use lru::LruCache;
 use rcgen::{
-    CertificateParams, DistinguishedName, DnType, IsCa, KeyPair, KeyUsagePurpose,
-    BasicConstraints, Certificate,
+    BasicConstraints, Certificate, CertificateParams, DistinguishedName, DnType, IsCa, KeyPair,
+    KeyUsagePurpose,
 };
 use rustls::pki_types::{CertificateDer, PrivateKeyDer, PrivatePkcs8KeyDer};
 use rustls::ServerConfig;
@@ -67,9 +67,7 @@ impl CertificateAuthority {
     fn generate_server_config(&self, domain: &str) -> anyhow::Result<ServerConfig> {
         let mut params = CertificateParams::new(vec![domain.to_string()])?;
         params.distinguished_name = DistinguishedName::new();
-        params
-            .distinguished_name
-            .push(DnType::CommonName, domain);
+        params.distinguished_name.push(DnType::CommonName, domain);
 
         let key = KeyPair::generate()?;
         let cert = params.signed_by(&key, &self.ca_cert, &self.ca_key)?;

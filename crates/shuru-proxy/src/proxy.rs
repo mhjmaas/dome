@@ -46,9 +46,7 @@ impl ProxyEngine {
         // BoringSSL upstream connector — Chrome's TLS stack so Cloudflare
         // doesn't reject our MITM connections based on JA3/JA4 fingerprint.
         let mut builder = SslConnector::builder(SslMethod::tls()).expect("SslConnector");
-        builder
-            .set_alpn_protos(b"\x08http/1.1")
-            .expect("ALPN");
+        builder.set_alpn_protos(b"\x08http/1.1").expect("ALPN");
         let upstream_ssl = builder.build();
 
         ProxyEngine {
@@ -139,7 +137,11 @@ async fn handle_connection(
     // Check if this is a connection to an exposed host port (host.shuru.internal).
     if let std::net::IpAddr::V4(ipv4) = dst.ip() {
         if let Some(host_port) = config.exposed_host_port(ipv4, dst.port()) {
-            debug!("expose-host: guest :{} -> localhost:{}", dst.port(), host_port);
+            debug!(
+                "expose-host: guest :{} -> localhost:{}",
+                dst.port(),
+                host_port
+            );
             let local_dst = SocketAddr::new(
                 std::net::IpAddr::V4(std::net::Ipv4Addr::LOCALHOST),
                 host_port,
@@ -169,7 +171,9 @@ async fn handle_connection(
             if !is_allowed {
                 debug!("IP not in DNS-pinned set, rejecting: {dst}");
                 let _ = cmd_tx.send(StackCommand::Close { id });
-                return Err(anyhow::anyhow!("connection to {dst} blocked: IP not resolved via allowed DNS"));
+                return Err(anyhow::anyhow!(
+                    "connection to {dst} blocked: IP not resolved via allowed DNS"
+                ));
             }
         }
     }
@@ -208,7 +212,9 @@ async fn handle_connection(
                 Some(domain) if !config.is_domain_allowed(domain) => {
                     debug!("SNI not in allowlist, rejecting: {domain}");
                     let _ = cmd_tx.send(StackCommand::Close { id });
-                    return Err(anyhow::anyhow!("TLS to {dst} blocked: SNI '{domain}' not in allowlist"));
+                    return Err(anyhow::anyhow!(
+                        "TLS to {dst} blocked: SNI '{domain}' not in allowlist"
+                    ));
                 }
                 None => {
                     debug!("no SNI in ClientHello, rejecting connection to {dst}");
@@ -328,13 +334,9 @@ async fn handle_mitm(
 
     // Upstream: BoringSSL — Chrome's TLS fingerprint passes Cloudflare
     let upstream_tcp = TcpStream::connect(dst).await?;
-    let upstream_tls = tokio_boring::connect(
-        upstream_ssl.configure()?,
-        &domain,
-        upstream_tcp,
-    )
-    .await
-    .map_err(|e| anyhow::anyhow!("BoringSSL connect to {domain}: {e}"))?;
+    let upstream_tls = tokio_boring::connect(upstream_ssl.configure()?, &domain, upstream_tcp)
+        .await
+        .map_err(|e| anyhow::anyhow!("BoringSSL connect to {domain}: {e}"))?;
 
     // HTTP/1.1 text-based relay with secret substitution
     let (mut guest_rd, mut guest_wr) = tokio::io::split(guest_tls);

@@ -280,27 +280,25 @@ impl AsyncSandbox {
 
         std::thread::Builder::new()
             .name("shuru-vm".into())
-            .spawn(move || {
-                match boot_vm(config) {
-                    Ok(booted) => {
-                        if ready_tx.send(Ok(booted.instance_dir.clone())).is_err() {
-                            return;
-                        }
-                        run_vm_loop(
-                            booted.sandbox,
-                            &booted.instance_dir,
-                            &booted.data_dir,
-                            cmd_rx,
-                            booted.proxy_handle,
-                            booted.fwd_handle,
-                            #[cfg(feature = "cas")]
-                            booted.nbd_handle,
-                            booted.default_env,
-                        );
+            .spawn(move || match boot_vm(config) {
+                Ok(booted) => {
+                    if ready_tx.send(Ok(booted.instance_dir.clone())).is_err() {
+                        return;
                     }
-                    Err(e) => {
-                        let _ = ready_tx.send(Err(e));
-                    }
+                    run_vm_loop(
+                        booted.sandbox,
+                        &booted.instance_dir,
+                        &booted.data_dir,
+                        cmd_rx,
+                        booted.proxy_handle,
+                        booted.fwd_handle,
+                        #[cfg(feature = "cas")]
+                        booted.nbd_handle,
+                        booted.default_env,
+                    );
+                }
+                Err(e) => {
+                    let _ = ready_tx.send(Err(e));
                 }
             })?;
 
@@ -380,8 +378,7 @@ impl AsyncSandbox {
                             }
                         }
                         Ok(Some((shuru_proto::frame::EXIT, payload))) => {
-                            let code =
-                                shuru_proto::frame::parse_exit_code(&payload).unwrap_or(0);
+                            let code = shuru_proto::frame::parse_exit_code(&payload).unwrap_or(0);
                             let _ = event_tx.send(ShellEvent::Exit(code));
                             break;
                         }
@@ -400,7 +397,9 @@ impl AsyncSandbox {
             writer: ShellWriter {
                 writer: Arc::new(std::sync::Mutex::new(writer_stream)),
             },
-            reader: ShellReader { output_rx: event_rx },
+            reader: ShellReader {
+                output_rx: event_rx,
+            },
             _reader_thread: reader_thread,
         })
     }
@@ -448,7 +447,10 @@ impl AsyncSandbox {
         let (reply_tx, reply_rx) = oneshot::channel();
         self.cmd_tx
             .send(SandboxCmd::AddPortForward {
-                mapping: shuru_proto::PortMapping { host_port, guest_port },
+                mapping: shuru_proto::PortMapping {
+                    host_port,
+                    guest_port,
+                },
                 reply: reply_tx,
             })
             .map_err(|_| anyhow::anyhow!("VM thread exited"))?;
@@ -532,7 +534,10 @@ impl AsyncSandbox {
         path: &str,
         extract: bool,
         strip_components: u32,
-    ) -> Result<(tokio::sync::oneshot::Receiver<Result<()>>, std::sync::mpsc::Receiver<shuru_proto::DownloadProgress>)> {
+    ) -> Result<(
+        tokio::sync::oneshot::Receiver<Result<()>>,
+        std::sync::mpsc::Receiver<shuru_proto::DownloadProgress>,
+    )> {
         let (reply_tx, reply_rx) = oneshot::channel();
         let (progress_tx, progress_rx) = std::sync::mpsc::channel();
         self.cmd_tx
@@ -654,8 +659,7 @@ fn clone_file_cow(src: &str, dst: &str) -> Result<()> {
 
 #[cfg(target_os = "linux")]
 fn clone_file_cow(src: &str, dst: &str) -> Result<()> {
-    std::fs::copy(src, dst)
-        .with_context(|| format!("failed to copy {} -> {}", src, dst))?;
+    std::fs::copy(src, dst).with_context(|| format!("failed to copy {} -> {}", src, dst))?;
     Ok(())
 }
 
@@ -672,9 +676,7 @@ struct BootedVm {
 
 fn boot_vm(config: SandboxConfig) -> Result<BootedVm> {
     let default_env = config.env.clone();
-    let data_dir = config
-        .data_dir
-        .unwrap_or_else(shuru_vm::default_data_dir);
+    let data_dir = config.data_dir.unwrap_or_else(shuru_vm::default_data_dir);
 
     // Resolve asset paths
     let kernel_path = format!("{}/Image", data_dir);
@@ -695,8 +697,7 @@ fn boot_vm(config: SandboxConfig) -> Result<BootedVm> {
 
     let source = match &config.from {
         Some(name) => {
-            shuru_vm::validate_checkpoint_name(name)
-                .map_err(|e| anyhow::anyhow!(e))?;
+            shuru_vm::validate_checkpoint_name(name).map_err(|e| anyhow::anyhow!(e))?;
 
             // Check .idx (CAS) first, then .ext4 (legacy)
             #[cfg(feature = "cas")]
@@ -743,12 +744,7 @@ fn boot_vm(config: SandboxConfig) -> Result<BootedVm> {
     // Use PID + atomic counter so concurrent boots in the same process
     // each get their own directory (avoids remove_dir_all racing).
     let seq = INSTANCE_COUNTER.fetch_add(1, Ordering::Relaxed);
-    let instance_dir = format!(
-        "{}/instances/sdk-{}-{}",
-        data_dir,
-        std::process::id(),
-        seq,
-    );
+    let instance_dir = format!("{}/instances/sdk-{}-{}", data_dir, std::process::id(), seq,);
     std::fs::create_dir_all(&instance_dir)?;
     let work_rootfs = format!("{}/rootfs.ext4", instance_dir);
 
@@ -762,9 +758,7 @@ fn boot_vm(config: SandboxConfig) -> Result<BootedVm> {
 
     // Extend disk to requested size (only meaningful for direct mode)
     if !use_nbd {
-        let f = std::fs::OpenOptions::new()
-            .write(true)
-            .open(&work_rootfs)?;
+        let f = std::fs::OpenOptions::new().write(true).open(&work_rootfs)?;
         let target = config.disk_size_mb * 1024 * 1024;
         let current = f.metadata()?.len();
         if target > current {
@@ -935,38 +929,78 @@ fn run_vm_loop(
                     let _ = reply.send(sb.read_dir(&path));
                 });
             }
-            SandboxCmd::WriteFile { path, content, reply } => {
+            SandboxCmd::WriteFile {
+                path,
+                content,
+                reply,
+            } => {
                 let _ = reply.send(sandbox.write_file(&path, &content));
             }
-            SandboxCmd::Mkdir { path, recursive, reply } => {
+            SandboxCmd::Mkdir {
+                path,
+                recursive,
+                reply,
+            } => {
                 let _ = reply.send(sandbox.mkdir(&path, recursive));
             }
-            SandboxCmd::Rename { old_path, new_path, reply } => {
+            SandboxCmd::Rename {
+                old_path,
+                new_path,
+                reply,
+            } => {
                 let _ = reply.send(sandbox.rename(&old_path, &new_path));
             }
             SandboxCmd::Chmod { path, mode, reply } => {
                 let _ = reply.send(sandbox.chmod(&path, mode));
             }
-            SandboxCmd::Download { url, path, extract, strip_components, progress_tx, reply } => {
+            SandboxCmd::Download {
+                url,
+                path,
+                extract,
+                strip_components,
+                progress_tx,
+                reply,
+            } => {
                 let result = sandbox.download(&url, &path, extract, strip_components, |p| {
                     let _ = progress_tx.send(p);
                 });
                 let _ = reply.send(result);
             }
-            SandboxCmd::OpenShell { argv, rows, cols, cwd, extra_env, reply } => {
+            SandboxCmd::OpenShell {
+                argv,
+                rows,
+                cols,
+                cwd,
+                extra_env,
+                reply,
+            } => {
                 let default_argv = ["/bin/bash".to_string(), "-l".to_string()];
                 let shell_argv: Vec<String> = argv.unwrap_or_else(|| default_argv.to_vec());
                 let shell_argv_refs: Vec<&str> = shell_argv.iter().map(|s| s.as_str()).collect();
                 let mut merged_env = env.clone();
                 merged_env.extend(extra_env);
-                let result = sandbox.open_shell_with_cwd(&shell_argv_refs, &merged_env, rows, cols, cwd.as_deref());
+                let result = sandbox.open_shell_with_cwd(
+                    &shell_argv_refs,
+                    &merged_env,
+                    rows,
+                    cols,
+                    cwd.as_deref(),
+                );
                 let _ = reply.send(result);
             }
-            SandboxCmd::Watch { path, recursive, reply } => {
+            SandboxCmd::Watch {
+                path,
+                recursive,
+                reply,
+            } => {
                 let result = sandbox.open_watch(&path, recursive);
                 let _ = reply.send(result);
             }
-            SandboxCmd::Remove { path, recursive, reply } => {
+            SandboxCmd::Remove {
+                path,
+                recursive,
+                reply,
+            } => {
                 let _ = reply.send(sandbox.remove(&path, recursive));
             }
             SandboxCmd::DiscardOverlay { path, reply } => {
@@ -986,8 +1020,7 @@ fn run_vm_loop(
             }
             SandboxCmd::Checkpoint { name, reply } => {
                 let result = (|| -> Result<()> {
-                    shuru_vm::validate_checkpoint_name(&name)
-                        .map_err(|e| anyhow::anyhow!(e))?;
+                    shuru_vm::validate_checkpoint_name(&name).map_err(|e| anyhow::anyhow!(e))?;
                     let checkpoints_dir = format!("{}/checkpoints", data_dir);
                     std::fs::create_dir_all(&checkpoints_dir)?;
 

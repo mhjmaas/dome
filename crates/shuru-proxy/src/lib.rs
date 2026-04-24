@@ -138,8 +138,14 @@ pub fn start(host_fd: RawFd, config: ProxyConfig) -> anyhow::Result<ProxyHandle>
                 .expect("failed to create tokio runtime for proxy");
 
             rt.block_on(async move {
-                let mut engine =
-                    ProxyEngine::new(proxy_config, event_rx, cmd_tx, ca, proxy_placeholders, proxy_allowed_ips);
+                let mut engine = ProxyEngine::new(
+                    proxy_config,
+                    event_rx,
+                    cmd_tx,
+                    ca,
+                    proxy_placeholders,
+                    proxy_allowed_ips,
+                );
                 engine.run().await;
             });
         })?;

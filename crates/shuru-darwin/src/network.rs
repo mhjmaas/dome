@@ -75,9 +75,7 @@ impl VirtioNetworkDevice {
     pub fn new() -> Self {
         VirtioNetworkDevice {
             inner: unsafe {
-                VZVirtioNetworkDeviceConfiguration::init(
-                    VZVirtioNetworkDeviceConfiguration::alloc(),
-                )
+                VZVirtioNetworkDeviceConfiguration::init(VZVirtioNetworkDeviceConfiguration::alloc())
             },
         }
     }
@@ -90,7 +88,8 @@ impl VirtioNetworkDevice {
 
     pub fn set_attachment(&self, attachment: &impl NetworkAttachment) {
         unsafe {
-            self.inner.setAttachment(Some(&attachment.as_vz_attachment()));
+            self.inner
+                .setAttachment(Some(&attachment.as_vz_attachment()));
         }
     }
 

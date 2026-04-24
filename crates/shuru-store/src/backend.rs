@@ -12,7 +12,11 @@ impl FlatFileBackend {
     pub fn open(path: &str) -> anyhow::Result<Self> {
         let file = OpenOptions::new().read(true).write(true).open(path)?;
         let size = file.metadata()?.len();
-        Ok(FlatFileBackend { file, path: path.to_string(), size })
+        Ok(FlatFileBackend {
+            file,
+            path: path.to_string(),
+            size,
+        })
     }
 
     pub fn path(&self) -> &str {

@@ -54,7 +54,11 @@ pub fn terminal_size(fd: RawFd) -> (u16, u16) {
 pub fn read_raw(fd: RawFd, buf: &mut [u8]) -> usize {
     unsafe {
         let n = libc::read(fd, buf.as_mut_ptr() as *mut libc::c_void, buf.len());
-        if n > 0 { n as usize } else { 0 }
+        if n > 0 {
+            n as usize
+        } else {
+            0
+        }
     }
 }
 

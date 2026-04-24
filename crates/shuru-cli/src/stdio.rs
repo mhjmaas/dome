@@ -326,7 +326,12 @@ pub(crate) fn run_stdio(prepared: &PreparedVm) -> Result<i32> {
     let nbd_handle = vm::start_nbd(prepared)?;
     let nbd_uri = nbd_handle.as_ref().map(|h| h.uri());
 
-    let sandbox = Arc::new(vm::build_sandbox(prepared, false, vm_fd, nbd_uri.as_deref())?);
+    let sandbox = Arc::new(vm::build_sandbox(
+        prepared,
+        false,
+        vm_fd,
+        nbd_uri.as_deref(),
+    )?);
     sandbox.start()?;
 
     // Inject CA cert and secret placeholders when MITM is needed
@@ -446,7 +451,12 @@ pub(crate) fn run_stdio(prepared: &PreparedVm) -> Result<i32> {
                 let params: ExecParams = match serde_json::from_value(req.params) {
                     Ok(p) => p,
                     Err(e) => {
-                        send_error_shared(&out, req.id, INVALID_PARAMS, format!("invalid params: {}", e))?;
+                        send_error_shared(
+                            &out,
+                            req.id,
+                            INVALID_PARAMS,
+                            format!("invalid params: {}", e),
+                        )?;
                         continue;
                     }
                 };
@@ -457,7 +467,12 @@ pub(crate) fn run_stdio(prepared: &PreparedVm) -> Result<i32> {
                 let params: SpawnParams = match serde_json::from_value(req.params) {
                     Ok(p) => p,
                     Err(e) => {
-                        send_error_shared(&out, req.id, INVALID_PARAMS, format!("invalid params: {}", e))?;
+                        send_error_shared(
+                            &out,
+                            req.id,
+                            INVALID_PARAMS,
+                            format!("invalid params: {}", e),
+                        )?;
                         continue;
                     }
                 };
@@ -510,8 +525,7 @@ pub(crate) fn run_stdio(prepared: &PreparedVm) -> Result<i32> {
                                     }
                                 }
                                 ProcessInput::Kill => {
-                                    let _ =
-                                        frame::write_frame(&mut vsock_writer, frame::KILL, &[]);
+                                    let _ = frame::write_frame(&mut vsock_writer, frame::KILL, &[]);
                                     break;
                                 }
                             }
@@ -577,7 +591,12 @@ pub(crate) fn run_stdio(prepared: &PreparedVm) -> Result<i32> {
                 let params: KillParams = match serde_json::from_value(req.params) {
                     Ok(p) => p,
                     Err(e) => {
-                        send_error_shared(&out, req.id, INVALID_PARAMS, format!("invalid params: {}", e))?;
+                        send_error_shared(
+                            &out,
+                            req.id,
+                            INVALID_PARAMS,
+                            format!("invalid params: {}", e),
+                        )?;
                         continue;
                     }
                 };
@@ -604,7 +623,12 @@ pub(crate) fn run_stdio(prepared: &PreparedVm) -> Result<i32> {
                 let params: WatchParams = match serde_json::from_value(req.params) {
                     Ok(p) => p,
                     Err(e) => {
-                        send_error_shared(&out, req.id, INVALID_PARAMS, format!("invalid params: {}", e))?;
+                        send_error_shared(
+                            &out,
+                            req.id,
+                            INVALID_PARAMS,
+                            format!("invalid params: {}", e),
+                        )?;
                         continue;
                     }
                 };
@@ -645,7 +669,12 @@ pub(crate) fn run_stdio(prepared: &PreparedVm) -> Result<i32> {
                 let params: ReadFileParams = match serde_json::from_value(req.params) {
                     Ok(p) => p,
                     Err(e) => {
-                        send_error_shared(&out, req.id, INVALID_PARAMS, format!("invalid params: {}", e))?;
+                        send_error_shared(
+                            &out,
+                            req.id,
+                            INVALID_PARAMS,
+                            format!("invalid params: {}", e),
+                        )?;
                         continue;
                     }
                 };
@@ -656,7 +685,12 @@ pub(crate) fn run_stdio(prepared: &PreparedVm) -> Result<i32> {
                 let params: WriteFileParams = match serde_json::from_value(req.params) {
                     Ok(p) => p,
                     Err(e) => {
-                        send_error_shared(&out, req.id, INVALID_PARAMS, format!("invalid params: {}", e))?;
+                        send_error_shared(
+                            &out,
+                            req.id,
+                            INVALID_PARAMS,
+                            format!("invalid params: {}", e),
+                        )?;
                         continue;
                     }
                 };
@@ -667,7 +701,12 @@ pub(crate) fn run_stdio(prepared: &PreparedVm) -> Result<i32> {
                 let params: CheckpointParams = match serde_json::from_value(req.params) {
                     Ok(p) => p,
                     Err(e) => {
-                        send_error_shared(&out, req.id, INVALID_PARAMS, format!("invalid params: {}", e))?;
+                        send_error_shared(
+                            &out,
+                            req.id,
+                            INVALID_PARAMS,
+                            format!("invalid params: {}", e),
+                        )?;
                         continue;
                     }
                 };
@@ -682,7 +721,12 @@ pub(crate) fn run_stdio(prepared: &PreparedVm) -> Result<i32> {
                 let params: MkdirParams = match serde_json::from_value(req.params) {
                     Ok(p) => p,
                     Err(e) => {
-                        send_error_shared(&out, req.id, INVALID_PARAMS, format!("invalid params: {}", e))?;
+                        send_error_shared(
+                            &out,
+                            req.id,
+                            INVALID_PARAMS,
+                            format!("invalid params: {}", e),
+                        )?;
                         continue;
                     }
                 };
@@ -696,7 +740,12 @@ pub(crate) fn run_stdio(prepared: &PreparedVm) -> Result<i32> {
                 let params: ReadDirParams = match serde_json::from_value(req.params) {
                     Ok(p) => p,
                     Err(e) => {
-                        send_error_shared(&out, req.id, INVALID_PARAMS, format!("invalid params: {}", e))?;
+                        send_error_shared(
+                            &out,
+                            req.id,
+                            INVALID_PARAMS,
+                            format!("invalid params: {}", e),
+                        )?;
                         continue;
                     }
                 };
@@ -721,7 +770,12 @@ pub(crate) fn run_stdio(prepared: &PreparedVm) -> Result<i32> {
                 let params: StatParams = match serde_json::from_value(req.params) {
                     Ok(p) => p,
                     Err(e) => {
-                        send_error_shared(&out, req.id, INVALID_PARAMS, format!("invalid params: {}", e))?;
+                        send_error_shared(
+                            &out,
+                            req.id,
+                            INVALID_PARAMS,
+                            format!("invalid params: {}", e),
+                        )?;
                         continue;
                     }
                 };
@@ -748,7 +802,12 @@ pub(crate) fn run_stdio(prepared: &PreparedVm) -> Result<i32> {
                 let params: RemoveParams = match serde_json::from_value(req.params) {
                     Ok(p) => p,
                     Err(e) => {
-                        send_error_shared(&out, req.id, INVALID_PARAMS, format!("invalid params: {}", e))?;
+                        send_error_shared(
+                            &out,
+                            req.id,
+                            INVALID_PARAMS,
+                            format!("invalid params: {}", e),
+                        )?;
                         continue;
                     }
                 };
@@ -762,7 +821,12 @@ pub(crate) fn run_stdio(prepared: &PreparedVm) -> Result<i32> {
                 let params: RenameParams = match serde_json::from_value(req.params) {
                     Ok(p) => p,
                     Err(e) => {
-                        send_error_shared(&out, req.id, INVALID_PARAMS, format!("invalid params: {}", e))?;
+                        send_error_shared(
+                            &out,
+                            req.id,
+                            INVALID_PARAMS,
+                            format!("invalid params: {}", e),
+                        )?;
                         continue;
                     }
                 };
@@ -776,7 +840,12 @@ pub(crate) fn run_stdio(prepared: &PreparedVm) -> Result<i32> {
                 let params: CopyParams = match serde_json::from_value(req.params) {
                     Ok(p) => p,
                     Err(e) => {
-                        send_error_shared(&out, req.id, INVALID_PARAMS, format!("invalid params: {}", e))?;
+                        send_error_shared(
+                            &out,
+                            req.id,
+                            INVALID_PARAMS,
+                            format!("invalid params: {}", e),
+                        )?;
                         continue;
                     }
                 };
@@ -790,7 +859,12 @@ pub(crate) fn run_stdio(prepared: &PreparedVm) -> Result<i32> {
                 let params: ChmodParams = match serde_json::from_value(req.params) {
                     Ok(p) => p,
                     Err(e) => {
-                        send_error_shared(&out, req.id, INVALID_PARAMS, format!("invalid params: {}", e))?;
+                        send_error_shared(
+                            &out,
+                            req.id,
+                            INVALID_PARAMS,
+                            format!("invalid params: {}", e),
+                        )?;
                         continue;
                     }
                 };
@@ -901,7 +975,12 @@ fn handle_checkpoint(
     let mut discard_out = Vec::new();
     let mut discard_err = Vec::new();
     if let Err(e) = sandbox.exec(&["sync"], &mut discard_out, &mut discard_err) {
-        return send_error_shared(out, id, SERVER_ERROR, format!("checkpoint sync failed: {}", e));
+        return send_error_shared(
+            out,
+            id,
+            SERVER_ERROR,
+            format!("checkpoint sync failed: {}", e),
+        );
     }
 
     if let Err(msg) = shuru_vm::validate_checkpoint_name(name) {
@@ -922,7 +1001,12 @@ fn handle_checkpoint(
     }
 
     if let Err(e) = vm::clone_file(&prepared.work_rootfs, &checkpoint_path) {
-        return send_error_shared(out, id, SERVER_ERROR, format!("checkpoint clone failed: {}", e));
+        return send_error_shared(
+            out,
+            id,
+            SERVER_ERROR,
+            format!("checkpoint clone failed: {}", e),
+        );
     }
 
     send_result_shared(out, id, EmptyResult {})

@@ -172,10 +172,7 @@ impl NetworkStack {
                     if !self.connections.contains_key(&id.0) {
                         continue;
                     }
-                    self.pending_send
-                        .entry(id.0)
-                        .or_default()
-                        .extend(&payload);
+                    self.pending_send.entry(id.0).or_default().extend(&payload);
                 }
                 StackCommand::Close { id } => {
                     // Connection may have already been cleaned up by poll_tcp_sockets
@@ -338,10 +335,8 @@ impl NetworkStack {
                         }
                     }
 
-                    let actual_dst = SocketAddr::new(
-                        IpAddr::V4(Ipv4Addr::from(ipv4.octets())),
-                        local.port,
-                    );
+                    let actual_dst =
+                        SocketAddr::new(IpAddr::V4(Ipv4Addr::from(ipv4.octets())), local.port);
 
                     self.connections.insert(handle, actual_dst);
                     let _ = self.event_tx.send(StackEvent::NewConnection(TcpConnection {

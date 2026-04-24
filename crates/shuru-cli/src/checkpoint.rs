@@ -22,8 +22,7 @@ pub(crate) fn create(
         vec!["/bin/sh".to_string()]
     };
 
-    shuru_vm::validate_checkpoint_name(&name)
-        .map_err(|e| anyhow::anyhow!(e))?;
+    shuru_vm::validate_checkpoint_name(&name).map_err(|e| anyhow::anyhow!(e))?;
 
     let data_dir = shuru_vm::default_data_dir();
     let checkpoints_dir = format!("{}/checkpoints", data_dir);
@@ -82,13 +81,12 @@ pub(crate) fn list() -> Result<()> {
         let meta = entry.metadata()?;
         let disk_usage = if is_cas {
             // Count non-ZERO chunks × 64KB for actual referenced data size
-            shuru_store::ChunkIndex::load(path.to_str().unwrap_or(""))
-                .map(|idx| {
-                    let non_zero = (0..idx.num_chunks())
-                        .filter(|&i| idx.get_hash(i).map(|h| h != "ZERO").unwrap_or(false))
-                        .count();
-                    (non_zero as u64) * 64 * 1024
-                })?
+            shuru_store::ChunkIndex::load(path.to_str().unwrap_or("")).map(|idx| {
+                let non_zero = (0..idx.num_chunks())
+                    .filter(|&i| idx.get_hash(i).map(|h| h != "ZERO").unwrap_or(false))
+                    .count();
+                (non_zero as u64) * 64 * 1024
+            })?
         } else {
             meta.blocks() * 512
         };
@@ -135,8 +133,7 @@ pub(crate) fn list() -> Result<()> {
 }
 
 pub(crate) fn delete(name: &str) -> Result<()> {
-    shuru_vm::validate_checkpoint_name(name)
-        .map_err(|e| anyhow::anyhow!(e))?;
+    shuru_vm::validate_checkpoint_name(name).map_err(|e| anyhow::anyhow!(e))?;
 
     let data_dir = default_data_dir();
     let checkpoints_dir = format!("{}/checkpoints", data_dir);

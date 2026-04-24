@@ -19,9 +19,7 @@ impl VirtioMemoryBalloonDevice {
         }
     }
 
-    pub(crate) fn as_memory_balloon_config(
-        &self,
-    ) -> Retained<VZMemoryBalloonDeviceConfiguration> {
+    pub(crate) fn as_memory_balloon_config(&self) -> Retained<VZMemoryBalloonDeviceConfiguration> {
         unsafe { Retained::cast_unchecked(self.inner.clone()) }
     }
 }

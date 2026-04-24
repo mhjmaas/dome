@@ -67,9 +67,7 @@ impl VZDevice {
     fn is_icmp(frame: &[u8]) -> bool {
         const ETHERTYPE_IPV4: [u8; 2] = [0x08, 0x00];
         const IP_PROTO_ICMP: u8 = 1;
-        frame.len() >= 24
-            && frame[12..14] == ETHERTYPE_IPV4
-            && frame[23] == IP_PROTO_ICMP
+        frame.len() >= 24 && frame[12..14] == ETHERTYPE_IPV4 && frame[23] == IP_PROTO_ICMP
     }
 
     /// Iterate over all pending frames for inspection (e.g. SYN detection).
@@ -165,7 +163,7 @@ mod tests {
     /// IPv4: version/IHL(1) + DSCP(1) + length(2) + id(2) + flags(2) + TTL(1) + proto(1) + ...
     fn make_frame(ip_proto: u8) -> Vec<u8> {
         let mut frame = vec![0u8; 34]; // 14 (eth) + 20 (ip min)
-        // EtherType = IPv4
+                                       // EtherType = IPv4
         frame[12] = 0x08;
         frame[13] = 0x00;
         // IPv4 version + IHL
@@ -193,7 +191,7 @@ mod tests {
     #[test]
     fn is_icmp_ignores_arp() {
         let mut frame = vec![0u8; 42]; // ARP is 28 bytes + 14 eth
-        // EtherType = ARP (0x0806), not IPv4
+                                       // EtherType = ARP (0x0806), not IPv4
         frame[12] = 0x08;
         frame[13] = 0x06;
         assert!(!VZDevice::is_icmp(&frame));

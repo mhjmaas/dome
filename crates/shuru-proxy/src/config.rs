@@ -112,7 +112,9 @@ fn domain_matches(pattern: &str, domain: &str) -> bool {
     if pattern == "*" {
         true
     } else if let Some(suffix) = pattern.strip_prefix("*.") {
-        domain.ends_with(suffix) && domain.len() > suffix.len() && domain.as_bytes()[domain.len() - suffix.len() - 1] == b'.'
+        domain.ends_with(suffix)
+            && domain.len() > suffix.len()
+            && domain.as_bytes()[domain.len() - suffix.len() - 1] == b'.'
     } else {
         pattern == domain
     }
@@ -127,18 +129,36 @@ mod tests {
         use std::net::Ipv4Addr;
         let config = ProxyConfig {
             expose_host: vec![
-                ExposeHostMapping { host_port: 3000, guest_port: 8080 },
-                ExposeHostMapping { host_port: 5432, guest_port: 5432 },
+                ExposeHostMapping {
+                    host_port: 3000,
+                    guest_port: 8080,
+                },
+                ExposeHostMapping {
+                    host_port: 5432,
+                    guest_port: 5432,
+                },
             ],
             ..Default::default()
         };
         // Gateway IP match
-        assert_eq!(config.exposed_host_port(Ipv4Addr::new(10, 0, 0, 1), 8080), Some(3000));
-        assert_eq!(config.exposed_host_port(Ipv4Addr::new(10, 0, 0, 1), 5432), Some(5432));
+        assert_eq!(
+            config.exposed_host_port(Ipv4Addr::new(10, 0, 0, 1), 8080),
+            Some(3000)
+        );
+        assert_eq!(
+            config.exposed_host_port(Ipv4Addr::new(10, 0, 0, 1), 5432),
+            Some(5432)
+        );
         // No mapping for this port
-        assert_eq!(config.exposed_host_port(Ipv4Addr::new(10, 0, 0, 1), 9999), None);
+        assert_eq!(
+            config.exposed_host_port(Ipv4Addr::new(10, 0, 0, 1), 9999),
+            None
+        );
         // Non-gateway IP
-        assert_eq!(config.exposed_host_port(Ipv4Addr::new(1, 2, 3, 4), 8080), None);
+        assert_eq!(
+            config.exposed_host_port(Ipv4Addr::new(1, 2, 3, 4), 8080),
+            None
+        );
     }
 
     #[test]

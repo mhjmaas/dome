@@ -135,8 +135,12 @@ impl VirtualMachine {
         self.running.load(Ordering::Acquire)
     }
 
-    pub fn can_pause(&self) -> bool { false }
-    pub fn can_resume(&self) -> bool { false }
+    pub fn can_pause(&self) -> bool {
+        false
+    }
+    pub fn can_resume(&self) -> bool {
+        false
+    }
 
     pub fn can_request_stop(&self) -> bool {
         self.can_stop()
@@ -144,13 +148,7 @@ impl VirtualMachine {
 
     /// Connect to a vsock port on the guest via AF_VSOCK.
     pub fn connect_to_vsock_port(&self, port: u32) -> Result<TcpStream> {
-        let sock = unsafe {
-            libc::socket(
-                layout::AF_VSOCK,
-                libc::SOCK_STREAM,
-                0,
-            )
-        };
+        let sock = unsafe { libc::socket(layout::AF_VSOCK, libc::SOCK_STREAM, 0) };
         if sock < 0 {
             return Err(VzError::new(format!(
                 "failed to create vsock socket: {}",
@@ -202,8 +200,7 @@ impl VirtualMachine {
 
             // Check if connect succeeded
             let mut err: libc::c_int = 0;
-            let mut len: libc::socklen_t =
-                std::mem::size_of::<libc::c_int>() as libc::socklen_t;
+            let mut len: libc::socklen_t = std::mem::size_of::<libc::c_int>() as libc::socklen_t;
             unsafe {
                 libc::getsockopt(
                     sock,

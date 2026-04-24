@@ -3,7 +3,7 @@ use std::sync::atomic::{AtomicBool, AtomicU32, Ordering};
 use std::sync::Arc;
 
 use kvm_ioctls::VmFd;
-use vm_memory::{Address, GuestAddress, GuestMemory, GuestMemoryMmap, Bytes};
+use vm_memory::{Address, Bytes, GuestAddress, GuestMemory, GuestMemoryMmap};
 use vmm_sys_util::eventfd::EventFd;
 
 use super::layout;
@@ -405,12 +405,8 @@ impl MmioDevice for VirtioMmioDevice {
                     (features >> 32) as u32
                 }
             }
-            VIRTIO_MMIO_QUEUE_NUM_MAX => {
-                self.selected_queue().map_or(0, |q| q.max_size as u32)
-            }
-            VIRTIO_MMIO_QUEUE_READY => {
-                self.selected_queue().map_or(0, |q| q.ready as u32)
-            }
+            VIRTIO_MMIO_QUEUE_NUM_MAX => self.selected_queue().map_or(0, |q| q.max_size as u32),
+            VIRTIO_MMIO_QUEUE_READY => self.selected_queue().map_or(0, |q| q.ready as u32),
             VIRTIO_MMIO_INTERRUPT_STATUS => self.interrupt_status.load(Ordering::Acquire),
             VIRTIO_MMIO_STATUS => self.status,
             VIRTIO_MMIO_CONFIG_GENERATION => 0,
@@ -431,8 +427,7 @@ impl MmioDevice for VirtioMmioDevice {
             VIRTIO_MMIO_DEV_FEATURES_SEL => self.dev_features_sel = val,
             VIRTIO_MMIO_DRV_FEATURES => {
                 if self.drv_features_sel == 0 {
-                    self.drv_features =
-                        (self.drv_features & 0xFFFF_FFFF_0000_0000) | val as u64;
+                    self.drv_features = (self.drv_features & 0xFFFF_FFFF_0000_0000) | val as u64;
                 } else {
                     self.drv_features =
                         (self.drv_features & 0x0000_0000_FFFF_FFFF) | ((val as u64) << 32);
@@ -542,17 +537,14 @@ struct VringDesc {
 }
 
 pub fn avail_idx(mem: &GuestMemoryMmap, avail_addr: u64) -> u16 {
-    mem.read_obj::<u16>(GuestAddress(avail_addr + 2)).unwrap_or(0)
+    mem.read_obj::<u16>(GuestAddress(avail_addr + 2))
+        .unwrap_or(0)
 }
 
-pub fn avail_ring_entry(
-    mem: &GuestMemoryMmap,
-    avail_addr: u64,
-    queue_size: u16,
-    idx: u16,
-) -> u16 {
+pub fn avail_ring_entry(mem: &GuestMemoryMmap, avail_addr: u64, queue_size: u16, idx: u16) -> u16 {
     let offset = 4 + (idx % queue_size) as u64 * 2;
-    mem.read_obj::<u16>(GuestAddress(avail_addr + offset)).unwrap_or(0)
+    mem.read_obj::<u16>(GuestAddress(avail_addr + offset))
+        .unwrap_or(0)
 }
 
 fn read_desc(mem: &GuestMemoryMmap, desc_addr: u64, idx: u16) -> VringDesc {
@@ -560,8 +552,12 @@ fn read_desc(mem: &GuestMemoryMmap, desc_addr: u64, idx: u16) -> VringDesc {
     VringDesc {
         addr: mem.read_obj(GuestAddress(desc_addr + off)).unwrap_or(0),
         len: mem.read_obj(GuestAddress(desc_addr + off + 8)).unwrap_or(0),
-        flags: mem.read_obj(GuestAddress(desc_addr + off + 12)).unwrap_or(0),
-        next: mem.read_obj(GuestAddress(desc_addr + off + 14)).unwrap_or(0),
+        flags: mem
+            .read_obj(GuestAddress(desc_addr + off + 12))
+            .unwrap_or(0),
+        next: mem
+            .read_obj(GuestAddress(desc_addr + off + 14))
+            .unwrap_or(0),
     }
 }
 
@@ -584,7 +580,7 @@ pub fn write_used(
 // ===========================================================================
 
 use std::fs::{File, OpenOptions};
-use std::io::{Read, Write, Seek, SeekFrom};
+use std::io::{Read, Seek, SeekFrom, Write};
 
 const VIRTIO_BLK_T_IN: u32 = 0;
 const VIRTIO_BLK_T_OUT: u32 = 1;
@@ -601,17 +597,21 @@ pub struct BlockBackend {
 
 impl BlockBackend {
     pub fn new(path: &str, read_only: bool) -> std::io::Result<Self> {
-        let disk = OpenOptions::new()
-            .read(true)
-            .write(!read_only)
-            .open(path)?;
+        let disk = OpenOptions::new().read(true).write(!read_only).open(path)?;
         let capacity = disk.metadata()?.len() / 512;
-        Ok(BlockBackend { disk, capacity, read_only, buf: vec![0u8; 65536] })
+        Ok(BlockBackend {
+            disk,
+            capacity,
+            read_only,
+            buf: vec![0u8; 65536],
+        })
     }
 }
 
 impl VirtioBackend for BlockBackend {
-    fn device_id(&self) -> u32 { 2 }
+    fn device_id(&self) -> u32 {
+        2
+    }
 
     fn device_features(&self) -> u64 {
         let mut f = VIRTIO_F_VERSION_1;
@@ -621,8 +621,12 @@ impl VirtioBackend for BlockBackend {
         f
     }
 
-    fn queue_count(&self) -> usize { 1 }
-    fn queue_max_size(&self) -> u16 { 256 }
+    fn queue_count(&self) -> usize {
+        1
+    }
+    fn queue_max_size(&self) -> u16 {
+        256
+    }
 
     fn config_read(&self, offset: u64) -> u32 {
         match offset {
@@ -634,8 +638,15 @@ impl VirtioBackend for BlockBackend {
 
     fn config_write(&mut self, _: u64, _: u32) {}
 
-    fn activate(&mut self, _: &[VirtioQueueState], _: &GuestMemoryMmap,
-                _: &Arc<VmFd>, _: u32, _: Arc<AtomicU32>) {}
+    fn activate(
+        &mut self,
+        _: &[VirtioQueueState],
+        _: &GuestMemoryMmap,
+        _: &Arc<VmFd>,
+        _: u32,
+        _: Arc<AtomicU32>,
+    ) {
+    }
 
     fn process_queue(
         &mut self,
@@ -656,8 +667,12 @@ impl VirtioBackend for BlockBackend {
             let head = avail_ring_entry(mem, q.avail_addr, q.size, q.last_avail_idx);
 
             let header_desc = read_desc(mem, q.desc_addr, head);
-            let req_type = mem.read_obj::<u32>(GuestAddress(header_desc.addr)).unwrap_or(u32::MAX);
-            let sector = mem.read_obj::<u64>(GuestAddress(header_desc.addr + 8)).unwrap_or(0);
+            let req_type = mem
+                .read_obj::<u32>(GuestAddress(header_desc.addr))
+                .unwrap_or(u32::MAX);
+            let sector = mem
+                .read_obj::<u64>(GuestAddress(header_desc.addr + 8))
+                .unwrap_or(0);
 
             // Walk the descriptor chain inline — no Vec allocation.
             // Chain: header → data desc(s) → status (last, no NEXT flag).
@@ -699,7 +714,9 @@ impl VirtioBackend for BlockBackend {
                                 status = VIRTIO_BLK_S_IOERR;
                             }
                         }
-                        _ => { status = VIRTIO_BLK_S_IOERR; }
+                        _ => {
+                            status = VIRTIO_BLK_S_IOERR;
+                        }
                     }
                     disk_offset += len as u64;
                     total_data_len += desc.len;
@@ -712,7 +729,14 @@ impl VirtioBackend for BlockBackend {
             if let Some(addr) = status_addr {
                 let _ = mem.write_obj(status, GuestAddress(addr));
             }
-            write_used(mem, q.used_addr, q.size, q.last_avail_idx, head as u32, total_data_len + 1);
+            write_used(
+                mem,
+                q.used_addr,
+                q.size,
+                q.last_avail_idx,
+                head as u32,
+                total_data_len + 1,
+            );
             q.last_avail_idx = q.last_avail_idx.wrapping_add(1);
         }
     }
@@ -746,14 +770,20 @@ impl NetBackend {
 }
 
 impl VirtioBackend for NetBackend {
-    fn device_id(&self) -> u32 { 1 }
+    fn device_id(&self) -> u32 {
+        1
+    }
 
     fn device_features(&self) -> u64 {
         VIRTIO_F_VERSION_1 | VIRTIO_NET_F_MAC
     }
 
-    fn queue_count(&self) -> usize { 2 }
-    fn queue_max_size(&self) -> u16 { 256 }
+    fn queue_count(&self) -> usize {
+        2
+    }
+    fn queue_max_size(&self) -> u16 {
+        256
+    }
 
     fn config_read(&self, offset: u64) -> u32 {
         match offset {
@@ -837,7 +867,12 @@ impl VirtioBackend for NetBackend {
             if packet.len() > VIRTIO_NET_HDR_SIZE {
                 let frame = &packet[VIRTIO_NET_HDR_SIZE..];
                 unsafe {
-                    libc::send(self.fd, frame.as_ptr() as *const _, frame.len(), libc::MSG_NOSIGNAL);
+                    libc::send(
+                        self.fd,
+                        frame.as_ptr() as *const _,
+                        frame.len(),
+                        libc::MSG_NOSIGNAL,
+                    );
                 }
             }
 
@@ -875,7 +910,11 @@ fn net_rx_loop(
     let mut buf = vec![0u8; 65535];
 
     while running.load(Ordering::Acquire) {
-        let mut pfd = libc::pollfd { fd, events: libc::POLLIN, revents: 0 };
+        let mut pfd = libc::pollfd {
+            fd,
+            events: libc::POLLIN,
+            revents: 0,
+        };
         let ret = unsafe { libc::poll(&mut pfd, 1, 100) };
         if ret <= 0 {
             continue;
@@ -903,7 +942,14 @@ fn net_rx_loop(
             let _ = mem.write_slice(&header, GuestAddress(desc.addr));
             let _ = mem.write_slice(frame, GuestAddress(desc.addr + VIRTIO_NET_HDR_SIZE as u64));
 
-            write_used(&mem, rx_q.used_addr, rx_q.size, used_idx, head as u32, total as u32);
+            write_used(
+                &mem,
+                rx_q.used_addr,
+                rx_q.size,
+                used_idx,
+                head as u32,
+                total as u32,
+            );
             used_idx = used_idx.wrapping_add(1);
             last_avail = last_avail.wrapping_add(1);
 
@@ -1012,12 +1058,20 @@ fn guest_to_host(mem: &GuestMemoryMmap, guest_addr: u64) -> u64 {
 }
 
 impl VirtioBackend for VhostVsockBackend {
-    fn device_id(&self) -> u32 { 19 }
+    fn device_id(&self) -> u32 {
+        19
+    }
 
-    fn device_features(&self) -> u64 { VIRTIO_F_VERSION_1 }
+    fn device_features(&self) -> u64 {
+        VIRTIO_F_VERSION_1
+    }
 
-    fn queue_count(&self) -> usize { 3 }
-    fn queue_max_size(&self) -> u16 { 256 }
+    fn queue_count(&self) -> usize {
+        3
+    }
+    fn queue_max_size(&self) -> u16 {
+        256
+    }
 
     fn config_read(&self, offset: u64) -> u32 {
         match offset {
@@ -1044,7 +1098,10 @@ impl VirtioBackend for VhostVsockBackend {
             )
         };
         if vhost_fd < 0 {
-            eprintln!("shuru: failed to open /dev/vhost-vsock: {}", std::io::Error::last_os_error());
+            eprintln!(
+                "shuru: failed to open /dev/vhost-vsock: {}",
+                std::io::Error::last_os_error()
+            );
             return;
         }
         self.vhost_fd = Some(vhost_fd);
@@ -1053,7 +1110,10 @@ impl VirtioBackend for VhostVsockBackend {
             // Exact order matching Cloud Hypervisor / Firecracker:
             // 1. OWNER → 2. FEATURES → 3. MEM_TABLE → 4. queues (NUM, ADDR, BASE, CALL, KICK) → 5. CID → 6. IRQFD
             if libc::ioctl(vhost_fd, VHOST_SET_OWNER) < 0 {
-                eprintln!("shuru: VHOST_SET_OWNER failed: {}", std::io::Error::last_os_error());
+                eprintln!(
+                    "shuru: VHOST_SET_OWNER failed: {}",
+                    std::io::Error::last_os_error()
+                );
                 return;
             }
 
@@ -1063,7 +1123,10 @@ impl VirtioBackend for VhostVsockBackend {
             libc::ioctl(vhost_fd, get_features, &mut avail_features);
             let features = avail_features & VIRTIO_F_VERSION_1;
             if libc::ioctl(vhost_fd, VHOST_SET_FEATURES, &features) < 0 {
-                eprintln!("shuru: VHOST_SET_FEATURES failed: {}", std::io::Error::last_os_error());
+                eprintln!(
+                    "shuru: VHOST_SET_FEATURES failed: {}",
+                    std::io::Error::last_os_error()
+                );
                 return;
             }
 
@@ -1073,7 +1136,10 @@ impl VirtioBackend for VhostVsockBackend {
             if let Some(region) = region {
                 use vm_memory::GuestMemoryRegion;
                 let mem_table = VhostMemTable {
-                    header: VhostMemoryHeader { nregions: 1, _padding: 0 },
+                    header: VhostMemoryHeader {
+                        nregions: 1,
+                        _padding: 0,
+                    },
                     region: VhostMemoryRegion {
                         guest_phys_addr: region.start_addr().raw_value(),
                         memory_size: region.len(),
@@ -1082,7 +1148,10 @@ impl VirtioBackend for VhostVsockBackend {
                     },
                 };
                 if libc::ioctl(vhost_fd, VHOST_SET_MEM_TABLE, &mem_table) < 0 {
-                    eprintln!("shuru: VHOST_SET_MEM_TABLE failed: {}", std::io::Error::last_os_error());
+                    eprintln!(
+                        "shuru: VHOST_SET_MEM_TABLE failed: {}",
+                        std::io::Error::last_os_error()
+                    );
                     return;
                 }
             }
@@ -1093,7 +1162,10 @@ impl VirtioBackend for VhostVsockBackend {
                     continue;
                 }
 
-                let vring_num = VhostVringState { index: i as u32, num: q.size as u32 };
+                let vring_num = VhostVringState {
+                    index: i as u32,
+                    num: q.size as u32,
+                };
                 libc::ioctl(vhost_fd, VHOST_SET_VRING_NUM, &vring_num);
 
                 let vring_addr = VhostVringAddr {
@@ -1106,17 +1178,26 @@ impl VirtioBackend for VhostVsockBackend {
                 };
                 libc::ioctl(vhost_fd, VHOST_SET_VRING_ADDR, &vring_addr);
 
-                let vring_base = VhostVringState { index: i as u32, num: 0 };
+                let vring_base = VhostVringState {
+                    index: i as u32,
+                    num: 0,
+                };
                 libc::ioctl(vhost_fd, VHOST_SET_VRING_BASE, &vring_base);
 
                 let kick_evt = EventFd::new(0).expect("eventfd");
                 let call_evt = EventFd::new(0).expect("eventfd");
 
-                let call_file = VhostVringFile { index: i as u32, fd: call_evt.as_raw_fd() };
+                let call_file = VhostVringFile {
+                    index: i as u32,
+                    fd: call_evt.as_raw_fd(),
+                };
                 libc::ioctl(vhost_fd, VHOST_SET_VRING_CALL, &call_file);
 
                 // KICK last — starts the vhost data plane
-                let kick_file = VhostVringFile { index: i as u32, fd: kick_evt.as_raw_fd() };
+                let kick_file = VhostVringFile {
+                    index: i as u32,
+                    fd: kick_evt.as_raw_fd(),
+                };
                 libc::ioctl(vhost_fd, VHOST_SET_VRING_KICK, &kick_file);
 
                 self.kick_evts.push(kick_evt);
@@ -1125,14 +1206,20 @@ impl VirtioBackend for VhostVsockBackend {
 
             // CID AFTER queue setup
             if libc::ioctl(vhost_fd, VHOST_VSOCK_SET_GUEST_CID, &self.guest_cid) < 0 {
-                eprintln!("shuru: VHOST_VSOCK_SET_GUEST_CID failed: {}", std::io::Error::last_os_error());
+                eprintln!(
+                    "shuru: VHOST_VSOCK_SET_GUEST_CID failed: {}",
+                    std::io::Error::last_os_error()
+                );
                 return;
             }
 
             // START the vhost worker — without this, no queues are processed!
             let running: libc::c_int = 1;
             if libc::ioctl(vhost_fd, VHOST_VSOCK_SET_RUNNING, &running) < 0 {
-                eprintln!("shuru: VHOST_VSOCK_SET_RUNNING failed: {}", std::io::Error::last_os_error());
+                eprintln!(
+                    "shuru: VHOST_VSOCK_SET_RUNNING failed: {}",
+                    std::io::Error::last_os_error()
+                );
                 return;
             }
             // Vhost worker is now running and processing queues.
@@ -1148,8 +1235,16 @@ impl VirtioBackend for VhostVsockBackend {
                 .name("vsock-irq".into())
                 .spawn(move || {
                     let mut pfds = [
-                        libc::pollfd { fd: call_fd_0, events: libc::POLLIN, revents: 0 },
-                        libc::pollfd { fd: call_fd_1, events: libc::POLLIN, revents: 0 },
+                        libc::pollfd {
+                            fd: call_fd_0,
+                            events: libc::POLLIN,
+                            revents: 0,
+                        },
+                        libc::pollfd {
+                            fd: call_fd_1,
+                            events: libc::POLLIN,
+                            revents: 0,
+                        },
                     ];
                     while irq_running.load(Ordering::Acquire) {
                         let ret = libc::poll(pfds.as_mut_ptr(), 2, 500);
@@ -1191,7 +1286,9 @@ impl VirtioBackend for VhostVsockBackend {
         self.kick_evts.clear();
         self.call_evts.clear();
         if let Some(fd) = self.vhost_fd.take() {
-            unsafe { libc::close(fd); }
+            unsafe {
+                libc::close(fd);
+            }
         }
     }
 }

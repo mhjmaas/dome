@@ -108,7 +108,6 @@ impl VirtioBlockDevice {
             read_only: attachment.is_read_only(),
         }
     }
-
 }
 
 impl StorageDevice for VirtioBlockDevice {
