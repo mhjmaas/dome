@@ -40,6 +40,17 @@ impl NbdHandle {
             .ok_or_else(|| anyhow::anyhow!("save_checkpoint requires CAS backend"))?;
         backend.save_index(index_path)
     }
+
+    /// Save the current disk state as a persistent sandbox index: flatten the chain
+    /// into a depth-1 parent-less index and write it atomically. Only works with the
+    /// CAS backend.
+    pub fn save_sandbox(&self, index_path: &str) -> Result<()> {
+        let backend = self
+            .cas_backend
+            .as_ref()
+            .ok_or_else(|| anyhow::anyhow!("save_sandbox requires CAS backend"))?;
+        backend.save_sandbox_index(index_path)
+    }
 }
 
 impl Drop for NbdHandle {

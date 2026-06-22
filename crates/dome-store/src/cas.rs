@@ -129,6 +129,49 @@ impl ChunkIndex {
         Ok(())
     }
 
+    /// Save index atomically: write to a temp file in the same directory, fsync it,
+    /// then rename over the target. The rename is atomic on the same filesystem, so a
+    /// crash mid-write leaves the previous index intact; the fsync guarantees the
+    /// temp file's bytes are durable before the rename publishes them, so a power loss
+    /// can't leave the renamed index pointing at unflushed (zero) data. On any failure
+    /// the temp file is removed so it can't accumulate alongside the real index.
+    pub fn save_atomic(&self, path: &str) -> Result<()> {
+        let target = Path::new(path);
+        if let Some(parent) = target.parent() {
+            fs::create_dir_all(parent)?;
+        }
+        // Temp file alongside the target so the rename stays on the same filesystem.
+        let tmp = format!("{}.tmp.{}", path, std::process::id());
+
+        // Write + fsync the temp file; clean it up on any failure before the rename.
+        let written = (|| -> Result<()> {
+            self.save(&tmp)
+                .with_context(|| format!("failed to write temp index: {}", tmp))?;
+            fs::File::open(&tmp)
+                .and_then(|f| f.sync_all())
+                .with_context(|| format!("failed to fsync temp index: {}", tmp))?;
+            Ok(())
+        })();
+        if let Err(e) = written {
+            let _ = fs::remove_file(&tmp);
+            return Err(e);
+        }
+
+        if let Err(e) = fs::rename(&tmp, path) {
+            let _ = fs::remove_file(&tmp);
+            return Err(anyhow::Error::from(e)
+                .context(format!("failed to rename {} -> {}", tmp, path)));
+        }
+
+        // fsync the directory so the rename itself survives a crash.
+        if let Some(parent) = target.parent() {
+            if let Ok(dir) = fs::File::open(parent) {
+                let _ = dir.sync_all();
+            }
+        }
+        Ok(())
+    }
+
     /// Load index from a file.
     pub fn load(path: &str) -> Result<Self> {
         let mut f = fs::File::open(path)
@@ -349,7 +392,54 @@ impl CasBackend {
                 index.fallback_path = Some(fb.path().to_string());
             }
         }
-        index.save(path)
+        index.save_atomic(path)
+    }
+
+    /// Flatten the current index and its parent chain into a single depth-1,
+    /// parent-less index. Every chunk is resolved through the chain (current index
+    /// first, then each parent) and its hash reference — not the chunk data — is
+    /// copied into the result. Chunks that are ZERO at every level stay ZERO and
+    /// continue to resolve through the preserved fallback file (the pinned base).
+    ///
+    /// Callers must `flush()` first so in-flight writes are reflected in the index.
+    pub fn flatten(&self) -> ChunkIndex {
+        let index = self.index.read().unwrap();
+        let parents = self.parents.read().unwrap();
+
+        let mut flat = ChunkIndex::new(index.disk_size());
+        for i in 0..index.num_chunks() {
+            let mut resolved = index.get_hash(i).unwrap_or(ZERO_CHUNK_HASH);
+            if resolved == ZERO_CHUNK_HASH {
+                for parent in parents.iter() {
+                    let ph = parent.get_hash(i).unwrap_or(ZERO_CHUNK_HASH);
+                    if ph != ZERO_CHUNK_HASH {
+                        resolved = ph;
+                        break;
+                    }
+                }
+            }
+            if resolved != ZERO_CHUNK_HASH {
+                flat.set_hash(i, resolved.to_string());
+            }
+        }
+
+        // Depth-1: no parent. Preserve the fallback so never-written chunks still
+        // resolve through the immutable base image.
+        flat.parent_path = None;
+        flat.fallback_path = index
+            .fallback_path
+            .clone()
+            .or_else(|| self.fallback.as_ref().map(|fb| fb.path().to_string()));
+        flat
+    }
+
+    /// Save the current disk state as a sandbox index: flush pending writes, flatten
+    /// the chain into a depth-1 parent-less index, and write it atomically. Keeps the
+    /// sandbox's index chain shallow so resume reads stay fast.
+    pub fn save_sandbox_index(&self, path: &str) -> Result<()> {
+        self.flush().map_err(|e| anyhow::anyhow!(e))?;
+        let flat = self.flatten();
+        flat.save_atomic(path)
     }
 
     fn read_chunk(&self, chunk_idx: usize) -> std::io::Result<Vec<u8>> {
@@ -512,6 +602,103 @@ mod tests {
             Err(e) => assert!(e.to_string().contains("chunk count")),
             Ok(_) => panic!("expected load to fail for mismatched chunk count"),
         }
+    }
+
+    #[test]
+    fn test_save_atomic_replaces_target() {
+        let tmp = tempfile::tempdir().unwrap();
+        let idx_path = tmp.path().join("sandbox.idx");
+        let path = idx_path.to_str().unwrap();
+
+        let mut first = ChunkIndex::new(256 * 1024);
+        first.set_hash(0, "first".to_string());
+        first.save_atomic(path).unwrap();
+        assert_eq!(ChunkIndex::load(path).unwrap().get_hash(0).unwrap(), "first");
+
+        let mut second = ChunkIndex::new(256 * 1024);
+        second.set_hash(0, "second".to_string());
+        second.save_atomic(path).unwrap();
+        assert_eq!(ChunkIndex::load(path).unwrap().get_hash(0).unwrap(), "second");
+
+        // A successful atomic save must not leave any temp files behind.
+        let leftovers: Vec<_> = fs::read_dir(tmp.path())
+            .unwrap()
+            .filter_map(|e| e.ok())
+            .map(|e| e.file_name().to_string_lossy().to_string())
+            .filter(|n| n.contains(".tmp."))
+            .collect();
+        assert!(leftovers.is_empty(), "atomic save left temp files: {:?}", leftovers);
+    }
+
+    #[test]
+    fn test_partial_save_leaves_prior_index_intact() {
+        let tmp = tempfile::tempdir().unwrap();
+        let idx_path = tmp.path().join("sandbox.idx");
+        let path = idx_path.to_str().unwrap();
+
+        // Write a good index.
+        let mut good = ChunkIndex::new(256 * 1024);
+        good.set_hash(1, "good".to_string());
+        good.save_atomic(path).unwrap();
+
+        // Simulate an interrupted save: a half-written temp file is left behind but
+        // the rename never happened. The original index must still load.
+        let tmp_garbage = format!("{}.tmp.99999", path);
+        fs::write(&tmp_garbage, b"truncated-garbage").unwrap();
+
+        let loaded = ChunkIndex::load(path).unwrap();
+        assert_eq!(loaded.get_hash(1).unwrap(), "good");
+    }
+
+    #[test]
+    fn test_flatten_is_depth1_and_byte_identical() {
+        let tmp = tempfile::tempdir().unwrap();
+        let store = LocalChunkStore::open(tmp.path().to_str().unwrap()).unwrap();
+
+        // Build a parent index that owns chunk 0.
+        let parent_path = tmp.path().join("parent.idx");
+        let parent_a = vec![0xAAu8; CHUNK_SIZE];
+        let hash_a = store.put(&parent_a).unwrap();
+        let mut parent = ChunkIndex::new(256 * 1024); // 4 chunks
+        parent.set_hash(0, hash_a.clone());
+        parent.save(parent_path.to_str().unwrap()).unwrap();
+
+        // Child index points at the parent and owns chunk 1.
+        let mut child = ChunkIndex::new(256 * 1024);
+        child.parent_path = Some(parent_path.to_str().unwrap().to_string());
+        let store2 = LocalChunkStore::open(tmp.path().to_str().unwrap()).unwrap();
+        let backend = CasBackend::new(Box::new(store2), child);
+        let data_b = b"chunk-one-payload";
+        backend.write(CHUNK_SIZE as u64, data_b).unwrap();
+        backend.flush().unwrap();
+
+        // Reads through the original chained backend.
+        let mut chunk0_before = vec![0u8; 8];
+        backend.read(0, &mut chunk0_before).unwrap();
+        let mut chunk1_before = vec![0u8; data_b.len()];
+        backend.read(CHUNK_SIZE as u64, &mut chunk1_before).unwrap();
+
+        // Flatten and persist.
+        let flat = backend.flatten();
+        assert!(flat.parent_path.is_none(), "flattened index must be depth-1");
+        let flat_path = tmp.path().join("flat.idx");
+        flat.save_atomic(flat_path.to_str().unwrap()).unwrap();
+
+        // Reads through a fresh backend built from the flattened index must match.
+        let loaded = ChunkIndex::load(flat_path.to_str().unwrap()).unwrap();
+        assert!(loaded.parent_path.is_none());
+        let store3 = LocalChunkStore::open(tmp.path().to_str().unwrap()).unwrap();
+        let flat_backend = CasBackend::new(Box::new(store3), loaded);
+
+        let mut chunk0_after = vec![0u8; 8];
+        flat_backend.read(0, &mut chunk0_after).unwrap();
+        let mut chunk1_after = vec![0u8; data_b.len()];
+        flat_backend.read(CHUNK_SIZE as u64, &mut chunk1_after).unwrap();
+
+        assert_eq!(chunk0_before, chunk0_after);
+        assert_eq!(chunk1_before, chunk1_after);
+        assert_eq!(&chunk0_after, &[0xAAu8; 8]);
+        assert_eq!(&chunk1_after, data_b);
     }
 
     #[test]
