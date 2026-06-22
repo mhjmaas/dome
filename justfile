@@ -24,6 +24,12 @@ build: build-guest build-cli codesign
 prepare-rootfs:
     ./scripts/prepare-rootfs.sh
 
+# Build a complete local OS image (guest + kernel + rootfs + initramfs) + VERSION; CLI uses it instead of downloading (Docker required on macOS)
+build-image: build-guest
+    ./scripts/prepare-rootfs.sh
+    cargo pkgid -p dome-cli | sed 's/.*#//' > ~/.local/share/dome/VERSION
+    @echo "==> Local OS image ready ($(cat ~/.local/share/dome/VERSION)) — CLI will use it instead of downloading"
+
 # Run a command inside the VM
 run *args:
     {{ binary }} run -- {{ args }}
@@ -32,8 +38,8 @@ run *args:
 shell:
     {{ binary }} run -- sh
 
-# Full setup from scratch: rootfs + build
-setup: prepare-rootfs build
+# Full setup from scratch: local OS image + CLI build
+setup: build-image build
 
 # Check all crates compile (host targets only)
 check:

@@ -10,6 +10,7 @@ env:
 jobs:
   publish-darwin:
     name: Publish macOS crates
+    if: ${{ false }} # Temporarily disabled — remove this line to re-enable (downstream jobs depend on this one).
     runs-on: macos-14
     steps:
       - uses: actions/checkout@v4

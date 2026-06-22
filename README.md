@@ -29,6 +29,27 @@ The install script supports macOS on Apple Silicon and experimental Linux ARM64.
 > [!NOTE]
 > Homebrew remains macOS-only. Linux installs via the script are still experimental and not ready for production use.
 
+## Build from source
+
+By default the CLI downloads a prebuilt OS image (kernel + rootfs + initramfs) from GitHub Releases on first run. Developers who want full control can build the entire image locally instead — useful for customizing the kernel ([`kernel/dome_defconfig`](kernel/dome_defconfig)) or rootfs.
+
+Requirements: a Rust toolchain with the `aarch64-unknown-linux-musl` target, [`just`](https://github.com/casey/just), and **Docker** (macOS uses it to compile the kernel and format the ext4 rootfs).
+
+```sh
+# Build the OS image locally (kernel + rootfs + initramfs) and stamp the
+# VERSION file so the CLI uses your local build instead of downloading
+just build-image
+
+# Build everything from scratch: local OS image + CLI binary (codesigned)
+just setup
+```
+
+The image is written to `~/.local/share/dome/` (`Image`, `rootfs.ext4`, `initramfs.cpio.gz`, `VERSION`). Once present and matching the CLI version, `dome run` uses it and skips the download. The kernel step is skipped if `Image` already exists; to rebuild just the kernel — optionally pinning a version — run:
+
+```sh
+KERNEL_VERSION=6.12.17 ./scripts/build-kernel.sh
+```
+
 ## Usage
 
 ```sh
