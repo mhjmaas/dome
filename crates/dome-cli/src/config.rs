@@ -17,6 +17,9 @@ pub(crate) struct DomeConfig {
     pub network: Option<NetworkEntry>,
     /// Host ports to expose to the guest (e.g. "3000:8080" or "5432").
     pub expose_host: Option<Vec<String>>,
+    /// Persistent sandbox name for this project. Used by `dome sandbox` when no
+    /// explicit name is given, before falling back to a cwd-derived slug.
+    pub sandbox: Option<String>,
 }
 
 /// A secret to inject via the proxy.

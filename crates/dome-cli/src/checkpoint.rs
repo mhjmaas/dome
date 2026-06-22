@@ -6,6 +6,7 @@ use dome_vm::default_data_dir;
 
 use crate::cli::VmArgs;
 use crate::config::load_config;
+use crate::session::{run_session, SaveTarget};
 use crate::vm;
 
 pub(crate) fn create(
@@ -31,24 +32,8 @@ pub(crate) fn create(
         bail!("checkpoint '{}' already exists, delete it first", name);
     }
 
-    let prepared = vm::prepare_vm(vm_args, &cfg, from)?;
-    let result = vm::run_command(&prepared, &command)?;
-
-    std::fs::create_dir_all(&checkpoints_dir)?;
-    eprintln!("dome: saving checkpoint '{}'...", name);
-
-    if let Some(ref nbd_handle) = result.nbd_handle {
-        let index_path = format!("{}/{}.idx", checkpoints_dir, name);
-        nbd_handle.save_checkpoint(&index_path)?;
-    } else {
-        let ext4_path = format!("{}/{}.ext4", checkpoints_dir, name);
-        vm::clone_file(&prepared.work_rootfs, &ext4_path)?;
-    }
-    eprintln!("dome: checkpoint '{}' saved", name);
-
-    drop(result.nbd_handle);
-    let _ = std::fs::remove_dir_all(&prepared.instance_dir);
-    Ok(result.exit_code)
+    let prepared = vm::prepare_vm(vm_args, &cfg, from, None)?;
+    run_session(&prepared, &command, &SaveTarget::Checkpoint { name })
 }
 
 pub(crate) fn list() -> Result<()> {

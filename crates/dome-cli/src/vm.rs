@@ -38,6 +38,16 @@ use crate::assets;
 use crate::cli::VmArgs;
 use crate::config::DomeConfig;
 
+/// A persistent sandbox's storage binding: where its CAS index lives and the
+/// immutable, version-pinned base image its never-written chunks resolve through.
+pub(crate) struct SandboxSource {
+    /// Path to the sandbox's CAS index (`sandboxes/<name>.idx`). May not exist yet
+    /// on first boot — it is created lazily from the base.
+    pub index_path: String,
+    /// Path to the immutable versioned base image (`bases/rootfs-<version>.ext4`).
+    pub base_path: String,
+}
+
 pub(crate) struct PreparedVm {
     pub instance_dir: String,
     pub source_rootfs: String,
@@ -55,14 +65,23 @@ pub(crate) struct PreparedVm {
     pub mounts: Vec<MountConfig>,
 }
 
+/// Resolve a per-boot config value with session-only precedence: a CLI flag wins,
+/// then the `dome.json` value, then the built-in default. The inputs are taken by
+/// value and nothing is written back, so a flag override applies to this session
+/// only — `dome.json` stays the source of truth for the next boot.
+pub(crate) fn resolve_session<T>(flag: Option<T>, config: Option<T>, default: T) -> T {
+    flag.or(config).unwrap_or(default)
+}
+
 pub(crate) fn prepare_vm(
     vm: &VmArgs,
     cfg: &DomeConfig,
     from: Option<&str>,
+    sandbox: Option<&SandboxSource>,
 ) -> Result<PreparedVm> {
-    let cpus = vm.cpus.or(cfg.cpus).unwrap_or(2);
-    let memory = vm.memory.or(cfg.memory).unwrap_or(2048);
-    let disk_size = vm.disk_size.or(cfg.disk_size).unwrap_or(4096);
+    let cpus = resolve_session(vm.cpus, cfg.cpus, 2);
+    let memory = resolve_session(vm.memory, cfg.memory, 2048);
+    let mut disk_size = resolve_session(vm.disk_size, cfg.disk_size, 4096);
     let allow_net = vm.allow_net || cfg.allow_net.unwrap_or(false);
     let allow_host_writes = vm.allow_host_writes || cfg.allow_host_writes.unwrap_or(false);
     let verbose = vm.verbose;
@@ -160,10 +179,30 @@ pub(crate) fn prepare_vm(
         );
     }
 
-    // Determine source for working copy: checkpoint or base rootfs
+    // Determine source for working copy: persistent sandbox, checkpoint, or base rootfs.
     let checkpoints_dir = format!("{}/checkpoints", data_dir);
     let mut cas_index: Option<String> = None;
-    let source = match from {
+    let source = if let Some(sb) = sandbox {
+        // A persistent sandbox always rides the CAS index it owns, falling back to
+        // its pinned base image. The index may not exist yet on first boot.
+        cas_index = Some(sb.index_path.clone());
+        if std::path::Path::new(&sb.index_path).exists() {
+            // Pin disk size to whatever the sandbox was created with; the index
+            // encodes a fixed chunk count, so honoring a differing --disk-size here
+            // would corrupt the filesystem.
+            let stored = dome_store::ChunkIndex::load(&sb.index_path)?.disk_size() / (1024 * 1024);
+            if vm.disk_size.map(|d| d != stored).unwrap_or(false) {
+                eprintln!(
+                    "dome: ignoring --disk-size {}MB; sandbox is pinned to {}MB",
+                    vm.disk_size.unwrap(),
+                    stored
+                );
+            }
+            disk_size = stored;
+        }
+        sb.base_path.clone()
+    } else {
+        match from {
         Some(name) => {
             dome_vm::validate_checkpoint_name(name)
                 .map_err(|e| anyhow::anyhow!(e))?;
@@ -187,6 +226,7 @@ pub(crate) fn prepare_vm(
                 );
             }
             rootfs_path
+        }
         }
     };
 
@@ -509,6 +549,26 @@ fn parse_port_mapping(s: &str) -> Result<PortMapping> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn session_config_precedence_flag_over_config_over_default() {
+        // Flag wins when present.
+        assert_eq!(resolve_session(Some(8u32), Some(4), 2), 8);
+        // Config is used when no flag is given.
+        assert_eq!(resolve_session(None, Some(4u32), 2), 4);
+        // Default applies when neither is set.
+        assert_eq!(resolve_session(None::<u32>, None, 2), 2);
+    }
+
+    #[test]
+    fn session_config_does_not_mutate_config_value() {
+        // The resolution is session-only: it reads the config Option without taking
+        // ownership of (or writing back to) the caller's config, so the same config
+        // resolves the same way on the next boot regardless of a one-off flag.
+        let config = Some(4u32);
+        assert_eq!(resolve_session(Some(8u32), config, 2), 8);
+        assert_eq!(resolve_session(None, config, 2), 4);
+    }
 
     #[test]
     fn mount_defaults_to_read_only() {

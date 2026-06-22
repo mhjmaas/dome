@@ -110,8 +110,39 @@ pub(crate) enum Commands {
         action: CheckpointCommands,
     },
 
+    /// Manage persistent developer sandboxes
+    Sandbox {
+        #[command(subcommand)]
+        action: SandboxCommands,
+    },
+
     /// Remove leftover instance data from crashed VMs
     Prune,
+}
+
+#[derive(clap::Subcommand)]
+pub(crate) enum SandboxCommands {
+    /// Open an interactive shell in a persistent sandbox (lazily created on first use)
+    Shell {
+        /// Sandbox name (defaults to the `sandbox` field in dome.json, else a cwd slug)
+        name: Option<String>,
+
+        #[command(flatten)]
+        vm: VmArgs,
+    },
+
+    /// Run a command in a persistent sandbox (lazily created on first use)
+    Run {
+        /// Sandbox name (defaults to the `sandbox` field in dome.json, else a cwd slug)
+        name: Option<String>,
+
+        #[command(flatten)]
+        vm: VmArgs,
+
+        /// Command and arguments to run inside the sandbox
+        #[arg(trailing_var_arg = true, allow_hyphen_values = true)]
+        command: Vec<String>,
+    },
 }
 
 #[derive(clap::Subcommand)]

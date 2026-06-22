@@ -2,6 +2,8 @@ mod assets;
 mod checkpoint;
 mod cli;
 mod config;
+mod sandbox;
+mod session;
 mod stdio;
 mod vm;
 
@@ -12,7 +14,7 @@ use clap::Parser;
 
 use dome_vm::{default_data_dir, VmState};
 
-use cli::{CheckpointCommands, Cli, Commands};
+use cli::{CheckpointCommands, Cli, Commands, SandboxCommands};
 use config::load_config;
 
 fn main() -> Result<()> {
@@ -44,17 +46,21 @@ fn main() -> Result<()> {
                 vec!["/bin/sh".to_string()]
             };
 
-            let prepared = vm::prepare_vm(&vm, &cfg, from.as_deref())?;
+            let prepared = vm::prepare_vm(&vm, &cfg, from.as_deref(), None)?;
 
             let result = if stdio {
-                stdio::run_stdio(&prepared)
+                let r = stdio::run_stdio(&prepared);
+                let _ = std::fs::remove_dir_all(&prepared.instance_dir);
+                r
             } else if console {
-                run_console(&prepared)
+                let r = run_console(&prepared);
+                let _ = std::fs::remove_dir_all(&prepared.instance_dir);
+                r
             } else {
-                vm::run_command(&prepared, &command).map(|r| r.exit_code)
+                // Ephemeral run: run_session handles instance cleanup and saves nothing.
+                session::run_session(&prepared, &command, &session::SaveTarget::None)
             };
 
-            let _ = std::fs::remove_dir_all(&prepared.instance_dir);
             process::exit(result?);
         }
         Commands::Init { force } => {
@@ -125,6 +131,16 @@ fn main() -> Result<()> {
             }
             CheckpointCommands::Pull { name: _ } => {
                 anyhow::bail!("checkpoint pull is not yet implemented")
+            }
+        },
+        Commands::Sandbox { action } => match action {
+            SandboxCommands::Shell { name, vm } => {
+                let exit_code = sandbox::run_sandbox(name, &vm, Vec::new())?;
+                process::exit(exit_code);
+            }
+            SandboxCommands::Run { name, vm, command } => {
+                let exit_code = sandbox::run_sandbox(name, &vm, command)?;
+                process::exit(exit_code);
             }
         },
     }
