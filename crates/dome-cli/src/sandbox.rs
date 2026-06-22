@@ -3,13 +3,14 @@
 //! base on first use), runs interactively or one-off, and flatten-saves on clean
 //! exit so the next invocation resumes exactly where it left off.
 
-use std::path::Path;
+use std::path::{Path, PathBuf};
 
 use anyhow::{bail, Result};
 
 use crate::assets;
 use crate::cli::VmArgs;
 use crate::config::{load_config, DomeConfig};
+use crate::lock::{self, Lock};
 use crate::session::{run_session, SaveTarget};
 use crate::vm::{self, SandboxSource};
 
@@ -38,6 +39,13 @@ pub(crate) fn run_sandbox(
 
     let data_dir = dome_vm::default_data_dir();
     let index_path = format!("{}/sandboxes/{}.idx", data_dir, name);
+    let lock_path = PathBuf::from(format!("{}/sandboxes/{}.lock", data_dir, name));
+
+    // Acquire the persistence lock. The first session to open a sandbox owns
+    // persistence (read-write, saves on exit); any concurrent session boots as a
+    // silent ephemeral fork that never saves back. A lock left by a crashed owner is
+    // reclaimed automatically via a process-liveness check.
+    let acquired = lock::acquire(&lock_path)?;
 
     let existed = Path::new(&index_path).exists();
     // A new sandbox pins to the currently installed OS version; an existing one stays
@@ -55,13 +63,32 @@ pub(crate) fn run_sandbox(
     };
     let prepared = vm::prepare_vm(vm_args, &cfg, None, Some(&source))?;
 
-    if existed {
-        eprintln!("dome: resuming sandbox '{}'", name);
-    } else {
-        eprintln!("dome: creating sandbox '{}'", name);
+    match acquired {
+        Lock::Owner(guard) => {
+            if existed {
+                eprintln!("dome: resuming sandbox '{}'", name);
+            } else {
+                eprintln!("dome: creating sandbox '{}'", name);
+            }
+            let result = run_session(&prepared, &command, &SaveTarget::Sandbox { name });
+            // Hold the lock until the session (and its save) is fully done, then
+            // release it explicitly so a crashed owner is distinguishable from a
+            // clean exit (the latter leaves no lock behind).
+            drop(guard);
+            result
+        }
+        Lock::Fork => {
+            eprintln!(
+                "dome: sandbox '{}' is already open in another session — running as an \
+                 ephemeral fork; changes made here will NOT be saved.",
+                name
+            );
+            // No save target: the fork boots from the current saved state (or the base
+            // image if the owner has not saved yet) and is fully functional, but it
+            // never writes back to the sandbox index.
+            run_session(&prepared, &command, &SaveTarget::None)
+        }
     }
-
-    run_session(&prepared, &command, &SaveTarget::Sandbox { name })
 }
 
 /// Persistence requires CAS — there is no index to save in direct mode.
