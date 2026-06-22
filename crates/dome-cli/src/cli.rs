@@ -164,6 +164,9 @@ pub(crate) enum SandboxCommands {
         #[arg(long)]
         from: Option<String>,
     },
+
+    /// List persistent sandboxes (size, pinned base version, running/idle status)
+    Ls,
 }
 
 #[derive(clap::Subcommand)]

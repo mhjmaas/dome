@@ -126,6 +126,14 @@ pub(crate) fn acquire(lock_path: &Path) -> Result<Lock> {
     Ok(Lock::Fork)
 }
 
+/// Whether a sandbox's persistence lock is currently held by a live session — the
+/// signal `dome sandbox ls` reports as `running` vs `idle`. True only when the lock
+/// file exists and records a PID that is still alive; a missing, stale (dead-PID), or
+/// garbage lock reads as not held (the same liveness check used to reclaim it).
+pub(crate) fn is_held_live(lock_path: &Path) -> bool {
+    matches!(read_lock_pid(lock_path), Some(pid) if is_alive(pid))
+}
+
 /// Read the PID recorded in a lock file, or `None` if it is missing, unreadable, or
 /// does not contain a valid PID.
 fn read_lock_pid(path: &Path) -> Option<i32> {
@@ -263,6 +271,30 @@ mod tests {
             leftovers
         );
         drop(guard);
+    }
+
+    #[test]
+    fn is_held_live_is_true_for_a_live_owner_and_false_otherwise() {
+        let tmp = tempfile::tempdir().unwrap();
+        let path = lock_path(&tmp);
+        std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+
+        // No lock file at all → not held (an idle sandbox).
+        assert!(!is_held_live(&path), "a missing lock must read as not held");
+
+        // A live PID (our own) holds it → running.
+        std::fs::write(&path, std::process::id().to_string()).unwrap();
+        assert!(
+            is_held_live(&path),
+            "a lock recording a live PID must read as held"
+        );
+
+        // A dead PID → stale, not held (status is idle until reclaimed).
+        std::fs::write(&path, "2147483646").unwrap();
+        assert!(
+            !is_held_live(&path),
+            "a lock recording a dead PID must read as not held"
+        );
     }
 
     #[test]
