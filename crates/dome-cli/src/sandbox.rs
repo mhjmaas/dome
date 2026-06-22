@@ -8,6 +8,7 @@ use std::path::{Path, PathBuf};
 use anyhow::{bail, Result};
 
 use crate::assets;
+use crate::checkpoint;
 use crate::cli::VmArgs;
 use crate::config::{load_config, DomeConfig};
 use crate::lock::{self, Lock};
@@ -365,6 +366,147 @@ fn ensure_current_base(data_dir: &str, vm_args: &VmArgs) -> Result<String> {
     Ok(base_path)
 }
 
+/// Entry point for `dome sandbox ls`. Lists every sandbox with NAME, SIZE (CAS delta),
+/// BASE (pinned OS version), STATUS (`running` if a live session holds the lock, else
+/// `idle`), and CREATED age — reusing the checkpoint-list size/age rendering. Output
+/// stays flat: flatten-in-place leaves no parent lineage to show.
+pub(crate) fn list_sandboxes() -> Result<()> {
+    let data_dir = dome_vm::default_data_dir();
+    let rows = collect_sandbox_rows(&data_dir)?;
+
+    if rows.is_empty() {
+        eprintln!("No sandboxes found.");
+        return Ok(());
+    }
+
+    let header = ["NAME", "SIZE", "BASE", "STATUS", "CREATED"];
+    let cells: Vec<Vec<String>> = rows
+        .iter()
+        .map(|row| {
+            vec![
+                row.name.clone(),
+                checkpoint::format_cas_size(row.size_bytes),
+                row.base.clone(),
+                if row.running { "running" } else { "idle" }.to_string(),
+                checkpoint::format_age(row.mtime),
+            ]
+        })
+        .collect();
+
+    print!("{}", checkpoint::render_table(&header, &cells));
+    Ok(())
+}
+
+/// One row of `dome sandbox ls`: a sandbox's name, CAS delta size, pinned base
+/// version, running/idle status, and last-modified time (used for the age column and
+/// for ordering). Kept as plain data so the listing logic can be tested over a temp
+/// data dir without rendering.
+struct SandboxRow {
+    name: String,
+    size_bytes: u64,
+    base: String,
+    running: bool,
+    mtime: std::time::SystemTime,
+}
+
+/// Gather a [`SandboxRow`] for every sandbox index under `{data_dir}/sandboxes`, sorted
+/// oldest-first to match `checkpoint list`. SIZE is the CAS delta (non-ZERO chunks ×
+/// 64 KiB), identical to how checkpoints are measured; BASE is the pinned OS version
+/// read from the index's fallback; STATUS is `running` when a live session holds the
+/// persistence lock. A missing `sandboxes/` directory is not an error — it yields no
+/// rows so the caller can print a clear "no sandboxes" message.
+fn collect_sandbox_rows(data_dir: &str) -> Result<Vec<SandboxRow>> {
+    let sandboxes_dir = format!("{}/sandboxes", data_dir);
+    let entries = match std::fs::read_dir(&sandboxes_dir) {
+        Ok(entries) => entries,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(Vec::new()),
+        Err(e) => bail!("failed to read sandboxes directory: {}", e),
+    };
+
+    let mut rows = Vec::new();
+    for entry in entries {
+        let entry = entry?;
+        let path = entry.path();
+        if path.extension().and_then(|e| e.to_str()) != Some("idx") {
+            continue;
+        }
+        let name = match path.file_stem().and_then(|s| s.to_str()) {
+            Some(n) => n.to_string(),
+            None => continue,
+        };
+
+        // Non-UTF-8 paths are impossible for dome-created sandboxes (names are
+        // ASCII-only), but guard explicitly so the error is intelligible rather than
+        // a spurious "failed to open index: " from an empty-string fallback.
+        let path_str = match path.to_str() {
+            Some(s) => s,
+            None => {
+                eprintln!("dome: skipping sandbox with non-UTF-8 path: {:?}", path);
+                continue;
+            }
+        };
+
+        // A corrupt or unreadable index must not abort the entire listing — other
+        // sandboxes are still healthy. Emit a warning and skip the bad entry.
+        let idx = match dome_store::ChunkIndex::load(path_str) {
+            Ok(idx) => idx,
+            Err(e) => {
+                eprintln!("dome: skipping sandbox '{}': {:#}", name, e);
+                continue;
+            }
+        };
+
+        // CAS delta size: count non-ZERO chunks × 64 KiB, matching `checkpoint list`.
+        let non_zero = (0..idx.num_chunks())
+            .filter(|&i| idx.get_hash(i).map(|h| h != "ZERO").unwrap_or(false))
+            .count();
+        let size_bytes = (non_zero as u64) * 64 * 1024;
+        let base = idx
+            .fallback_path
+            .as_deref()
+            .map(base_version_from_fallback)
+            .unwrap_or_else(|| "?".to_string());
+
+        let lock_path = path.with_extension("lock");
+        let running = lock::is_held_live(&lock_path);
+
+        let mtime = match entry.metadata().and_then(|m| m.modified()) {
+            Ok(t) => t,
+            Err(e) => {
+                eprintln!("dome: skipping sandbox '{}': {}", name, e);
+                continue;
+            }
+        };
+
+        rows.push(SandboxRow {
+            name,
+            size_bytes,
+            base,
+            running,
+            mtime,
+        });
+    }
+
+    rows.sort_by_key(|r| r.mtime);
+    Ok(rows)
+}
+
+/// Extract the OS base version a sandbox is pinned to from its recorded base image
+/// path. Base images are stored under versioned `rootfs-<version>.ext4` filenames, so
+/// the version is the filename with that prefix and suffix stripped. A non-standard
+/// base path (e.g. an explicit `--rootfs`) has no embedded version, so its bare
+/// filename is shown as a best-effort label rather than a misleading version.
+fn base_version_from_fallback(fallback_path: &str) -> String {
+    let file = Path::new(fallback_path)
+        .file_name()
+        .and_then(|s| s.to_str())
+        .unwrap_or(fallback_path);
+    file.strip_prefix("rootfs-")
+        .and_then(|s| s.strip_suffix(".ext4"))
+        .unwrap_or(file)
+        .to_string()
+}
+
 /// Resolve the pinned base image for an existing sandbox from the base recorded in
 /// its index. If that base image is no longer available (e.g. its OS version was
 /// reclaimed), error clearly rather than silently rebasing onto a different version,
@@ -392,6 +534,95 @@ fn pinned_base_for_existing(index_path: &str) -> Result<String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn base_version_is_parsed_from_a_versioned_rootfs_path() {
+        // A sandbox pins its base via the versioned rootfs filename written at
+        // creation; `ls` shows just the version, not the whole path.
+        assert_eq!(
+            base_version_from_fallback("/Users/dev/.dome/rootfs-1.2.3.ext4"),
+            "1.2.3"
+        );
+    }
+
+    #[test]
+    fn base_version_falls_back_to_filename_for_a_nonstandard_path() {
+        // An explicit `--rootfs` base has no embedded version; show its filename as a
+        // best-effort label rather than a misleading or empty version.
+        assert_eq!(
+            base_version_from_fallback("/opt/images/custom-base.img"),
+            "custom-base.img"
+        );
+    }
+
+    #[test]
+    fn collect_rows_reports_size_base_and_status_per_sandbox() {
+        let tmp = tempfile::tempdir().unwrap();
+        let data_dir = tmp.path().to_str().unwrap();
+        let sb_dir = format!("{}/sandboxes", data_dir);
+        std::fs::create_dir_all(&sb_dir).unwrap();
+
+        // A sandbox with one written (non-ZERO) chunk, pinned to a versioned base.
+        let mut web = dome_store::ChunkIndex::new(64 * 1024 * 1024);
+        web.fallback_path = Some(format!("{}/rootfs-1.2.3.ext4", data_dir));
+        web.set_hash(0, "deadbeef".to_string());
+        web.save(&format!("{}/web.idx", sb_dir)).unwrap();
+        // It is currently open: its lock records our (live) PID → running.
+        std::fs::write(
+            format!("{}/web.lock", sb_dir),
+            std::process::id().to_string(),
+        )
+        .unwrap();
+
+        // A fresh, never-written sandbox pinned to a different base, no lock → idle.
+        let mut api = dome_store::ChunkIndex::new(64 * 1024 * 1024);
+        api.fallback_path = Some(format!("{}/rootfs-2.0.0.ext4", data_dir));
+        api.save(&format!("{}/api.idx", sb_dir)).unwrap();
+
+        let rows = collect_sandbox_rows(data_dir).unwrap();
+        let by_name = |n: &str| rows.iter().find(|r| r.name == n).unwrap();
+
+        let web_row = by_name("web");
+        assert_eq!(web_row.size_bytes, 64 * 1024, "one chunk = 64 KiB delta");
+        assert_eq!(web_row.base, "1.2.3");
+        assert!(web_row.running, "a sandbox with a live lock is running");
+
+        let api_row = by_name("api");
+        assert_eq!(api_row.size_bytes, 0, "an unwritten sandbox has zero delta");
+        assert_eq!(api_row.base, "2.0.0");
+        assert!(!api_row.running, "a sandbox with no lock is idle");
+    }
+
+    #[test]
+    fn collect_rows_is_empty_when_there_are_no_sandboxes() {
+        // A data dir without a sandboxes/ directory yields no rows, so `ls` can print
+        // a clear "no sandboxes" message rather than erroring.
+        let tmp = tempfile::tempdir().unwrap();
+        let rows = collect_sandbox_rows(tmp.path().to_str().unwrap()).unwrap();
+        assert!(rows.is_empty());
+    }
+
+    #[test]
+    fn collect_rows_skips_a_corrupt_index_and_returns_healthy_ones() {
+        // A corrupt .idx alongside a valid one must not abort the listing — the valid
+        // sandbox should still appear and the corrupt one is skipped with a warning.
+        let tmp = tempfile::tempdir().unwrap();
+        let data_dir = tmp.path().to_str().unwrap();
+        let sb_dir = format!("{}/sandboxes", data_dir);
+        std::fs::create_dir_all(&sb_dir).unwrap();
+
+        // Valid sandbox.
+        let mut good = dome_store::ChunkIndex::new(64 * 1024 * 1024);
+        good.fallback_path = Some(format!("{}/rootfs-1.0.0.ext4", data_dir));
+        good.save(&format!("{}/good.idx", sb_dir)).unwrap();
+
+        // Corrupt .idx: valid extension, but garbage bytes.
+        std::fs::write(format!("{}/corrupt.idx", sb_dir), b"not-an-index").unwrap();
+
+        let rows = collect_sandbox_rows(data_dir).unwrap();
+        assert_eq!(rows.len(), 1, "only the healthy sandbox should appear");
+        assert_eq!(rows[0].name, "good");
+    }
 
     fn cfg_with(sandbox: Option<&str>) -> DomeConfig {
         DomeConfig {

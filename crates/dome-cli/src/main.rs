@@ -151,6 +151,7 @@ fn main() -> Result<()> {
             SandboxCommands::Create { name, vm, from } => {
                 sandbox::create_sandbox(name, &vm, from.as_deref())?;
             }
+            SandboxCommands::Ls => sandbox::list_sandboxes()?,
         },
     }
 

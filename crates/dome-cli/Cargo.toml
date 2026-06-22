@@ -9,6 +9,7 @@ path = "src/main.rs"
 
 [dev-dependencies]
 tempfile = "3"
+dome-store = { path = "../dome-store" }
 
 [dependencies]
 dome-vm = { path = "../dome-vm" }
