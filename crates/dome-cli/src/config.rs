@@ -20,6 +20,11 @@ pub(crate) struct DomeConfig {
     /// Persistent sandbox name for this project. Used by `dome sandbox` when no
     /// explicit name is given, before falling back to a cwd-derived slug.
     pub sandbox: Option<String>,
+    /// Opt-in latest-only base retention. When true, `dome upgrade` offers to delete
+    /// sandboxes pinned to a superseded OS base (after confirmation) so only the latest
+    /// base remains. Off by default: sandboxes are pinned forever and old bases are
+    /// reclaimed by `dome prune` once unreferenced.
+    pub latest_only: Option<bool>,
 }
 
 /// A secret to inject via the proxy.

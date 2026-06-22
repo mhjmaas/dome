@@ -309,7 +309,7 @@ pub(crate) fn remove_sandbox(name_arg: Option<String>, config_path: Option<&str>
 /// open by a live session — deleting a running sandbox's index would just be recreated
 /// by that session's save on exit, so it is rejected rather than silently lost.
 /// Chunks are intentionally left untouched; `dome prune` reclaims them later.
-fn delete_sandbox_index(data_dir: &str, name: &str) -> Result<()> {
+pub(crate) fn delete_sandbox_index(data_dir: &str, name: &str) -> Result<()> {
     let index_path = format!("{}/sandboxes/{}.idx", data_dir, name);
     let lock_path = PathBuf::from(format!("{}/sandboxes/{}.lock", data_dir, name));
 
@@ -538,6 +538,17 @@ fn collect_sandbox_rows(data_dir: &str) -> Result<Vec<SandboxRow>> {
 
     rows.sort_by_key(|r| r.mtime);
     Ok(rows)
+}
+
+/// Pair every sandbox under `{data_dir}/sandboxes` with the OS base version it is
+/// pinned to, reusing the same robust walker as `dome sandbox ls` (corrupt indexes are
+/// skipped with a warning rather than aborting). Used by the latest-only retention
+/// policy to find sandboxes still pinned to a now-superseded base after an upgrade.
+pub(crate) fn collect_sandbox_base_versions(data_dir: &str) -> Result<Vec<(String, String)>> {
+    Ok(collect_sandbox_rows(data_dir)?
+        .into_iter()
+        .map(|row| (row.name, row.base))
+        .collect())
 }
 
 /// Extract the OS base version a sandbox is pinned to from its recorded base image

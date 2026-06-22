@@ -4,6 +4,7 @@ mod cli;
 mod config;
 mod gc;
 mod lock;
+mod retention;
 mod sandbox;
 mod session;
 mod stdio;
@@ -79,9 +80,25 @@ fn main() -> Result<()> {
                 assets::download_os_image(&data_dir)?;
             }
         }
-        Commands::Upgrade => {
+        Commands::Upgrade { latest_only } => {
             let data_dir = default_data_dir();
-            assets::upgrade(&data_dir)?;
+            let cfg = load_config(None)?;
+            let policy_enabled = retention::policy_enabled(latest_only, cfg.latest_only);
+
+            // Upgrade first; it reports the version it moved to (None if already latest).
+            if let Some(new_version) = assets::upgrade(&data_dir)? {
+                // Apply the opt-in latest-only retention against the version just
+                // installed. Pin-forever + GC is the default, so this is a no-op unless
+                // explicitly enabled.
+                if policy_enabled {
+                    let outcome = retention::apply_latest_only(
+                        &data_dir,
+                        &new_version,
+                        retention::interactive_confirm,
+                    )?;
+                    retention::report_outcome(&outcome);
+                }
+            }
         }
         Commands::Prune => {
             let data_dir = default_data_dir();

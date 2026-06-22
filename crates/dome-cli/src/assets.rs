@@ -136,8 +136,10 @@ fn cli_tarball_name(version: &str) -> Result<String> {
     Ok(format!("dome-v{}-{}.tar.gz", version, platform))
 }
 
-/// Check for a newer release and upgrade the CLI binary + OS image.
-pub fn upgrade(data_dir: &str) -> Result<()> {
+/// Check for a newer release and upgrade the CLI binary + OS image. Returns the version
+/// upgraded to (`Some`) so the caller can apply post-upgrade retention against it, or
+/// `None` when already on the latest release (nothing changed).
+pub fn upgrade(data_dir: &str) -> Result<Option<String>> {
     if let Ok(exe) = std::env::current_exe() {
         if exe.to_string_lossy().contains("/Cellar/") {
             bail!("This copy was installed via Homebrew. Please run `brew upgrade dome` instead");
@@ -169,7 +171,7 @@ pub fn upgrade(data_dir: &str) -> Result<()> {
 
     if latest == CURRENT_VERSION {
         eprintln!("dome: already on latest version ({})", CURRENT_VERSION);
-        return Ok(());
+        return Ok(None);
     }
 
     eprintln!("dome: upgrading {} -> {}", CURRENT_VERSION, latest);
@@ -242,7 +244,7 @@ pub fn upgrade(data_dir: &str) -> Result<()> {
     download_os_image_version(data_dir, latest)?;
 
     eprintln!("dome: upgrade complete ({})", latest);
-    Ok(())
+    Ok(Some(latest.to_string()))
 }
 
 /// Wraps a reader to print download progress to stderr.

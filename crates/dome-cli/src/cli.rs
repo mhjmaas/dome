@@ -102,7 +102,13 @@ pub(crate) enum Commands {
     },
 
     /// Upgrade dome to the latest release (CLI + OS image)
-    Upgrade,
+    Upgrade {
+        /// Opt in to latest-only retention: after upgrading, offer to delete sandboxes
+        /// pinned to the superseded OS base (after confirmation) so only the latest base
+        /// remains. Overrides `latest_only` in dome.json for this run.
+        #[arg(long)]
+        latest_only: bool,
+    },
 
     /// Manage disk checkpoints
     Checkpoint {
