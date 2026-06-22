@@ -28,10 +28,10 @@ jobs:
           sudo apt-get install -y musl-tools build-essential bc flex bison \
             libelf-dev libssl-dev wget xz-utils
 
-      - name: Build shuru-guest
+      - name: Build dome-guest
         env:
           CARGO_TARGET_AARCH64_UNKNOWN_LINUX_MUSL_LINKER: musl-gcc
-        run: cargo build -p shuru-guest --target aarch64-unknown-linux-musl --release
+        run: cargo build -p dome-guest --target aarch64-unknown-linux-musl --release
 
       - name: Build OS image
         run: ./scripts/prepare-rootfs.sh
@@ -39,8 +39,8 @@ jobs:
       - name: Package OS image
         run: |
           VERSION="${GITHUB_REF_NAME}"
-          DATA_DIR="${HOME}/.local/share/shuru"
-          tar czf "shuru-os-${VERSION}-aarch64.tar.gz" \
+          DATA_DIR="${HOME}/.local/share/dome"
+          tar czf "dome-os-${VERSION}-aarch64.tar.gz" \
             -C "${DATA_DIR}" \
             Image initramfs.cpio.gz rootfs.ext4
 
@@ -48,7 +48,7 @@ jobs:
         uses: actions/upload-artifact@v4
         with:
           name: os-image
-          path: shuru-os-*.tar.gz
+          path: dome-os-*.tar.gz
           retention-days: 1
 
   build-cli-darwin:
@@ -60,23 +60,23 @@ jobs:
         uses: dtolnay/rust-toolchain@stable
 
       - name: Build CLI
-        run: cargo build -p shuru-cli --release
+        run: cargo build -p dome-cli --release
 
       - name: Codesign
-        run: codesign --entitlements shuru.entitlements --force -s - target/release/shuru
+        run: codesign --entitlements dome.entitlements --force -s - target/release/dome
 
       - name: Package CLI binary
         run: |
           VERSION="${GITHUB_REF_NAME}"
-          tar czf "shuru-${VERSION}-darwin-aarch64.tar.gz" \
+          tar czf "dome-${VERSION}-darwin-aarch64.tar.gz" \
             -C target/release \
-            shuru
+            dome
 
       - name: Upload artifact
         uses: actions/upload-artifact@v4
         with:
           name: cli-binary-darwin
-          path: shuru-*.tar.gz
+          path: dome-*.tar.gz
           retention-days: 1
 
   build-cli-linux:
@@ -88,20 +88,20 @@ jobs:
         uses: dtolnay/rust-toolchain@stable
 
       - name: Build CLI
-        run: cargo build -p shuru-cli --release
+        run: cargo build -p dome-cli --release
 
       - name: Package CLI binary
         run: |
           VERSION="${GITHUB_REF_NAME}"
-          tar czf "shuru-${VERSION}-linux-aarch64.tar.gz" \
+          tar czf "dome-${VERSION}-linux-aarch64.tar.gz" \
             -C target/release \
-            shuru
+            dome
 
       - name: Upload artifact
         uses: actions/upload-artifact@v4
         with:
           name: cli-binary-linux
-          path: shuru-*.tar.gz
+          path: dome-*.tar.gz
           retention-days: 1
 
   release:
@@ -136,7 +136,7 @@ jobs:
     steps:
       - uses: actions/checkout@v4
         with:
-          repository: superhq-ai/homebrew-tap
+          repository: mhjmaas/homebrew-tap
           token: ${{ secrets.HOMEBREW_TAP_TOKEN }}
 
       - name: Download CLI artifact
@@ -148,15 +148,15 @@ jobs:
       - name: Update formula
         run: |
           VERSION="${GITHUB_REF_NAME#v}"
-          SHA256=$(sha256sum /tmp/artifact/shuru-${GITHUB_REF_NAME}-darwin-aarch64.tar.gz | awk '{print $1}')
-          sed -i "s/version \".*\"/version \"${VERSION}\"/" Formula/shuru.rb
-          sed -i "s/sha256 \".*\"/sha256 \"${SHA256}\"/" Formula/shuru.rb
+          SHA256=$(sha256sum /tmp/artifact/dome-${GITHUB_REF_NAME}-darwin-aarch64.tar.gz | awk '{print $1}')
+          sed -i "s/version \".*\"/version \"${VERSION}\"/" Formula/dome.rb
+          sed -i "s/sha256 \".*\"/sha256 \"${SHA256}\"/" Formula/dome.rb
 
       - name: Commit and push
         run: |
           git config user.name "github-actions[bot]"
           git config user.email "github-actions[bot]@users.noreply.github.com"
-          git add Formula/shuru.rb
+          git add Formula/dome.rb
           git diff --cached --quiet && exit 0
-          git commit -m "bump shuru to ${GITHUB_REF_NAME}"
+          git commit -m "bump dome to ${GITHUB_REF_NAME}"
           git push

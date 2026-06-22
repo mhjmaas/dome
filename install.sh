@@ -1,7 +1,7 @@
 #!/bin/sh
 set -eu
 
-REPO="superhq-ai/shuru"
+REPO="mhjmaas/dome"
 INSTALL_DIR="$HOME/.local/bin"
 PLATFORM=""
 
@@ -13,7 +13,7 @@ ARCH="$(uname -m)"
 case "$OS" in
     Darwin)
         if [ "$ARCH" != "arm64" ]; then
-            echo "Error: shuru requires Apple Silicon (arm64) on macOS. Detected: $ARCH" >&2
+            echo "Error: dome requires Apple Silicon (arm64) on macOS. Detected: $ARCH" >&2
             exit 1
         fi
         PLATFORM="darwin-aarch64"
@@ -25,13 +25,13 @@ case "$OS" in
                 echo "Warning: Linux support is experimental and not ready for production use yet." >&2
                 ;;
             *)
-                echo "Error: shuru Linux builds currently support ARM64 only. Detected: $ARCH" >&2
+                echo "Error: dome Linux builds currently support ARM64 only. Detected: $ARCH" >&2
                 exit 1
                 ;;
         esac
         ;;
     *)
-        echo "Error: shuru only supports macOS and Linux. Detected: $OS" >&2
+        echo "Error: dome only supports macOS and Linux. Detected: $OS" >&2
         exit 1
         ;;
 esac
@@ -51,7 +51,7 @@ echo "Latest version: $VERSION"
 
 ##### Download and extract
 
-TARBALL="shuru-v${VERSION}-${PLATFORM}.tar.gz"
+TARBALL="dome-v${VERSION}-${PLATFORM}.tar.gz"
 URL="https://github.com/${REPO}/releases/download/${TAG}/${TARBALL}"
 
 TMPDIR=$(mktemp -d)
@@ -62,13 +62,13 @@ curl -fsSL "$URL" -o "$TMPDIR/$TARBALL"
 
 mkdir -p "$INSTALL_DIR"
 tar -xzf "$TMPDIR/$TARBALL" -C "$INSTALL_DIR"
-chmod +x "$INSTALL_DIR/shuru"
+chmod +x "$INSTALL_DIR/dome"
 if [ "$OS" = "Darwin" ]; then
-    xattr -d com.apple.quarantine "$INSTALL_DIR/shuru" 2>/dev/null || true
+    xattr -d com.apple.quarantine "$INSTALL_DIR/dome" 2>/dev/null || true
 fi
 
 echo ""
-echo "Installed shuru $VERSION to $INSTALL_DIR/shuru"
+echo "Installed dome $VERSION to $INSTALL_DIR/dome"
 
 ##### PATH check
 

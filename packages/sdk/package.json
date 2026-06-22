@@ -1,5 +1,5 @@
 {
-  "name": "@superhq/shuru",
+  "name": "@superhq/dome",
   "version": "0.4.2",
   "type": "module",
   "main": "src/index.ts",
@@ -7,7 +7,7 @@
   "files": ["src"],
   "repository": {
     "type": "git",
-    "url": "https://github.com/superhq-ai/shuru",
+    "url": "https://github.com/mhjmaas/dome",
     "directory": "packages/sdk"
   },
   "scripts": {

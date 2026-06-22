@@ -2,13 +2,13 @@ import { afterAll, beforeAll, describe, expect, test } from "bun:test";
 import { resolve } from "node:path";
 import { Sandbox } from "../../src/sandbox";
 
-const MOCK_BIN = `bun ${resolve(import.meta.dir, "mock-shuru.ts")}`;
+const MOCK_BIN = `bun ${resolve(import.meta.dir, "mock-dome.ts")}`;
 
 describe("mkdir", () => {
 	let sb: Sandbox;
 
 	beforeAll(async () => {
-		sb = await Sandbox.start({ shuruBin: MOCK_BIN });
+		sb = await Sandbox.start({ domeBin: MOCK_BIN });
 	}, 10_000);
 
 	afterAll(async () => {
@@ -36,7 +36,7 @@ describe("readDir", () => {
 	let sb: Sandbox;
 
 	beforeAll(async () => {
-		sb = await Sandbox.start({ shuruBin: MOCK_BIN });
+		sb = await Sandbox.start({ domeBin: MOCK_BIN });
 	}, 10_000);
 
 	afterAll(async () => {
@@ -66,7 +66,7 @@ describe("stat", () => {
 	let sb: Sandbox;
 
 	beforeAll(async () => {
-		sb = await Sandbox.start({ shuruBin: MOCK_BIN });
+		sb = await Sandbox.start({ domeBin: MOCK_BIN });
 	}, 10_000);
 
 	afterAll(async () => {
@@ -94,7 +94,7 @@ describe("remove", () => {
 	let sb: Sandbox;
 
 	beforeAll(async () => {
-		sb = await Sandbox.start({ shuruBin: MOCK_BIN });
+		sb = await Sandbox.start({ domeBin: MOCK_BIN });
 	}, 10_000);
 
 	afterAll(async () => {
@@ -114,7 +114,7 @@ describe("rename", () => {
 	let sb: Sandbox;
 
 	beforeAll(async () => {
-		sb = await Sandbox.start({ shuruBin: MOCK_BIN });
+		sb = await Sandbox.start({ domeBin: MOCK_BIN });
 	}, 10_000);
 
 	afterAll(async () => {
@@ -130,7 +130,7 @@ describe("copy", () => {
 	let sb: Sandbox;
 
 	beforeAll(async () => {
-		sb = await Sandbox.start({ shuruBin: MOCK_BIN });
+		sb = await Sandbox.start({ domeBin: MOCK_BIN });
 	}, 10_000);
 
 	afterAll(async () => {
@@ -150,7 +150,7 @@ describe("chmod", () => {
 	let sb: Sandbox;
 
 	beforeAll(async () => {
-		sb = await Sandbox.start({ shuruBin: MOCK_BIN });
+		sb = await Sandbox.start({ domeBin: MOCK_BIN });
 	}, 10_000);
 
 	afterAll(async () => {
@@ -166,7 +166,7 @@ describe("exists", () => {
 	let sb: Sandbox;
 
 	beforeAll(async () => {
-		sb = await Sandbox.start({ shuruBin: MOCK_BIN });
+		sb = await Sandbox.start({ domeBin: MOCK_BIN });
 	}, 10_000);
 
 	afterAll(async () => {

@@ -1,5 +1,5 @@
 {
-  "name": "shuru-www",
+  "name": "dome-www",
   "type": "module",
   "scripts": {
     "dev": "astro dev",

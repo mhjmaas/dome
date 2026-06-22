@@ -1,12 +1,12 @@
 /**
  * Integration tests for streaming exec, kill, and file watching
- * against a real shuru VM.
+ * against a real dome VM.
  *
  * Prerequisites:
- *   1. cargo build -p shuru-cli -p shuru-guest --target aarch64-unknown-linux-musl --release
+ *   1. cargo build -p dome-cli -p dome-guest --target aarch64-unknown-linux-musl --release
  *   2. ./scripts/prepare-rootfs.sh
- *   3. codesign --entitlements shuru.entitlements --force -s - target/debug/shuru
- *   4. shuru init
+ *   3. codesign --entitlements dome.entitlements --force -s - target/debug/dome
+ *   4. dome init
  *
  * Run: bun test test/integration/streaming.test.ts
  */
@@ -18,15 +18,15 @@ import { Sandbox } from "../../src/sandbox";
 import type { FileChangeEvent } from "../../src/types";
 
 const REPO_ROOT = resolve(import.meta.dir, "../../../..");
-const SHURU_BIN = resolve(REPO_ROOT, "target/debug/shuru");
+const DOME_BIN = resolve(REPO_ROOT, "target/debug/dome");
 
-const canRun = existsSync(SHURU_BIN);
+const canRun = existsSync(DOME_BIN);
 
 describe.if(canRun)("streaming exec", () => {
 	let sb: Sandbox;
 
 	beforeAll(async () => {
-		sb = await Sandbox.start({ shuruBin: SHURU_BIN });
+		sb = await Sandbox.start({ domeBin: DOME_BIN });
 	}, 60_000);
 
 	afterAll(async () => {
@@ -141,7 +141,7 @@ describe.if(canRun)("file watching", () => {
 	let sb: Sandbox;
 
 	beforeAll(async () => {
-		sb = await Sandbox.start({ shuruBin: SHURU_BIN });
+		sb = await Sandbox.start({ domeBin: DOME_BIN });
 		// Create the directory we'll watch
 		await sb.exec("mkdir -p /tmp/watched");
 	}, 60_000);
@@ -261,9 +261,9 @@ describe.if(canRun)("file watching", () => {
 });
 
 describe.if(!canRun)("streaming exec (skipped)", () => {
-	test("shuru binary not found", () => {
+	test("dome binary not found", () => {
 		console.log(
-			"Build with: cargo build -p shuru-cli && codesign --entitlements shuru.entitlements --force -s - target/debug/shuru",
+			"Build with: cargo build -p dome-cli && codesign --entitlements dome.entitlements --force -s - target/debug/dome",
 		);
 	});
 });

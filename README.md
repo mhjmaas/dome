@@ -1,8 +1,8 @@
-# shuru
+# dome
 
 Local-first microVM sandbox for AI agents on macOS, with experimental Linux support.
 
-Shuru boots lightweight Linux VMs for AI agents. On macOS it uses Apple's Virtualization.framework. On Linux it uses a KVM backend that is now available as an experimental release build for ARM64 hosts. Every sandbox is ephemeral: the rootfs resets on every run, giving agents a disposable environment to execute code, install packages, and run tools without touching your host.
+Dome boots lightweight Linux VMs for AI agents. On macOS it uses Apple's Virtualization.framework. On Linux it uses a KVM backend that is now available as an experimental release build for ARM64 hosts. Every sandbox is ephemeral: the rootfs resets on every run, giving agents a disposable environment to execute code, install packages, and run tools without touching your host.
 
 > [!WARNING]
 > **Experimental Linux support.** Linux builds are available for testing, but they are not ready for production use yet. Expect rough edges, missing polish, and compatibility gaps.
@@ -15,13 +15,13 @@ Shuru boots lightweight Linux VMs for AI agents. On macOS it uses Apple's Virtua
 ## Install
 
 ```sh
-brew tap superhq-ai/tap && brew install shuru
+brew tap mhjmaas/tap && brew install dome
 ```
 
 Or via the install script:
 
 ```sh
-curl -fsSL https://raw.githubusercontent.com/superhq-ai/shuru/main/install.sh | sh
+curl -fsSL https://raw.githubusercontent.com/mhjmaas/dome/main/install.sh | sh
 ```
 
 The install script supports macOS on Apple Silicon and experimental Linux ARM64. Linux users can also download the `linux-aarch64` release tarball manually from GitHub Releases if they prefer.
@@ -33,19 +33,19 @@ The install script supports macOS on Apple Silicon and experimental Linux ARM64.
 
 ```sh
 # Interactive shell
-shuru run
+dome run
 
 # Run a command
-shuru run -- echo hello
+dome run -- echo hello
 
 # With network access
-shuru run --allow-net
+dome run --allow-net
 
 # Restrict to specific hosts
-shuru run --allow-net --allow-host api.openai.com --allow-host registry.npmjs.org
+dome run --allow-net --allow-host api.openai.com --allow-host registry.npmjs.org
 
 # Custom resources
-shuru run --cpus 4 --memory 4096 --disk-size 8192 -- make -j4
+dome run --cpus 4 --memory 4096 --disk-size 8192 -- make -j4
 ```
 
 ### Directory mounts
@@ -54,21 +54,21 @@ Share host directories into the VM using VirtioFS. By default the host directory
 
 ```sh
 # Mount a directory (guest can read, writes go to overlay — host is untouched)
-shuru run --mount ./src:/workspace -- touch /workspace/test.txt
+dome run --mount ./src:/workspace -- touch /workspace/test.txt
 ls ./src/test.txt   # not found — write stayed in the overlay
 
 # Read-write mount (guest writes land on host, requires --allow-host-writes)
-shuru run --allow-host-writes --mount ./src:/workspace:rw -- touch /workspace/test.txt
+dome run --allow-host-writes --mount ./src:/workspace:rw -- touch /workspace/test.txt
 ls ./src/test.txt   # found — write went to host
 
 # Multiple mounts
-shuru run --mount ./src:/workspace --mount ./data:/data -- sh
+dome run --mount ./src:/workspace --mount ./data:/data -- sh
 ```
 
-Mounts can also be set in `shuru.json` (see [Config file](#config-file)).
+Mounts can also be set in `dome.json` (see [Config file](#config-file)).
 
 > [!NOTE]
-> Directory mounts require checkpoints created on v0.1.11+. Existing checkpoints work normally for all other features. Run `shuru upgrade` to get the latest version.
+> Directory mounts require checkpoints created on v0.1.11+. Existing checkpoints work normally for all other features. Run `dome upgrade` to get the latest version.
 
 ### Port forwarding
 
@@ -76,17 +76,17 @@ Forward host ports to guest ports over vsock. Works without `--allow-net` — th
 
 ```sh
 # Install python3 into a checkpoint, then serve with port forwarding
-shuru checkpoint create py --allow-net -- apt-get install -y python3
-shuru run --from py -p 8080:8000 -- python3 -m http.server 8000
+dome checkpoint create py --allow-net -- apt-get install -y python3
+dome run --from py -p 8080:8000 -- python3 -m http.server 8000
 
 # From the host (in another terminal)
 curl http://127.0.0.1:8080/
 
 # Multiple ports
-shuru run -p 8080:80 -p 8443:443 -- nginx
+dome run -p 8080:80 -p 8443:443 -- nginx
 ```
 
-Port forwards can also be set in `shuru.json` (see [Config file](#config-file)).
+Port forwards can also be set in `dome.json` (see [Config file](#config-file)).
 
 ### Checkpoints
 
@@ -94,17 +94,17 @@ Checkpoints save the disk state so you can reuse an environment across runs.
 
 ```sh
 # Set up an environment and save it
-shuru checkpoint create myenv --allow-net -- sh -c 'apt-get install -y python3 gcc'
+dome checkpoint create myenv --allow-net -- sh -c 'apt-get install -y python3 gcc'
 
 # Run from a checkpoint (ephemeral -- changes are discarded)
-shuru run --from myenv -- python3 script.py
+dome run --from myenv -- python3 script.py
 
 # Branch from an existing checkpoint
-shuru checkpoint create myenv2 --from myenv --allow-net -- sh -c 'pip install numpy'
+dome checkpoint create myenv2 --from myenv --allow-net -- sh -c 'pip install numpy'
 
 # List and delete
-shuru checkpoint list
-shuru checkpoint delete myenv
+dome checkpoint list
+dome checkpoint delete myenv
 ```
 
 ### Secrets
@@ -113,10 +113,10 @@ Secrets keep API keys on the host. The guest receives a random placeholder token
 
 ```sh
 # Inject a secret via CLI
-shuru run --allow-net --secret API_KEY=OPENAI_API_KEY@api.openai.com -- curl https://api.openai.com/v1/models
+dome run --allow-net --secret API_KEY=OPENAI_API_KEY@api.openai.com -- curl https://api.openai.com/v1/models
 
 # Multiple secrets
-shuru run --allow-net \
+dome run --allow-net \
   --secret API_KEY=OPENAI_API_KEY@api.openai.com \
   --secret GH_TOKEN=GITHUB_TOKEN@api.github.com \
   -- sh
@@ -124,11 +124,11 @@ shuru run --allow-net \
 
 Format: `NAME=ENV_VAR@host1,host2` — `NAME` is the env var the guest sees, `ENV_VAR` is the host env var with the real value, and hosts are where the proxy substitutes it.
 
-Secrets can also be set in `shuru.json` (see [Config file](#config-file)).
+Secrets can also be set in `dome.json` (see [Config file](#config-file)).
 
 ### Config file
 
-Shuru loads `shuru.json` from the current directory (or `--config PATH`). All fields are optional; CLI flags take precedence.
+Dome loads `dome.json` from the current directory (or `--config PATH`). All fields are optional; CLI flags take precedence.
 
 ```json
 {
@@ -155,14 +155,14 @@ The `network.allow` list restricts which hosts the guest can reach. Omit it to a
 
 ## SDK
 
-Use shuru programmatically from TypeScript with the [`@superhq/shuru`](https://www.npmjs.com/package/@superhq/shuru) package.
+Use dome programmatically from TypeScript with the [`@superhq/dome`](https://www.npmjs.com/package/@superhq/dome) package.
 
 ```sh
-bun add @superhq/shuru
+bun add @superhq/dome
 ```
 
 ```ts
-import { Sandbox } from "@superhq/shuru";
+import { Sandbox } from "@superhq/dome";
 
 const sb = await Sandbox.start({ from: "python-env" });
 
@@ -176,17 +176,17 @@ See the [SDK README](packages/sdk/README.md) for full API docs.
 
 ## Agent Skill
 
-Shuru ships as an [agent skill](https://agentskills.io) so AI agents (Claude Code, Cursor, Copilot, etc.) can use it automatically.
+Dome ships as an [agent skill](https://agentskills.io) so AI agents (Claude Code, Cursor, Copilot, etc.) can use it automatically.
 
 ```sh
 # Install via Vercel's skills CLI
-npx skills add superhq-ai/shuru
+npx skills add mhjmaas/dome
 
 # Or manually copy into your project
-cp -r skills/shuru .claude/skills/shuru
+cp -r skills/dome .claude/skills/dome
 ```
 
-Once installed, agents will use `shuru run` whenever they need sandboxed execution.
+Once installed, agents will use `dome run` whenever they need sandboxed execution.
 
 ## Changelog
 
@@ -198,14 +198,14 @@ See [CHANGELOG.md](CHANGELOG.md) for release notes and breaking changes.
 
 ## Bugs
 
-File issues at [github.com/superhq-ai/shuru/issues](https://github.com/superhq-ai/shuru/issues).
+File issues at [github.com/mhjmaas/dome/issues](https://github.com/mhjmaas/dome/issues).
 
 ## Star History
 
-<a href="https://www.star-history.com/?repos=superhq-ai%2Fshuru&type=date&legend=top-left">
+<a href="https://www.star-history.com/?repos=mhjmaas%2Fdome&type=date&legend=top-left">
  <picture>
-   <source media="(prefers-color-scheme: dark)" srcset="https://api.star-history.com/chart?repos=superhq-ai/shuru&type=date&theme=dark&legend=top-left" />
-   <source media="(prefers-color-scheme: light)" srcset="https://api.star-history.com/chart?repos=superhq-ai/shuru&type=date&legend=top-left" />
-   <img alt="Star History Chart" src="https://api.star-history.com/chart?repos=superhq-ai/shuru&type=date&legend=top-left" />
+   <source media="(prefers-color-scheme: dark)" srcset="https://api.star-history.com/chart?repos=mhjmaas/dome&type=date&theme=dark&legend=top-left" />
+   <source media="(prefers-color-scheme: light)" srcset="https://api.star-history.com/chart?repos=mhjmaas/dome&type=date&legend=top-left" />
+   <img alt="Star History Chart" src="https://api.star-history.com/chart?repos=mhjmaas/dome&type=date&legend=top-left" />
  </picture>
 </a>

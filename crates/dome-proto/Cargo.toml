@@ -1,0 +1,11 @@
+[package]
+name = "dome-proto"
+version = "0.3.3"
+edition = "2021"
+description = "Shared wire protocol for dome host/guest communication"
+license = "Apache-2.0"
+repository = "https://github.com/mhjmaas/dome"
+
+[dependencies]
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"

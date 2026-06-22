@@ -1,11 +1,11 @@
 /**
- * Integration tests for filesystem operations against the real shuru VM.
+ * Integration tests for filesystem operations against the real dome VM.
  *
  * Prerequisites:
- *   1. cargo build -p shuru-guest --target aarch64-unknown-linux-musl --release
+ *   1. cargo build -p dome-guest --target aarch64-unknown-linux-musl --release
  *   2. ./scripts/prepare-rootfs.sh
- *   3. cargo build -p shuru-cli
- *   4. codesign --entitlements shuru.entitlements --force -s - target/debug/shuru
+ *   3. cargo build -p dome-cli
+ *   4. codesign --entitlements dome.entitlements --force -s - target/debug/dome
  *
  * Run: bun test test/integration/filesystem.test.ts
  */
@@ -16,15 +16,15 @@ import { resolve } from "node:path";
 import { Sandbox } from "../../src/sandbox";
 
 const REPO_ROOT = resolve(import.meta.dir, "../../../..");
-const SHURU_BIN = resolve(REPO_ROOT, "target/debug/shuru");
+const DOME_BIN = resolve(REPO_ROOT, "target/debug/dome");
 
-const canRun = existsSync(SHURU_BIN);
+const canRun = existsSync(DOME_BIN);
 
 describe.if(canRun)("filesystem operations", () => {
 	let sb: Sandbox;
 
 	beforeAll(async () => {
-		sb = await Sandbox.start({ shuruBin: SHURU_BIN });
+		sb = await Sandbox.start({ domeBin: DOME_BIN });
 	}, 60_000);
 
 	afterAll(async () => {
@@ -146,9 +146,9 @@ describe.if(canRun)("filesystem operations", () => {
 });
 
 describe.if(!canRun)("filesystem operations (skipped)", () => {
-	test("shuru binary not found", () => {
+	test("dome binary not found", () => {
 		console.log(
-			"Build with: cargo build -p shuru-cli && codesign --entitlements shuru.entitlements --force -s - target/debug/shuru",
+			"Build with: cargo build -p dome-cli && codesign --entitlements dome.entitlements --force -s - target/debug/dome",
 		);
 	});
 });

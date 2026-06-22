@@ -12,7 +12,7 @@ export interface ProcessEventHandlers {
 	onExit: (code: number) => void;
 }
 
-export class ShuruProcess {
+export class DomeProcess {
 	private proc: Subprocess<"pipe", "pipe", "inherit"> | null = null;
 	private pending = new Map<number, PendingRequest>();
 	private idCounter = 0;
@@ -36,7 +36,7 @@ export class ShuruProcess {
 
 		await new Promise<void>((resolve, reject) => {
 			const timeout = setTimeout(() => {
-				reject(new Error("shuru: timed out waiting for ready signal (30s)"));
+				reject(new Error("dome: timed out waiting for ready signal (30s)"));
 			}, 30_000);
 
 			this.onReady = () => {
@@ -54,7 +54,7 @@ export class ShuruProcess {
 		method: string,
 		params: Record<string, unknown>,
 	): Promise<JsonRpcResult> {
-		if (!this.proc) throw new Error("shuru process not started");
+		if (!this.proc) throw new Error("dome process not started");
 
 		const id = ++this.idCounter;
 		const line = `${JSON.stringify({ jsonrpc: "2.0", id, method, params })}\n`;
@@ -69,7 +69,7 @@ export class ShuruProcess {
 
 	/** Send a fire-and-forget notification (no id, no response expected). */
 	sendNotification(method: string, params: Record<string, unknown>): void {
-		if (!this.proc) throw new Error("shuru process not started");
+		if (!this.proc) throw new Error("dome process not started");
 		const line = `${JSON.stringify({ jsonrpc: "2.0", method, params })}\n`;
 		this.proc.stdin.write(line);
 		this.proc.stdin.flush();
@@ -87,7 +87,7 @@ export class ShuruProcess {
 		const exited = this.proc.exited;
 		const timeout = new Promise<never>((_, reject) =>
 			setTimeout(
-				() => reject(new Error("shuru: shutdown timed out (5s)")),
+				() => reject(new Error("dome: shutdown timed out (5s)")),
 				5_000,
 			),
 		);
@@ -100,7 +100,7 @@ export class ShuruProcess {
 		}
 
 		for (const [, req] of this.pending) {
-			req.reject(new Error("shuru process stopped"));
+			req.reject(new Error("dome process stopped"));
 		}
 		this.pending.clear();
 		this.proc = null;
@@ -141,12 +141,12 @@ export class ShuruProcess {
 		}
 
 		if (this.onReadyError) {
-			this.onReadyError(new Error("shuru process exited unexpectedly"));
+			this.onReadyError(new Error("dome process exited unexpectedly"));
 			this.onReady = null;
 			this.onReadyError = null;
 		}
 		for (const [, req] of this.pending) {
-			req.reject(new Error("shuru process exited unexpectedly"));
+			req.reject(new Error("dome process exited unexpectedly"));
 		}
 		this.pending.clear();
 	}
