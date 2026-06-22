@@ -2,6 +2,7 @@ mod assets;
 mod checkpoint;
 mod cli;
 mod config;
+mod lock;
 mod sandbox;
 mod session;
 mod stdio;

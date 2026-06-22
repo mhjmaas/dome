@@ -22,6 +22,15 @@ fn sandbox_run(name: &str, guest_cmd: &str) -> std::process::Output {
         .expect("failed to spawn dome — is DOME_BIN correct?")
 }
 
+/// Spawn a sandbox session without waiting for it, so a second session can run
+/// concurrently against the same sandbox.
+fn sandbox_spawn(name: &str, guest_cmd: &str) -> std::process::Child {
+    Command::new(dome_bin())
+        .args(["sandbox", "run", name, "--", "sh", "-c", guest_cmd])
+        .spawn()
+        .expect("failed to spawn dome — is DOME_BIN correct?")
+}
+
 fn ephemeral_run(guest_cmd: &str) -> std::process::Output {
     Command::new(dome_bin())
         .args(["run", "--", "sh", "-c", guest_cmd])
@@ -33,8 +42,10 @@ fn rm_sandbox(name: &str) {
     // Best-effort cleanup; sandbox rm lands in a later slice, so remove the index
     // directly via the data dir if the command is unavailable.
     let home = std::env::var("HOME").unwrap_or_else(|_| "/tmp".to_string());
-    let idx = format!("{}/.local/share/dome/sandboxes/{}.idx", home, name);
-    let _ = std::fs::remove_file(idx);
+    let dir = format!("{}/.local/share/dome/sandboxes", home);
+    let _ = std::fs::remove_file(format!("{}/{}.idx", dir, name));
+    // Drop any lock left by a crashed session so it can't wedge the next run.
+    let _ = std::fs::remove_file(format!("{}/{}.lock", dir, name));
 }
 
 #[test]
@@ -135,6 +146,60 @@ fn lazy_create_then_resume() {
     assert!(
         second.status.success(),
         "second run should resume the sandbox"
+    );
+
+    rm_sandbox(&name);
+}
+
+/// A second concurrent session on a locked sandbox must boot as an ephemeral fork:
+/// it runs fully but never writes back to the owner's saved index, and it announces
+/// itself so the user knows its changes are discarded.
+#[test]
+#[ignore]
+fn concurrent_fork_does_not_alter_owner_saved_state() {
+    let name = sandbox_name("concurrent");
+    rm_sandbox(&name);
+
+    // Seed the sandbox with a known marker and let the owner persist it.
+    let seed = sandbox_run(&name, "echo owner-original > /root/marker.txt");
+    assert!(
+        seed.status.success(),
+        "seeding the sandbox should succeed; stderr: {}",
+        String::from_utf8_lossy(&seed.stderr)
+    );
+
+    // The owner holds the persistence lock for a while without changing the marker.
+    // It acquires the lock early (before the slow VM boot), so by the time the fork
+    // starts the lock is already held.
+    let mut owner = sandbox_spawn(&name, "sleep 25");
+
+    // Give the owner time to start and acquire the lock before the fork begins.
+    std::thread::sleep(std::time::Duration::from_secs(6));
+
+    // The fork tries to overwrite the marker. Because the sandbox is locked, this
+    // session is an ephemeral fork and its write must be discarded.
+    let fork = sandbox_run(&name, "echo fork-wrote-this > /root/marker.txt");
+    assert!(
+        String::from_utf8_lossy(&fork.stderr).contains("ephemeral fork"),
+        "a concurrent session should announce itself as an ephemeral fork; stderr: {}",
+        String::from_utf8_lossy(&fork.stderr)
+    );
+
+    // Let the owner exit cleanly and save (the marker unchanged).
+    owner.wait().expect("owner session should exit");
+
+    // Resuming the sandbox must show the OWNER's state, never the fork's write.
+    let read = sandbox_run(&name, "cat /root/marker.txt");
+    let out = String::from_utf8_lossy(&read.stdout);
+    assert!(
+        out.contains("owner-original"),
+        "saved state should reflect the owner, not the fork; stdout: {}",
+        out
+    );
+    assert!(
+        !out.contains("fork-wrote-this"),
+        "the ephemeral fork's write must NOT be persisted; stdout: {}",
+        out
     );
 
     rm_sandbox(&name);
