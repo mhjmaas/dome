@@ -150,16 +150,28 @@ pub fn start_cas_nbd_server(
     let (index, fallback, source_idx) = if Path::new(index_path).exists() {
         info!("loading CAS index from {}", index_path);
         let idx = ChunkIndex::load(index_path)?;
-        // If the index has a fallback_path, open it and validate disk_size
-        let fb = idx
-            .fallback_path
-            .as_ref()
-            .and_then(|p| FlatFileBackend::open(p).ok());
+        // If the index records a fallback (the immutable base image its never-written
+        // chunks resolve through), it MUST still be openable. Silently dropping it
+        // would read zeros for every never-written chunk and corrupt the filesystem,
+        // so a missing base is a hard error — never a silent rebase/migration.
+        let fb = match idx.fallback_path.as_ref() {
+            Some(p) => Some(FlatFileBackend::open(p).with_context(|| {
+                format!(
+                    "pinned base image is unavailable: {} — the OS version this \
+                     sandbox/checkpoint was created on may have been removed. dome \
+                     will not silently migrate it to a different base (that would \
+                     corrupt the filesystem); restore the base image or recreate it",
+                    p
+                )
+            })?),
+            None => None,
+        };
         if let Some(ref fb) = fb {
             anyhow::ensure!(
                 fb.size() <= idx.disk_size(),
                 "fallback file size ({}) exceeds index disk_size ({}); index may be corrupt",
-                fb.size(), idx.disk_size(),
+                fb.size(),
+                idx.disk_size(),
             );
         }
         (idx, fb, Some(index_path.to_string()))
@@ -184,4 +196,52 @@ pub fn start_cas_nbd_server(
     }
     let cas = Arc::new(backend);
     start_nbd_with_backend(cas.clone(), socket_path, Some(cas))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// A sandbox/checkpoint index records the immutable base image it falls back to
+    /// for never-written chunks. If that base is gone (e.g. its OS version was
+    /// reclaimed), booting from the index must hard-error rather than silently drop
+    /// the fallback — dropping it would read zeros for every never-written chunk and
+    /// silently corrupt the filesystem.
+    #[test]
+    fn missing_fallback_base_is_a_hard_error() {
+        let tmp = tempfile::tempdir().unwrap();
+        let cas_dir = tmp.path().join("cas");
+        let index_path = tmp.path().join("sandbox.idx");
+        let socket_path = tmp.path().join("nbd.sock");
+
+        // Build an index that points its fallback at a base file that does not exist.
+        let mut idx = ChunkIndex::new(256 * 1024);
+        idx.set_hash(0, "deadbeef".to_string());
+        idx.fallback_path = Some(
+            tmp.path()
+                .join("rootfs-9.9.9.ext4")
+                .to_string_lossy()
+                .to_string(),
+        );
+        idx.save(index_path.to_str().unwrap()).unwrap();
+
+        let result = start_cas_nbd_server(
+            "/unused/when/index/exists",
+            cas_dir.to_str().unwrap(),
+            index_path.to_str().unwrap(),
+            socket_path.to_str().unwrap(),
+            0,
+        );
+
+        let err = match result {
+            Ok(_) => panic!("booting from an index whose pinned base is missing must fail"),
+            Err(e) => e,
+        };
+        let msg = format!("{:#}", err);
+        assert!(
+            msg.contains("base image") && msg.contains("rootfs-9.9.9.ext4"),
+            "error should name the unavailable base image; got: {}",
+            msg
+        );
+    }
 }

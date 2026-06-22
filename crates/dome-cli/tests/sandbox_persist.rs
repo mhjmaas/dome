@@ -132,7 +132,10 @@ fn lazy_create_then_resume() {
     );
 
     let second = sandbox_run(&name, "true");
-    assert!(second.status.success(), "second run should resume the sandbox");
+    assert!(
+        second.status.success(),
+        "second run should resume the sandbox"
+    );
 
     rm_sandbox(&name);
 }
