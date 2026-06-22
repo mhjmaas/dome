@@ -834,12 +834,7 @@ mod tests {
         let tmp = tempfile::tempdir().unwrap();
         let child_path = tmp.path().join("child.idx");
         let mut child = ChunkIndex::new(256 * 1024);
-        child.parent_path = Some(
-            tmp.path()
-                .join("gone.idx")
-                .to_string_lossy()
-                .to_string(),
-        );
+        child.parent_path = Some(tmp.path().join("gone.idx").to_string_lossy().to_string());
         child.save(child_path.to_str().unwrap()).unwrap();
 
         match ChunkIndex::flatten_chain(child_path.to_str().unwrap()) {
