@@ -68,6 +68,21 @@ pub(crate) fn resolve_session<T>(flag: Option<T>, config: Option<T>, default: T)
     flag.or(config).unwrap_or(default)
 }
 
+/// Resolve the disk size for booting an *existing* sandbox. Disk size is pinned at
+/// creation: the index encodes a fixed chunk count, so booting at a different size
+/// would corrupt the filesystem. The stored size therefore always wins. When the
+/// caller passed `--disk-size` (`flag_mb`) and it differs from the pinned size, the
+/// flag is ignored and the requested value is returned alongside so the caller can
+/// emit a one-line notice. A matching or absent flag yields no notice. `stored_mb`
+/// and the resolved size are both in MB.
+pub(crate) fn pin_sandbox_disk_size(flag_mb: Option<u64>, stored_mb: u64) -> (u64, Option<u64>) {
+    let ignored = match flag_mb {
+        Some(requested) if requested != stored_mb => Some(requested),
+        _ => None,
+    };
+    (stored_mb, ignored)
+}
+
 pub(crate) fn prepare_vm(
     vm: &VmArgs,
     cfg: &DomeConfig,
@@ -193,14 +208,14 @@ pub(crate) fn prepare_vm(
             // encodes a fixed chunk count, so honoring a differing --disk-size here
             // would corrupt the filesystem.
             let stored = dome_store::ChunkIndex::load(&sb.index_path)?.disk_size() / (1024 * 1024);
-            if vm.disk_size.map(|d| d != stored).unwrap_or(false) {
+            let (resolved, ignored) = pin_sandbox_disk_size(vm.disk_size, stored);
+            if let Some(requested) = ignored {
                 eprintln!(
                     "dome: ignoring --disk-size {}MB; sandbox is pinned to {}MB",
-                    vm.disk_size.unwrap(),
-                    stored
+                    requested, resolved
                 );
             }
-            disk_size = stored;
+            disk_size = resolved;
         }
         sb.base_path.clone()
     } else {
@@ -576,6 +591,36 @@ mod tests {
         let config = Some(4u32);
         assert_eq!(resolve_session(Some(8u32), config, 2), 8);
         assert_eq!(resolve_session(None, config, 2), 4);
+    }
+
+    #[test]
+    fn pinned_disk_size_wins_and_a_differing_flag_is_reported() {
+        // A sandbox is pinned to its creation size. A boot-time `--disk-size` that
+        // differs is ignored (the stored size is used) and reported back so the caller
+        // can warn — a differing size would corrupt the fixed-chunk-count filesystem.
+        let (resolved, ignored) = pin_sandbox_disk_size(Some(8192), 4096);
+        assert_eq!(resolved, 4096, "the pinned size must win over the flag");
+        assert_eq!(
+            ignored,
+            Some(8192),
+            "the ignored flag is reported for the notice"
+        );
+    }
+
+    #[test]
+    fn a_matching_disk_size_flag_is_not_reported() {
+        // Passing the same size the sandbox is pinned to is a no-op, not a warning.
+        let (resolved, ignored) = pin_sandbox_disk_size(Some(4096), 4096);
+        assert_eq!(resolved, 4096);
+        assert_eq!(ignored, None, "a matching flag must not produce a notice");
+    }
+
+    #[test]
+    fn an_absent_disk_size_flag_uses_the_pinned_size_silently() {
+        // With no `--disk-size`, the pinned size is used and nothing is reported.
+        let (resolved, ignored) = pin_sandbox_disk_size(None, 2048);
+        assert_eq!(resolved, 2048);
+        assert_eq!(ignored, None);
     }
 
     #[test]
