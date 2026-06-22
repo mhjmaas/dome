@@ -39,13 +39,42 @@ fn ephemeral_run(guest_cmd: &str) -> std::process::Output {
 }
 
 fn rm_sandbox(name: &str) {
-    // Best-effort cleanup; sandbox rm lands in a later slice, so remove the index
-    // directly via the data dir if the command is unavailable.
+    // Best-effort cleanup independent of the binary under test: remove the index (and
+    // any lock left by a crashed session) directly via the data dir so a broken `rm`
+    // can never strand other tests.
     let home = std::env::var("HOME").unwrap_or_else(|_| "/tmp".to_string());
     let dir = format!("{}/.local/share/dome/sandboxes", home);
     let _ = std::fs::remove_file(format!("{}/{}.idx", dir, name));
     // Drop any lock left by a crashed session so it can't wedge the next run.
     let _ = std::fs::remove_file(format!("{}/{}.lock", dir, name));
+}
+
+/// Run the real `dome sandbox rm <name>` command.
+fn sandbox_rm_cmd(name: &str) -> std::process::Output {
+    Command::new(dome_bin())
+        .args(["sandbox", "rm", name])
+        .output()
+        .expect("failed to spawn dome — is DOME_BIN correct?")
+}
+
+/// Run the real `dome prune` command (instance cleanup + CAS mark-and-sweep).
+fn prune_cmd() -> std::process::Output {
+    Command::new(dome_bin())
+        .arg("prune")
+        .output()
+        .expect("failed to spawn dome — is DOME_BIN correct?")
+}
+
+fn sandbox_index_path(name: &str) -> String {
+    let home = std::env::var("HOME").unwrap_or_else(|_| "/tmp".to_string());
+    format!("{}/.local/share/dome/sandboxes/{}.idx", home, name)
+}
+
+/// Number of chunk files currently in the global CAS chunk store.
+fn chunk_count() -> usize {
+    let home = std::env::var("HOME").unwrap_or_else(|_| "/tmp".to_string());
+    let chunks = format!("{}/.local/share/dome/chunks", home);
+    std::fs::read_dir(&chunks).map(|d| d.count()).unwrap_or(0)
 }
 
 #[test]
@@ -203,4 +232,101 @@ fn concurrent_fork_does_not_alter_owner_saved_state() {
     );
 
     rm_sandbox(&name);
+}
+
+/// `dome sandbox rm` on a name with no index reports a clear error and fails — this
+/// path needs no VM, so it is cheap even though the suite is `#[ignore]`d.
+#[test]
+#[ignore]
+fn rm_reports_a_clear_error_for_a_missing_sandbox() {
+    let name = sandbox_name("rm-missing");
+    rm_sandbox(&name); // ensure it really is absent
+
+    let out = sandbox_rm_cmd(&name);
+    assert!(
+        !out.status.success(),
+        "removing a non-existent sandbox should fail"
+    );
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert!(
+        stderr.contains(&name) && stderr.contains("not found"),
+        "error should name the missing sandbox; stderr: {}",
+        stderr
+    );
+}
+
+/// End-to-end of issue #10: `rm` unlinks only the index (chunks survive), and a
+/// subsequent `prune` mark-and-sweep reclaims the now-orphaned chunks while a different,
+/// still-referenced sandbox keeps its data and resumes intact.
+#[test]
+#[ignore]
+fn rm_then_prune_reclaims_orphans_while_keeping_referenced() {
+    let victim = sandbox_name("gc-victim");
+    let keeper = sandbox_name("gc-keeper");
+    rm_sandbox(&victim);
+    rm_sandbox(&keeper);
+
+    // The keeper writes a unique marker plus a few MB of unique data, then persists.
+    let k = sandbox_run(
+        &keeper,
+        "head -c 3000000 /dev/urandom > /root/keep.bin; echo keeper-marker > /root/marker.txt",
+    );
+    assert!(
+        k.status.success(),
+        "seeding the keeper sandbox should succeed; stderr: {}",
+        String::from_utf8_lossy(&k.stderr)
+    );
+
+    // The victim writes its own few MB of unique data (so it owns distinct chunks).
+    let v = sandbox_run(&victim, "head -c 3000000 /dev/urandom > /root/victim.bin");
+    assert!(
+        v.status.success(),
+        "seeding the victim sandbox should succeed; stderr: {}",
+        String::from_utf8_lossy(&v.stderr)
+    );
+
+    let before = chunk_count();
+
+    // rm unlinks only the index: it succeeds, the index is gone, and — crucially — the
+    // chunk store is untouched (reclamation is deferred to prune).
+    let rm = sandbox_rm_cmd(&victim);
+    assert!(
+        rm.status.success(),
+        "rm should succeed; stderr: {}",
+        String::from_utf8_lossy(&rm.stderr)
+    );
+    assert!(
+        !std::path::Path::new(&sandbox_index_path(&victim)).exists(),
+        "rm should unlink the sandbox index"
+    );
+    assert_eq!(
+        chunk_count(),
+        before,
+        "rm must NOT delete chunks — that is deferred to prune"
+    );
+
+    // prune sweeps the now-unreferenced chunks: the store shrinks.
+    let prune = prune_cmd();
+    assert!(
+        prune.status.success(),
+        "prune should succeed; stderr: {}",
+        String::from_utf8_lossy(&prune.stderr)
+    );
+    assert!(
+        chunk_count() < before,
+        "prune should reclaim the victim's orphaned chunks ({} -> {})",
+        before,
+        chunk_count()
+    );
+
+    // The keeper's referenced data survived the sweep and still resumes.
+    let read = sandbox_run(&keeper, "cat /root/marker.txt");
+    assert!(
+        String::from_utf8_lossy(&read.stdout).contains("keeper-marker"),
+        "a still-referenced sandbox must keep its data through prune; stdout: {}",
+        String::from_utf8_lossy(&read.stdout)
+    );
+
+    rm_sandbox(&victim);
+    rm_sandbox(&keeper);
 }

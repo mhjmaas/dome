@@ -167,8 +167,23 @@ pub(crate) enum SandboxCommands {
 
     /// List persistent sandboxes (size, pinned base version, running/idle status)
     Ls,
+
+    /// Remove a sandbox's index (fast; chunk reclamation is deferred to `dome prune`)
+    Rm {
+        /// Sandbox name (defaults to the `sandbox` field in dome.json, else a cwd slug)
+        name: Option<String>,
+
+        /// Path to config file (default: ./dome.json)
+        #[arg(long)]
+        config: Option<String>,
+    },
 }
 
+// Variants flatten the shared `VmArgs` struct, which clap requires by value (a
+// `Box<VmArgs>` can't be `#[command(flatten)]`d), so the size spread between `Create`
+// and the lightweight variants is inherent. These enums are parsed once at startup, so
+// the size is irrelevant.
+#[allow(clippy::large_enum_variant)]
 #[derive(clap::Subcommand)]
 pub(crate) enum CheckpointCommands {
     /// Run a command and save the resulting disk state as a checkpoint
