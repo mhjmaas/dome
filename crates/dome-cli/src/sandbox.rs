@@ -535,8 +535,16 @@ mod tests {
         // --from was involved; the two states stay distinguishable by their wording.
         let exists = collision_error("web", Collision::Exists, false).to_string();
         assert!(exists.contains("'web'") && exists.contains("already exists"));
-        assert!(exists.contains("dome sandbox rm web"), "missing remedy: {}", exists);
-        assert!(!exists.contains("--from"), "no --from clause expected: {}", exists);
+        assert!(
+            exists.contains("dome sandbox rm web"),
+            "missing remedy: {}",
+            exists
+        );
+        assert!(
+            !exists.contains("--from"),
+            "no --from clause expected: {}",
+            exists
+        );
 
         let exists_from = collision_error("web", Collision::Exists, true).to_string();
         assert!(exists_from.contains("already exists") && exists_from.contains("--from"));
@@ -545,7 +553,11 @@ mod tests {
         let in_use = collision_error("web", Collision::InUse, false).to_string();
         assert!(in_use.contains("'web'") && in_use.contains("in use"));
         assert!(in_use.contains("Wait"), "missing remedy: {}", in_use);
-        assert!(!in_use.contains("--from"), "no --from clause expected: {}", in_use);
+        assert!(
+            !in_use.contains("--from"),
+            "no --from clause expected: {}",
+            in_use
+        );
 
         let in_use_from = collision_error("web", Collision::InUse, true).to_string();
         assert!(in_use_from.contains("in use") && in_use_from.contains("--from"));
@@ -694,14 +706,17 @@ mod tests {
         child.save(child_path.to_str().unwrap()).unwrap();
 
         let dst = tmp.path().join("sb.idx");
-        let err = seed_sandbox_index(child_path.to_str().unwrap(), dst.to_str().unwrap())
-            .unwrap_err();
+        let err =
+            seed_sandbox_index(child_path.to_str().unwrap(), dst.to_str().unwrap()).unwrap_err();
         assert!(
             err.to_string().contains("parent"),
             "error should name the missing parent; got: {}",
             err
         );
-        assert!(!dst.exists(), "a failed seed must not leave an index behind");
+        assert!(
+            !dst.exists(),
+            "a failed seed must not leave an index behind"
+        );
     }
 
     #[test]

@@ -2,11 +2,11 @@
 
 mod sandbox;
 
-pub use sandbox::{MountConfig, PortForwardHandle, Sandbox, VmConfigBuilder};
 pub use dome_proto::{
     frame, ExecRequest, ForwardRequest, ForwardResponse, MountRequest, MountResponse, PortMapping,
     ReadFileRequest, WriteFileRequest, WriteFileResponse, VSOCK_PORT, VSOCK_PORT_FORWARD,
 };
+pub use sandbox::{MountConfig, PortForwardHandle, Sandbox, VmConfigBuilder};
 
 // Re-exports from platform-specific backend for advanced/escape-hatch use
 #[cfg(target_os = "macos")]

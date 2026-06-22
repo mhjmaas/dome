@@ -257,7 +257,11 @@ mod tests {
             .map(|e| e.file_name().to_string_lossy().to_string())
             .filter(|n| n.contains(".stage."))
             .collect();
-        assert!(leftovers.is_empty(), "staged temp files left behind: {:?}", leftovers);
+        assert!(
+            leftovers.is_empty(),
+            "staged temp files left behind: {:?}",
+            leftovers
+        );
         drop(guard);
     }
 
