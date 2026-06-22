@@ -10,24 +10,45 @@ use tar::Archive;
 const GITHUB_REPO: &str = "mhjmaas/dome";
 pub const CURRENT_VERSION: &str = env!("CARGO_PKG_VERSION");
 
+/// Path to the immutable, version-addressed rootfs base image. Each OS version is
+/// stored under its own filename so an upgrade never overwrites a base image that a
+/// sandbox is pinned to (which would silently corrupt its never-written chunks).
+pub fn versioned_rootfs_path(data_dir: &str, version: &str) -> String {
+    format!("{}/rootfs-{}.ext4", data_dir, version)
+}
+
+/// The currently installed OS image version, read from the `VERSION` file written on
+/// the last successful download. `None` if no image has been installed yet.
+pub fn installed_version(data_dir: &str) -> Option<String> {
+    fs::read_to_string(format!("{}/VERSION", data_dir))
+        .ok()
+        .map(|s| s.trim().to_string())
+        .filter(|s| !s.is_empty())
+}
+
+/// Map a tarball entry name to its on-disk destination, or `None` to skip it. The
+/// rootfs is stored under an immutable, versioned filename; the kernel and initramfs
+/// are loaded fresh into VM memory each boot (never a CAS fallback) so they live at
+/// fixed, version-agnostic paths and may be replaced in place on upgrade.
+fn asset_dest(data_dir: &str, version: &str, entry_name: &str) -> Option<String> {
+    match entry_name {
+        "rootfs.ext4" => Some(versioned_rootfs_path(data_dir, version)),
+        "Image" | "initramfs.cpio.gz" => Some(format!("{}/{}", data_dir, entry_name)),
+        _ => None,
+    }
+}
+
 /// Check if OS image assets exist and match the expected version.
 pub fn assets_ready(data_dir: &str) -> bool {
+    let version = match installed_version(data_dir) {
+        Some(v) if v == CURRENT_VERSION => v,
+        _ => return false,
+    };
     let kernel = format!("{}/Image", data_dir);
-    let rootfs = format!("{}/rootfs.ext4", data_dir);
     let initramfs = format!("{}/initramfs.cpio.gz", data_dir);
+    let rootfs = versioned_rootfs_path(data_dir, &version);
 
-    if !Path::new(&kernel).exists()
-        || !Path::new(&rootfs).exists()
-        || !Path::new(&initramfs).exists()
-    {
-        return false;
-    }
-
-    let version_file = format!("{}/VERSION", data_dir);
-    match fs::read_to_string(&version_file) {
-        Ok(v) => v.trim() == CURRENT_VERSION,
-        Err(_) => false,
-    }
+    Path::new(&kernel).exists() && Path::new(&initramfs).exists() && Path::new(&rootfs).exists()
 }
 
 /// Download and extract OS image assets from GitHub Releases.
@@ -66,13 +87,33 @@ fn download_os_image_version(data_dir: &str, version: &str) -> Result<()> {
     let decoder = GzDecoder::new(reader);
     let mut archive = Archive::new(decoder);
 
-    archive
-        .unpack(data_dir)
-        .context("failed to extract OS image")?;
+    // Extract each entry to its versioned/fixed destination. The rootfs lands under
+    // an immutable `rootfs-<version>.ext4` filename, so downloading a new version is
+    // non-destructive: it never overwrites or deletes a prior version's base image
+    // that an existing sandbox is still pinned to.
+    for entry in archive
+        .entries()
+        .context("failed to read OS image archive")?
+    {
+        let mut entry = entry.context("failed to read archive entry")?;
+        let name = entry
+            .path()
+            .context("invalid archive entry path")?
+            .file_name()
+            .and_then(|n| n.to_str())
+            .map(|s| s.to_string());
+        let Some(name) = name else { continue };
+        let Some(dest) = asset_dest(data_dir, version, &name) else {
+            continue;
+        };
+        let mut out =
+            fs::File::create(&dest).with_context(|| format!("failed to create {}", dest))?;
+        io::copy(&mut entry, &mut out).with_context(|| format!("failed to extract {}", dest))?;
+    }
 
     eprintln!(); // newline after progress
 
-    // Write VERSION file
+    // Write VERSION last so a partially-extracted image is never seen as ready.
     let version_file = format!("{}/VERSION", data_dir);
     fs::write(&version_file, format!("{}\n", version)).context("failed to write VERSION file")?;
 
@@ -246,5 +287,91 @@ impl<R: Read> Read for ProgressReader<R> {
         }
 
         Ok(n)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn rootfs_entry_maps_to_versioned_path() {
+        assert_eq!(
+            asset_dest("/data", "1.2.3", "rootfs.ext4"),
+            Some("/data/rootfs-1.2.3.ext4".to_string())
+        );
+        assert_eq!(
+            versioned_rootfs_path("/data", "1.2.3"),
+            "/data/rootfs-1.2.3.ext4"
+        );
+    }
+
+    #[test]
+    fn kernel_and_initramfs_map_to_fixed_paths() {
+        assert_eq!(
+            asset_dest("/data", "1.2.3", "Image"),
+            Some("/data/Image".to_string())
+        );
+        assert_eq!(
+            asset_dest("/data", "1.2.3", "initramfs.cpio.gz"),
+            Some("/data/initramfs.cpio.gz".to_string())
+        );
+    }
+
+    #[test]
+    fn unknown_entries_are_skipped() {
+        assert_eq!(asset_dest("/data", "1.2.3", "README.md"), None);
+    }
+
+    #[test]
+    fn different_versions_resolve_to_distinct_rootfs_files() {
+        // The core non-destructive-upgrade property: each version owns its own base
+        // file, so extracting a newer version can never target an older one's path.
+        let v1 = asset_dest("/data", "1.0.0", "rootfs.ext4").unwrap();
+        let v2 = asset_dest("/data", "2.0.0", "rootfs.ext4").unwrap();
+        assert_ne!(v1, v2);
+    }
+
+    #[test]
+    fn extracting_a_new_version_leaves_the_old_base_intact() {
+        let tmp = tempfile::tempdir().unwrap();
+        let data_dir = tmp.path().to_str().unwrap();
+
+        // Simulate an already-installed v1 base image.
+        let v1 = asset_dest(data_dir, "1.0.0", "rootfs.ext4").unwrap();
+        fs::write(&v1, b"v1-base-bytes").unwrap();
+
+        // "Download" v2 by writing to its destination, exactly as the extract loop does.
+        let v2 = asset_dest(data_dir, "2.0.0", "rootfs.ext4").unwrap();
+        fs::write(&v2, b"v2-base-bytes").unwrap();
+
+        // The older base a sandbox could be pinned to is untouched and both coexist.
+        assert_eq!(fs::read(&v1).unwrap(), b"v1-base-bytes");
+        assert_eq!(fs::read(&v2).unwrap(), b"v2-base-bytes");
+    }
+
+    #[test]
+    fn assets_not_ready_without_version_file() {
+        let tmp = tempfile::tempdir().unwrap();
+        assert!(!assets_ready(tmp.path().to_str().unwrap()));
+    }
+
+    #[test]
+    fn assets_ready_requires_the_versioned_rootfs_for_the_installed_version() {
+        let tmp = tempfile::tempdir().unwrap();
+        let data_dir = tmp.path().to_str().unwrap();
+        // Pretend the installed version matches this build.
+        fs::write(
+            format!("{}/VERSION", data_dir),
+            format!("{}\n", CURRENT_VERSION),
+        )
+        .unwrap();
+        fs::write(format!("{}/Image", data_dir), b"k").unwrap();
+        fs::write(format!("{}/initramfs.cpio.gz", data_dir), b"i").unwrap();
+        // No versioned rootfs yet → not ready.
+        assert!(!assets_ready(data_dir));
+        // Add the versioned rootfs → ready.
+        fs::write(versioned_rootfs_path(data_dir, CURRENT_VERSION), b"r").unwrap();
+        assert!(assets_ready(data_dir));
     }
 }

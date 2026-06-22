@@ -6,11 +6,7 @@ use anyhow::{bail, Context, Result};
 
 #[cfg(target_os = "macos")]
 extern "C" {
-    fn clonefile(
-        src: *const libc::c_char,
-        dst: *const libc::c_char,
-        flags: u32,
-    ) -> libc::c_int;
+    fn clonefile(src: *const libc::c_char, dst: *const libc::c_char, flags: u32) -> libc::c_int;
 }
 
 #[cfg(target_os = "macos")]
@@ -27,8 +23,7 @@ pub(crate) fn clone_file(src: &str, dst: &str) -> Result<()> {
 
 #[cfg(target_os = "linux")]
 pub(crate) fn clone_file(src: &str, dst: &str) -> Result<()> {
-    std::fs::copy(src, dst)
-        .with_context(|| format!("failed to copy {} -> {}", src, dst))?;
+    std::fs::copy(src, dst).with_context(|| format!("failed to copy {} -> {}", src, dst))?;
     Ok(())
 }
 
@@ -91,11 +86,16 @@ pub(crate) fn prepare_vm(
 
         // Merge --secret flags: NAME=ENV_VAR@host1,host2
         for s in &vm.secret {
-            let (name, from, hosts) = parse_secret_flag(s)
-                .with_context(|| format!("invalid --secret: '{}' (expected NAME=ENV@host1,host2)", s))?;
+            let (name, from, hosts) = parse_secret_flag(s).with_context(|| {
+                format!("invalid --secret: '{}' (expected NAME=ENV@host1,host2)", s)
+            })?;
             proxy.secrets.insert(
                 name,
-                dome_proxy::config::SecretConfig { from, hosts, value: None },
+                dome_proxy::config::SecretConfig {
+                    from,
+                    hosts,
+                    value: None,
+                },
             );
         }
 
@@ -125,8 +125,8 @@ pub(crate) fn prepare_vm(
     }
     let mut forwards = Vec::new();
     for s in &port_strs {
-        let mapping = parse_port_mapping(s)
-            .with_context(|| format!("invalid port mapping: '{}'", s))?;
+        let mapping =
+            parse_port_mapping(s).with_context(|| format!("invalid port mapping: '{}'", s))?;
         forwards.push(mapping);
     }
 
@@ -139,8 +139,7 @@ pub(crate) fn prepare_vm(
     }
     let mut mounts = Vec::new();
     for s in &mount_strs {
-        let mc = parse_mount_spec(s)
-            .with_context(|| format!("invalid mount spec: '{}'", s))?;
+        let mc = parse_mount_spec(s).with_context(|| format!("invalid mount spec: '{}'", s))?;
         mounts.push(mc);
     }
 
@@ -163,10 +162,13 @@ pub(crate) fn prepare_vm(
         .kernel
         .clone()
         .unwrap_or_else(|| format!("{}/Image", data_dir));
-    let rootfs_path = vm
-        .rootfs
-        .clone()
-        .unwrap_or_else(|| format!("{}/rootfs.ext4", data_dir));
+    // Ephemeral runs and checkpoints resolve the base via the immutable, versioned
+    // rootfs path of the installed OS version — the same file sandboxes pin to.
+    let rootfs_path = vm.rootfs.clone().unwrap_or_else(|| {
+        let version = assets::installed_version(&data_dir)
+            .unwrap_or_else(|| assets::CURRENT_VERSION.to_string());
+        assets::versioned_rootfs_path(&data_dir, &version)
+    });
     let initrd_path_str = vm
         .initrd
         .clone()
@@ -203,30 +205,29 @@ pub(crate) fn prepare_vm(
         sb.base_path.clone()
     } else {
         match from {
-        Some(name) => {
-            dome_vm::validate_checkpoint_name(name)
-                .map_err(|e| anyhow::anyhow!(e))?;
-            // Check .idx (CAS) first, then .ext4 (legacy)
-            let idx_path = format!("{}/{}.idx", checkpoints_dir, name);
-            let ext4_path = format!("{}/{}.ext4", checkpoints_dir, name);
-            if std::path::Path::new(&idx_path).exists() {
-                cas_index = Some(idx_path.clone());
-                idx_path
-            } else if std::path::Path::new(&ext4_path).exists() {
-                ext4_path
-            } else {
-                bail!("Checkpoint '{}' not found", name);
+            Some(name) => {
+                dome_vm::validate_checkpoint_name(name).map_err(|e| anyhow::anyhow!(e))?;
+                // Check .idx (CAS) first, then .ext4 (legacy)
+                let idx_path = format!("{}/{}.idx", checkpoints_dir, name);
+                let ext4_path = format!("{}/{}.ext4", checkpoints_dir, name);
+                if std::path::Path::new(&idx_path).exists() {
+                    cas_index = Some(idx_path.clone());
+                    idx_path
+                } else if std::path::Path::new(&ext4_path).exists() {
+                    ext4_path
+                } else {
+                    bail!("Checkpoint '{}' not found", name);
+                }
             }
-        }
-        None => {
-            if !std::path::Path::new(&rootfs_path).exists() {
-                bail!(
-                    "Rootfs not found at {}. Run `dome init` to download.",
-                    rootfs_path
-                );
+            None => {
+                if !std::path::Path::new(&rootfs_path).exists() {
+                    bail!(
+                        "Rootfs not found at {}. Run `dome init` to download.",
+                        rootfs_path
+                    );
+                }
+                rootfs_path
             }
-            rootfs_path
-        }
         }
     };
 
@@ -250,9 +251,7 @@ pub(crate) fn prepare_vm(
     }
 
     // Extend to requested disk size
-    let f = std::fs::OpenOptions::new()
-        .write(true)
-        .open(&work_rootfs)?;
+    let f = std::fs::OpenOptions::new().write(true).open(&work_rootfs)?;
     let target = disk_size * 1024 * 1024;
     let current = f.metadata()?.len();
     if target < current {
@@ -424,12 +423,20 @@ pub(crate) fn run_command(prepared: &PreparedVm, command: &[String]) -> Result<R
     let exit_code = if std::io::stdin().is_terminal() {
         sandbox.shell(command, &env)?
     } else {
-        sandbox.exec_with_env(command, &env, &mut std::io::stdout(), &mut std::io::stderr())?
+        sandbox.exec_with_env(
+            command,
+            &env,
+            &mut std::io::stdout(),
+            &mut std::io::stderr(),
+        )?
     };
 
     drop(proxy_handle);
     let _ = sandbox.stop();
-    Ok(RunResult { exit_code, nbd_handle })
+    Ok(RunResult {
+        exit_code,
+        nbd_handle,
+    })
 }
 
 /// Pure string validation — no filesystem access. Separated from `parse_mount_spec`
@@ -469,7 +476,8 @@ fn parse_mount_spec(s: &str) -> Result<MountConfig> {
 
 fn validate_mounts(mounts: &[MountConfig], allow_host_writes: bool) -> Result<()> {
     let cwd = std::env::current_dir().context("failed to determine current working directory")?;
-    let cwd = std::fs::canonicalize(&cwd).context("failed to canonicalize current working directory")?;
+    let cwd =
+        std::fs::canonicalize(&cwd).context("failed to canonicalize current working directory")?;
     validate_mounts_with_cwd(mounts, allow_host_writes, &cwd)
 }
 
@@ -642,7 +650,9 @@ mod tests {
             read_only: true,
         }];
         let err = validate_mounts_with_cwd(&mounts, false, cwd).unwrap_err();
-        assert!(err.to_string().contains("outside the current working directory"));
+        assert!(err
+            .to_string()
+            .contains("outside the current working directory"));
     }
 
     #[test]

@@ -28,6 +28,9 @@ prepare-rootfs:
 build-image: build-guest
     ./scripts/prepare-rootfs.sh
     cargo pkgid -p dome-cli | sed 's/.*#//' > ~/.local/share/dome/VERSION
+    # The CLI resolves the base via an immutable, version-addressed rootfs filename.
+    # Materialize it from the freshly-built rootfs.ext4 (clones on APFS, copies elsewhere).
+    cp -c ~/.local/share/dome/rootfs.ext4 ~/.local/share/dome/rootfs-$(cat ~/.local/share/dome/VERSION).ext4 2>/dev/null || cp ~/.local/share/dome/rootfs.ext4 ~/.local/share/dome/rootfs-$(cat ~/.local/share/dome/VERSION).ext4
     @echo "==> Local OS image ready ($(cat ~/.local/share/dome/VERSION)) — CLI will use it instead of downloading"
 
 # Run a command inside the VM

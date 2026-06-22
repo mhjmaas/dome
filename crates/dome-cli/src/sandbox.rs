@@ -38,9 +38,17 @@ pub(crate) fn run_sandbox(
 
     let data_dir = dome_vm::default_data_dir();
     let index_path = format!("{}/sandboxes/{}.idx", data_dir, name);
-    let base_path = ensure_versioned_base(&data_dir, vm_args)?;
 
     let existed = Path::new(&index_path).exists();
+    // A new sandbox pins to the currently installed OS version; an existing one stays
+    // pinned to the immutable base recorded in its index, regardless of any later
+    // upgrade — so an OS upgrade never silently rebases (and corrupts) it.
+    let base_path = if existed {
+        pinned_base_for_existing(&index_path)?
+    } else {
+        ensure_current_base(&data_dir, vm_args)?
+    };
+
     let source = SandboxSource {
         index_path,
         base_path,
@@ -69,11 +77,7 @@ fn reject_direct_storage() -> Result<()> {
 
 /// Resolve the sandbox name: explicit argument → `dome.json` `sandbox` field →
 /// a slug derived from the current working directory, in that order.
-pub(crate) fn resolve_name(
-    explicit: Option<&str>,
-    cfg: &DomeConfig,
-    cwd: &Path,
-) -> Result<String> {
+pub(crate) fn resolve_name(explicit: Option<&str>, cfg: &DomeConfig, cwd: &Path) -> Result<String> {
     if let Some(name) = explicit {
         if name.is_empty() {
             bail!("sandbox name cannot be empty");
@@ -85,10 +89,7 @@ pub(crate) fn resolve_name(
             return Ok(name.to_string());
         }
     }
-    let base = cwd
-        .file_name()
-        .and_then(|s| s.to_str())
-        .unwrap_or_default();
+    let base = cwd.file_name().and_then(|s| s.to_str()).unwrap_or_default();
     let slug = slugify(base);
     if slug.is_empty() {
         bail!(
@@ -117,13 +118,12 @@ fn slugify(s: &str) -> String {
     out.trim_matches('-').to_string()
 }
 
-/// Ensure an immutable, version-pinned copy of the base image exists and return its
-/// path. The sandbox's never-written chunks resolve through this file, so it must
-/// not change underneath a sandbox even when the live rootfs is upgraded.
-///
-/// On APFS the clone is copy-on-write (essentially free); on Linux it is a full copy.
-fn ensure_versioned_base(data_dir: &str, vm_args: &VmArgs) -> Result<String> {
-    // Make sure the live OS image is present before we pin a copy of it.
+/// Resolve the immutable, version-addressed base image for a brand-new sandbox: the
+/// rootfs of the currently installed OS version. The sandbox's never-written chunks
+/// resolve through this file, and because it is stored under a per-version filename
+/// it is never overwritten by a later upgrade.
+fn ensure_current_base(data_dir: &str, vm_args: &VmArgs) -> Result<String> {
+    // Make sure the OS image is present before we pin to it.
     if vm_args.kernel.is_none()
         && vm_args.rootfs.is_none()
         && vm_args.initrd.is_none()
@@ -132,35 +132,42 @@ fn ensure_versioned_base(data_dir: &str, vm_args: &VmArgs) -> Result<String> {
         assets::download_os_image(data_dir)?;
     }
 
-    let rootfs_path = vm_args
-        .rootfs
-        .clone()
-        .unwrap_or_else(|| format!("{}/rootfs.ext4", data_dir));
-    if !Path::new(&rootfs_path).exists() {
+    let base_path = vm_args.rootfs.clone().unwrap_or_else(|| {
+        let version = assets::installed_version(data_dir)
+            .unwrap_or_else(|| assets::CURRENT_VERSION.to_string());
+        assets::versioned_rootfs_path(data_dir, &version)
+    });
+    if !Path::new(&base_path).exists() {
         bail!(
             "Rootfs not found at {}. Run `dome init` to download.",
-            rootfs_path
+            base_path
         );
-    }
-
-    let version = base_version(data_dir);
-    let bases_dir = format!("{}/bases", data_dir);
-    std::fs::create_dir_all(&bases_dir)?;
-    let base_path = format!("{}/rootfs-{}.ext4", bases_dir, version);
-    if !Path::new(&base_path).exists() {
-        vm::clone_file(&rootfs_path, &base_path)?;
     }
     Ok(base_path)
 }
 
-/// The installed OS image version (the `VERSION` file written by asset download),
-/// falling back to the CLI's build version.
-fn base_version(data_dir: &str) -> String {
-    std::fs::read_to_string(format!("{}/VERSION", data_dir))
-        .ok()
-        .map(|s| s.trim().to_string())
-        .filter(|s| !s.is_empty())
-        .unwrap_or_else(|| assets::CURRENT_VERSION.to_string())
+/// Resolve the pinned base image for an existing sandbox from the base recorded in
+/// its index. If that base image is no longer available (e.g. its OS version was
+/// reclaimed), error clearly rather than silently rebasing onto a different version,
+/// which would corrupt the filesystem.
+fn pinned_base_for_existing(index_path: &str) -> Result<String> {
+    let idx = dome_store::ChunkIndex::load(index_path)?;
+    let base = idx.fallback_path.clone().ok_or_else(|| {
+        anyhow::anyhow!(
+            "sandbox index '{}' records no pinned base image; it may be corrupt",
+            index_path
+        )
+    })?;
+    if !Path::new(&base).exists() {
+        bail!(
+            "this sandbox's pinned OS base image is no longer available: {}\n\
+             The OS version it was created on has been removed. dome will not silently \
+             migrate it to a different base (that would corrupt the filesystem). \
+             Restore that base image or recreate the sandbox.",
+            base
+        );
+    }
+    Ok(base)
 }
 
 #[cfg(test)]
@@ -212,6 +219,45 @@ mod tests {
         assert_eq!(slugify("--weird__name!!"), "weird-name");
         assert_eq!(slugify("CamelCase"), "camelcase");
         assert_eq!(slugify("a.b.c"), "a-b-c");
+    }
+
+    #[test]
+    fn existing_sandbox_resolves_its_recorded_pinned_base() {
+        let tmp = tempfile::tempdir().unwrap();
+        // A base image file for the version this sandbox was created on.
+        let base = tmp.path().join("rootfs-1.0.0.ext4");
+        std::fs::write(&base, b"base").unwrap();
+
+        // An index recording that base as its fallback (as flatten-save does).
+        let idx_path = tmp.path().join("foo.idx");
+        let mut idx = dome_store::ChunkIndex::new(256 * 1024);
+        idx.fallback_path = Some(base.to_string_lossy().to_string());
+        idx.save(idx_path.to_str().unwrap()).unwrap();
+
+        let resolved = pinned_base_for_existing(idx_path.to_str().unwrap()).unwrap();
+        assert_eq!(resolved, base.to_string_lossy());
+    }
+
+    #[test]
+    fn existing_sandbox_with_missing_base_errors_clearly() {
+        let tmp = tempfile::tempdir().unwrap();
+        let idx_path = tmp.path().join("foo.idx");
+        let mut idx = dome_store::ChunkIndex::new(256 * 1024);
+        idx.fallback_path = Some(
+            tmp.path()
+                .join("rootfs-9.9.9.ext4")
+                .to_string_lossy()
+                .to_string(),
+        );
+        idx.save(idx_path.to_str().unwrap()).unwrap();
+
+        let err = pinned_base_for_existing(idx_path.to_str().unwrap()).unwrap_err();
+        let msg = err.to_string();
+        assert!(
+            msg.contains("rootfs-9.9.9.ext4") && msg.to_lowercase().contains("base"),
+            "error should name the unavailable base and not silently migrate; got: {}",
+            msg
+        );
     }
 
     #[test]
