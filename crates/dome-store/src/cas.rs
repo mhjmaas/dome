@@ -248,6 +248,62 @@ impl ChunkIndex {
         );
         Ok(())
     }
+
+    /// Flatten an on-disk index and its parent chain into a self-contained, depth-1,
+    /// parent-less index, resolving each chunk's hash reference through the chain (this
+    /// index first, then each parent). Only hash references are copied — no chunk data
+    /// is read or moved — so this is cheap and needs no chunk store or running backend.
+    /// The deepest fallback (the pinned base image) is preserved so never-written
+    /// chunks still resolve through it.
+    ///
+    /// Unlike [`CasBackend::load_parent_chain`], a missing link in the chain is a hard
+    /// error rather than a silent fall-through: a corrupt or partially-removed source
+    /// can never silently produce wrong content here. This is the primitive used to
+    /// seed a sandbox from a checkpoint or another sandbox without inheriting a fragile
+    /// dependency on the source's parent index files.
+    pub fn flatten_chain(path: &str) -> Result<ChunkIndex> {
+        let index = ChunkIndex::load(path)?;
+
+        // Eagerly load the full parent chain; a missing link is corruption.
+        let mut chain = Vec::new();
+        let mut next = index.parent_path.clone();
+        while let Some(parent_path) = next {
+            let parent = ChunkIndex::load(&parent_path).with_context(|| {
+                format!(
+                    "failed to load parent index '{}' while flattening '{}'",
+                    parent_path, path
+                )
+            })?;
+            next = parent.parent_path.clone();
+            chain.push(parent);
+        }
+
+        let mut flat = ChunkIndex::new(index.disk_size());
+        for i in 0..index.num_chunks() {
+            let mut resolved = index.get_hash(i).unwrap_or(ZERO_CHUNK_HASH);
+            if resolved == ZERO_CHUNK_HASH {
+                for parent in &chain {
+                    let ph = parent.get_hash(i).unwrap_or(ZERO_CHUNK_HASH);
+                    if ph != ZERO_CHUNK_HASH {
+                        resolved = ph;
+                        break;
+                    }
+                }
+            }
+            if resolved != ZERO_CHUNK_HASH {
+                flat.set_hash(i, resolved.to_string());
+            }
+        }
+
+        // Depth-1: no parent. Preserve the deepest fallback so never-written chunks
+        // still resolve through the immutable base image.
+        flat.parent_path = None;
+        flat.fallback_path = index
+            .fallback_path
+            .clone()
+            .or_else(|| chain.iter().find_map(|p| p.fallback_path.clone()));
+        Ok(flat)
+    }
 }
 
 /// CAS-backed storage backend for the NBD server.
@@ -741,6 +797,59 @@ mod tests {
         assert_eq!(chunk1_before, chunk1_after);
         assert_eq!(&chunk0_after, &[0xAAu8; 8]);
         assert_eq!(&chunk1_after, data_b);
+    }
+
+    #[test]
+    fn test_flatten_chain_resolves_from_disk_without_a_backend() {
+        let tmp = tempfile::tempdir().unwrap();
+        let base = tmp.path().join("base.ext4");
+        std::fs::write(&base, b"base").unwrap();
+
+        // Parent owns chunk 0; child chains onto it and owns chunk 1.
+        let parent_path = tmp.path().join("parent.idx");
+        let mut parent = ChunkIndex::new(256 * 1024); // 4 chunks
+        parent.fallback_path = Some(base.to_string_lossy().to_string());
+        parent.set_hash(0, "hash-zero".to_string());
+        parent.save(parent_path.to_str().unwrap()).unwrap();
+
+        let child_path = tmp.path().join("child.idx");
+        let mut child = ChunkIndex::new(256 * 1024);
+        child.parent_path = Some(parent_path.to_str().unwrap().to_string());
+        child.fallback_path = Some(base.to_string_lossy().to_string());
+        child.set_hash(1, "hash-one".to_string());
+        child.save(child_path.to_str().unwrap()).unwrap();
+
+        let flat = ChunkIndex::flatten_chain(child_path.to_str().unwrap()).unwrap();
+        // Depth-1, self-contained, with both levels' chunks resolved in place.
+        assert!(flat.parent_path.is_none());
+        assert_eq!(flat.get_hash(0), Some("hash-zero"));
+        assert_eq!(flat.get_hash(1), Some("hash-one"));
+        // ZERO chunks stay ZERO and continue to resolve through the preserved fallback.
+        assert_eq!(flat.get_hash(2), Some(ZERO_CHUNK_HASH));
+        assert_eq!(flat.fallback_path.as_deref(), base.to_str());
+    }
+
+    #[test]
+    fn test_flatten_chain_errors_on_a_missing_parent() {
+        let tmp = tempfile::tempdir().unwrap();
+        let child_path = tmp.path().join("child.idx");
+        let mut child = ChunkIndex::new(256 * 1024);
+        child.parent_path = Some(
+            tmp.path()
+                .join("gone.idx")
+                .to_string_lossy()
+                .to_string(),
+        );
+        child.save(child_path.to_str().unwrap()).unwrap();
+
+        match ChunkIndex::flatten_chain(child_path.to_str().unwrap()) {
+            Ok(_) => panic!("missing parent must be a hard error, not a silent flatten"),
+            Err(e) => assert!(
+                e.to_string().contains("parent"),
+                "missing parent must be a hard error; got: {}",
+                e
+            ),
+        }
     }
 
     #[test]

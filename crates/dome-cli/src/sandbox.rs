@@ -20,6 +20,7 @@ pub(crate) fn run_sandbox(
     name_arg: Option<String>,
     vm_args: &VmArgs,
     command: Vec<String>,
+    from: Option<&str>,
 ) -> Result<i32> {
     reject_direct_storage()?;
 
@@ -46,12 +47,33 @@ pub(crate) fn run_sandbox(
     // silent ephemeral fork that never saves back. A lock left by a crashed owner is
     // reclaimed automatically via a process-liveness check.
     let acquired = lock::acquire(&lock_path)?;
+    let is_owner = matches!(acquired, Lock::Owner(_));
 
     let existed = Path::new(&index_path).exists();
-    // A new sandbox pins to the currently installed OS version; an existing one stays
+    // `--from` is a creation-time seed: honored only when we own persistence and the
+    // sandbox is absent. If it already exists, or a live session is already
+    // creating/using it (we are a fork), seeding would clobber or race it — a hard
+    // error, never a silent miss.
+    let seed = match gate_from(from, existed, is_owner) {
+        FromGate::NoSeed => None,
+        FromGate::Seed(s) => Some(s),
+        FromGate::Refused(reason) => return Err(collision_error(&name, reason, true)),
+    };
+
+    // Only the persistence owner may create or seed the index. A concurrent fork never
+    // writes it (its changes are discarded), so it just boots from the current state.
+    if is_owner {
+        if let Some(seed_name) = seed {
+            let seed_idx = resolve_seed_index(seed_name, &data_dir)?;
+            seed_sandbox_index(&seed_idx, &index_path)?;
+        }
+    }
+
+    // A freshly created (or seeded) sandbox now has an index; an existing one stays
     // pinned to the immutable base recorded in its index, regardless of any later
     // upgrade — so an OS upgrade never silently rebases (and corrupts) it.
-    let base_path = if existed {
+    let now_exists = Path::new(&index_path).exists();
+    let base_path = if now_exists {
         pinned_base_for_existing(&index_path)?
     } else {
         ensure_current_base(&data_dir, vm_args)?
@@ -67,6 +89,8 @@ pub(crate) fn run_sandbox(
         Lock::Owner(guard) => {
             if existed {
                 eprintln!("dome: resuming sandbox '{}'", name);
+            } else if let Some(seed_name) = seed {
+                eprintln!("dome: creating sandbox '{}' from '{}'", name, seed_name);
             } else {
                 eprintln!("dome: creating sandbox '{}'", name);
             }
@@ -89,6 +113,174 @@ pub(crate) fn run_sandbox(
             run_session(&prepared, &command, &SaveTarget::None)
         }
     }
+}
+
+/// Entry point for `dome sandbox create`: materialize a sandbox's index without
+/// booting a VM. With `--from`, the index is seeded from a checkpoint or another
+/// sandbox; without it, a fresh index pinned to the current OS base is written. An
+/// existing sandbox is never overwritten — `create` always hard-errors on collision.
+pub(crate) fn create_sandbox(
+    name_arg: Option<String>,
+    vm_args: &VmArgs,
+    from: Option<&str>,
+) -> Result<()> {
+    reject_direct_storage()?;
+
+    let cfg = load_config(vm_args.config.as_deref())?;
+    let cwd = std::env::current_dir()?;
+    let name = resolve_name(name_arg.as_deref(), &cfg, &cwd)?;
+    dome_vm::validate_checkpoint_name(&name).map_err(|e| anyhow::anyhow!(e))?;
+
+    let data_dir = dome_vm::default_data_dir();
+    let index_path = format!("{}/sandboxes/{}.idx", data_dir, name);
+    let lock_path = PathBuf::from(format!("{}/sandboxes/{}.lock", data_dir, name));
+
+    // Materializing the index is a persistence write, so take the persistence lock —
+    // the same one-writer rule `shell`/`run` follow. A fork outcome means a live
+    // session already owns this name (it may be lazily creating the index right now):
+    // refuse rather than race its save and silently lose one of the two writes. The
+    // guard is held until this function returns and released on any exit path, so a
+    // freshly created sandbox is left idle (unlocked), not wedged.
+    let _guard = match lock::acquire(&lock_path)? {
+        Lock::Owner(g) => g,
+        Lock::Fork => return Err(collision_error(&name, Collision::InUse, from.is_some())),
+    };
+
+    if Path::new(&index_path).exists() {
+        // `create` never resumes — an on-disk index is a hard collision.
+        return Err(collision_error(&name, Collision::Exists, from.is_some()));
+    }
+
+    match from {
+        Some(seed_name) => {
+            let seed_idx = resolve_seed_index(seed_name, &data_dir)?;
+            seed_sandbox_index(&seed_idx, &index_path)?;
+            eprintln!("dome: created sandbox '{}' from '{}'", name, seed_name);
+        }
+        None => {
+            let base_path = ensure_current_base(&data_dir, vm_args)?;
+            let disk_size_mb = vm::resolve_session(vm_args.disk_size, cfg.disk_size, 4096);
+            materialize_from_base(&index_path, &base_path, disk_size_mb)?;
+            eprintln!("dome: created sandbox '{}'", name);
+        }
+    }
+    Ok(())
+}
+
+/// Why a sandbox cannot be created or seeded right now. The two states are kept
+/// distinct because they have different remedies, but both are reported through
+/// [`collision_error`] so every command phrases them identically.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Collision {
+    /// A persisted index is already on disk. Remedy: `dome sandbox rm`, then recreate.
+    Exists,
+    /// A live session owns persistence for this name (it may be lazily creating the
+    /// index right now). Remedy: wait for that session to finish, then retry.
+    InUse,
+}
+
+/// The outcome of gating `--from` for a session: a no-op, a seed to materialize from,
+/// or a refusal carrying the reason. Pure (no name, no message) so the decision can be
+/// tested in isolation; the caller attaches the sandbox name via [`collision_error`].
+#[derive(Debug, PartialEq, Eq)]
+enum FromGate<'a> {
+    /// No `--from` was given.
+    NoSeed,
+    /// Materialize the new sandbox from this seed name.
+    Seed(&'a str),
+    /// `--from` cannot be honored; report it with this reason.
+    Refused(Collision),
+}
+
+/// Build the canonical collision error for a sandbox, shared by every command so the
+/// phrasing, the included name, and the remedy are identical everywhere. When `--from`
+/// was involved, a clause clarifying what `--from` does is appended uniformly.
+fn collision_error(name: &str, reason: Collision, had_from: bool) -> anyhow::Error {
+    let (state, remedy) = match reason {
+        Collision::Exists => (
+            "already exists",
+            format!("Remove it first with `dome sandbox rm {name}` to recreate it."),
+        ),
+        Collision::InUse => (
+            "is currently in use by another session",
+            "Wait for it to finish, then try again.".to_string(),
+        ),
+    };
+    let from_clause = if had_from {
+        " --from only seeds a brand-new sandbox; it will not re-seed, clobber, or race \
+         an existing or in-use one."
+    } else {
+        ""
+    };
+    anyhow::anyhow!("sandbox '{name}' {state}.{from_clause} {remedy}")
+}
+
+/// Decide what `--from` means for this session, given whether the named sandbox's
+/// index already exists and whether this session owns persistence (vs. running as a
+/// fork). `--from` is a *creation-time* seed honored ONLY by the persistence owner of
+/// a not-yet-existing sandbox. Re-seeding an existing sandbox — or a sandbox a live
+/// session is already creating/using (we are a fork) — would clobber or race it, so
+/// both are refused rather than silently missed.
+fn gate_from(from: Option<&str>, sandbox_exists: bool, is_owner: bool) -> FromGate<'_> {
+    match from {
+        None => FromGate::NoSeed,
+        Some(_) if sandbox_exists => FromGate::Refused(Collision::Exists),
+        Some(_) if !is_owner => FromGate::Refused(Collision::InUse),
+        Some(seed) => FromGate::Seed(seed),
+    }
+}
+
+/// Resolve a `--from` seed name to the CAS index it should be materialized from.
+/// A seed may be a checkpoint or another sandbox; checkpoints are checked first
+/// (mirroring how `--from` resolves for `dome run`/`checkpoint create`), then
+/// sandboxes. Errors clearly when neither exists rather than silently falling back
+/// to the base image. Legacy `.ext4` checkpoints have no index to seed from and are
+/// not a valid CAS seed source.
+fn resolve_seed_index(seed: &str, data_dir: &str) -> Result<String> {
+    dome_vm::validate_checkpoint_name(seed).map_err(|e| anyhow::anyhow!(e))?;
+    let candidates = [
+        format!("{}/checkpoints/{}.idx", data_dir, seed),
+        format!("{}/sandboxes/{}.idx", data_dir, seed),
+    ];
+    for candidate in &candidates {
+        if Path::new(candidate).exists() {
+            return Ok(candidate.clone());
+        }
+    }
+    bail!(
+        "seed '{}' not found: no checkpoint or sandbox index exists to seed from \
+         (looked in checkpoints/ and sandboxes/). Persistent sandboxes require a CAS \
+         index, so legacy .ext4 checkpoints cannot be used as a seed.",
+        seed
+    )
+}
+
+/// Write a fresh, depth-1 sandbox index pinned to `base_path`, without booting a VM.
+/// Every chunk starts ZERO and resolves through the base — exactly the disk state a
+/// first boot-from-base would observe before any write — so a later `shell`/`run`
+/// resumes it correctly. The index is written atomically (temp + rename).
+fn materialize_from_base(index_path: &str, base_path: &str, disk_size_mb: u64) -> Result<()> {
+    let mut idx = dome_store::ChunkIndex::new(disk_size_mb * 1024 * 1024);
+    idx.fallback_path = Some(base_path.to_string());
+    idx.save_atomic(index_path)?;
+    Ok(())
+}
+
+/// Seed a new sandbox index from the source's CAS index. Because chunks live in a
+/// single global deduplicated pool, copying only the (resolved) hash references hands
+/// the new sandbox the source's exact content for free — no chunk data is moved. The
+/// source's pinned base (`fallback_path`) is inherited, so a fork of an older-OS
+/// sandbox keeps resolving its never-written chunks through the base it was actually
+/// built on.
+///
+/// The source's parent chain is flattened into a self-contained, depth-1 index so the
+/// new sandbox never depends on the source's parent index files: removing the source
+/// (or its parents) later cannot silently corrupt the seeded sandbox, and its resume
+/// reads stay shallow. The source index is left untouched; the write is atomic.
+fn seed_sandbox_index(source_index: &str, dest_index: &str) -> Result<()> {
+    let flat = dome_store::ChunkIndex::flatten_chain(source_index)?;
+    flat.save_atomic(dest_index)?;
+    Ok(())
 }
 
 /// Persistence requires CAS — there is no index to save in direct mode.
@@ -285,6 +477,231 @@ mod tests {
             "error should name the unavailable base and not silently migrate; got: {}",
             msg
         );
+    }
+
+    #[test]
+    fn from_is_honored_when_sandbox_is_absent() {
+        // A brand-new sandbox we own: --from names the seed to materialize it from.
+        assert_eq!(
+            gate_from(Some("base-ckpt"), false, true),
+            FromGate::Seed("base-ckpt")
+        );
+    }
+
+    #[test]
+    fn no_from_is_a_no_op_regardless_of_existence_or_ownership() {
+        for &exists in &[false, true] {
+            for &owner in &[false, true] {
+                assert_eq!(
+                    gate_from(None, exists, owner),
+                    FromGate::NoSeed,
+                    "no --from must be a no-op (exists={}, owner={})",
+                    exists,
+                    owner
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn from_on_an_existing_sandbox_is_refused_as_exists() {
+        // Re-seeding a live sandbox would clobber it — must be refused, not silent,
+        // whether we'd own it or are a fork.
+        for &owner in &[false, true] {
+            assert_eq!(
+                gate_from(Some("base-ckpt"), true, owner),
+                FromGate::Refused(Collision::Exists),
+                "an on-disk index must refuse --from as Exists (owner={})",
+                owner
+            );
+        }
+    }
+
+    #[test]
+    fn from_on_a_forked_sandbox_is_refused_as_in_use() {
+        // A live session is already creating/using this name (we are a fork) and the
+        // index does not exist yet. `--from` must NOT be silently dropped (which would
+        // boot from base, ignoring the user's seed): it is refused as in-use.
+        assert_eq!(
+            gate_from(Some("base-ckpt"), false, false),
+            FromGate::Refused(Collision::InUse)
+        );
+    }
+
+    #[test]
+    fn collision_error_is_consistent_across_states_and_from() {
+        // Every collision reads as: sandbox '<name>' <state>. [<--from clause>] <remedy>.
+        // The name and a remedy are always present; the --from clause appears only when
+        // --from was involved; the two states stay distinguishable by their wording.
+        let exists = collision_error("web", Collision::Exists, false).to_string();
+        assert!(exists.contains("'web'") && exists.contains("already exists"));
+        assert!(exists.contains("dome sandbox rm web"), "missing remedy: {}", exists);
+        assert!(!exists.contains("--from"), "no --from clause expected: {}", exists);
+
+        let exists_from = collision_error("web", Collision::Exists, true).to_string();
+        assert!(exists_from.contains("already exists") && exists_from.contains("--from"));
+        assert!(exists_from.contains("dome sandbox rm web"));
+
+        let in_use = collision_error("web", Collision::InUse, false).to_string();
+        assert!(in_use.contains("'web'") && in_use.contains("in use"));
+        assert!(in_use.contains("Wait"), "missing remedy: {}", in_use);
+        assert!(!in_use.contains("--from"), "no --from clause expected: {}", in_use);
+
+        let in_use_from = collision_error("web", Collision::InUse, true).to_string();
+        assert!(in_use_from.contains("in use") && in_use_from.contains("--from"));
+    }
+
+    #[test]
+    fn seed_resolves_a_checkpoint_index() {
+        let tmp = tempfile::tempdir().unwrap();
+        let data_dir = tmp.path().to_str().unwrap();
+        let ckpt = format!("{}/checkpoints/base.idx", data_dir);
+        std::fs::create_dir_all(format!("{}/checkpoints", data_dir)).unwrap();
+        std::fs::write(&ckpt, b"idx").unwrap();
+
+        let resolved = resolve_seed_index("base", data_dir).unwrap();
+        assert_eq!(resolved, ckpt);
+    }
+
+    #[test]
+    fn seed_resolves_a_sandbox_index() {
+        let tmp = tempfile::tempdir().unwrap();
+        let data_dir = tmp.path().to_str().unwrap();
+        let other = format!("{}/sandboxes/other.idx", data_dir);
+        std::fs::create_dir_all(format!("{}/sandboxes", data_dir)).unwrap();
+        std::fs::write(&other, b"idx").unwrap();
+
+        let resolved = resolve_seed_index("other", data_dir).unwrap();
+        assert_eq!(resolved, other);
+    }
+
+    #[test]
+    fn seed_that_does_not_exist_errors_clearly() {
+        let tmp = tempfile::tempdir().unwrap();
+        let data_dir = tmp.path().to_str().unwrap();
+        let err = resolve_seed_index("ghost", data_dir).unwrap_err();
+        let msg = err.to_string();
+        assert!(
+            msg.contains("ghost"),
+            "error should name the missing seed; got: {}",
+            msg
+        );
+    }
+
+    #[test]
+    fn materialize_from_base_writes_a_fresh_pinned_index() {
+        let tmp = tempfile::tempdir().unwrap();
+        let base = tmp.path().join("rootfs-1.0.0.ext4");
+        std::fs::write(&base, vec![0u8; 1024]).unwrap();
+        let idx_path = tmp.path().join("nested/sb.idx");
+
+        materialize_from_base(idx_path.to_str().unwrap(), base.to_str().unwrap(), 64).unwrap();
+
+        let idx = dome_store::ChunkIndex::load(idx_path.to_str().unwrap()).unwrap();
+        // Pinned to the base it was created on, with the requested disk size.
+        assert_eq!(idx.fallback_path.as_deref(), Some(base.to_str().unwrap()));
+        assert_eq!(idx.disk_size(), 64 * 1024 * 1024);
+        // Depth-1: a freshly materialized sandbox has no parent chain.
+        assert!(idx.parent_path.is_none());
+        // Nothing written yet: every chunk resolves through the base (all ZERO).
+        let non_zero = (0..idx.num_chunks())
+            .filter(|&i| idx.get_hash(i).map(|h| h != "ZERO").unwrap_or(false))
+            .count();
+        assert_eq!(non_zero, 0);
+    }
+
+    #[test]
+    fn seeding_inherits_the_source_content_and_pinned_base() {
+        let tmp = tempfile::tempdir().unwrap();
+        let base = tmp.path().join("rootfs-1.0.0.ext4");
+        std::fs::write(&base, vec![0u8; 1024]).unwrap();
+
+        // A seed index pinned to `base` with one written (non-ZERO) chunk.
+        let seed_path = tmp.path().join("seed.idx");
+        let mut seed = dome_store::ChunkIndex::new(64 * 1024 * 1024);
+        seed.fallback_path = Some(base.to_string_lossy().to_string());
+        seed.set_hash(2, "deadbeef".to_string());
+        seed.save(seed_path.to_str().unwrap()).unwrap();
+
+        // Seeding a new sandbox from it.
+        let dst = tmp.path().join("nested/sb.idx");
+        seed_sandbox_index(seed_path.to_str().unwrap(), dst.to_str().unwrap()).unwrap();
+
+        let copied = dome_store::ChunkIndex::load(dst.to_str().unwrap()).unwrap();
+        // Same content (chunk references), same disk size, same pinned base.
+        assert_eq!(copied.get_hash(2), Some("deadbeef"));
+        assert_eq!(copied.disk_size(), seed.disk_size());
+        assert_eq!(copied.fallback_path.as_deref(), base.to_str());
+        // The original seed is untouched.
+        assert!(seed_path.exists());
+    }
+
+    #[test]
+    fn seeding_flattens_a_chained_source_into_a_self_contained_index() {
+        // Seeding from a *chained* checkpoint (created with `--from`) must not leave the
+        // sandbox depending on the source's parent files: that dependency would silently
+        // corrupt reads if the source were removed before the sandbox's first save.
+        let tmp = tempfile::tempdir().unwrap();
+        let base = tmp.path().join("rootfs-1.0.0.ext4");
+        std::fs::write(&base, vec![0u8; 1024]).unwrap();
+
+        // A parent checkpoint (one written chunk), pinned to the base.
+        let parent_path = tmp.path().join("parent.idx");
+        let mut parent = dome_store::ChunkIndex::new(64 * 1024 * 1024);
+        parent.fallback_path = Some(base.to_string_lossy().to_string());
+        parent.set_hash(1, "parentchunk".to_string());
+        parent.save(parent_path.to_str().unwrap()).unwrap();
+
+        // A child checkpoint chained onto it, adding its own chunk.
+        let child_path = tmp.path().join("child.idx");
+        let mut child = dome_store::ChunkIndex::new(64 * 1024 * 1024);
+        child.parent_path = Some(parent_path.to_string_lossy().to_string());
+        child.fallback_path = Some(base.to_string_lossy().to_string());
+        child.set_hash(2, "childchunk".to_string());
+        child.save(child_path.to_str().unwrap()).unwrap();
+
+        let dst = tmp.path().join("nested/sb.idx");
+        seed_sandbox_index(child_path.to_str().unwrap(), dst.to_str().unwrap()).unwrap();
+
+        // Remove the entire source chain: the seeded sandbox must remain intact.
+        std::fs::remove_file(&child_path).unwrap();
+        std::fs::remove_file(&parent_path).unwrap();
+
+        let copied = dome_store::ChunkIndex::load(dst.to_str().unwrap()).unwrap();
+        // Depth-1: no surviving parent dependency.
+        assert!(copied.parent_path.is_none());
+        // Both the child's own chunk and the inherited parent chunk resolve in place.
+        assert_eq!(copied.get_hash(2), Some("childchunk"));
+        assert_eq!(copied.get_hash(1), Some("parentchunk"));
+        // Pinned base preserved.
+        assert_eq!(copied.fallback_path.as_deref(), base.to_str());
+    }
+
+    #[test]
+    fn seeding_from_a_corrupt_chain_errors_rather_than_silently_dropping_content() {
+        // A source whose parent link is missing is corrupt; seeding must hard-error
+        // instead of silently producing an index that resolves through the base.
+        let tmp = tempfile::tempdir().unwrap();
+        let child_path = tmp.path().join("child.idx");
+        let mut child = dome_store::ChunkIndex::new(64 * 1024 * 1024);
+        child.parent_path = Some(
+            tmp.path()
+                .join("vanished-parent.idx")
+                .to_string_lossy()
+                .to_string(),
+        );
+        child.set_hash(2, "childchunk".to_string());
+        child.save(child_path.to_str().unwrap()).unwrap();
+
+        let dst = tmp.path().join("sb.idx");
+        let err = seed_sandbox_index(child_path.to_str().unwrap(), dst.to_str().unwrap())
+            .unwrap_err();
+        assert!(
+            err.to_string().contains("parent"),
+            "error should name the missing parent; got: {}",
+            err
+        );
+        assert!(!dst.exists(), "a failed seed must not leave an index behind");
     }
 
     #[test]

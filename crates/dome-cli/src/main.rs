@@ -135,13 +135,21 @@ fn main() -> Result<()> {
             }
         },
         Commands::Sandbox { action } => match action {
-            SandboxCommands::Shell { name, vm } => {
-                let exit_code = sandbox::run_sandbox(name, &vm, Vec::new())?;
+            SandboxCommands::Shell { name, vm, from } => {
+                let exit_code = sandbox::run_sandbox(name, &vm, Vec::new(), from.as_deref())?;
                 process::exit(exit_code);
             }
-            SandboxCommands::Run { name, vm, command } => {
-                let exit_code = sandbox::run_sandbox(name, &vm, command)?;
+            SandboxCommands::Run {
+                name,
+                vm,
+                from,
+                command,
+            } => {
+                let exit_code = sandbox::run_sandbox(name, &vm, command, from.as_deref())?;
                 process::exit(exit_code);
+            }
+            SandboxCommands::Create { name, vm, from } => {
+                sandbox::create_sandbox(name, &vm, from.as_deref())?;
             }
         },
     }
