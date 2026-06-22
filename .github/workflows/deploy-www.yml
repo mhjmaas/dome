@@ -1,11 +1,12 @@
 name: Deploy Website
 
 on:
-  push:
-    branches: [main]
-    paths:
-      - "www/**"
-      - "install.sh"
+  # Temporarily disabled — re-enable by uncommenting the push trigger below.
+  # push:
+  #   branches: [main]
+  #   paths:
+  #     - "www/**"
+  #     - "install.sh"
   workflow_dispatch:
 
 permissions:

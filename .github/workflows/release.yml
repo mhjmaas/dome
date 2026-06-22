@@ -1,9 +1,11 @@
 name: Release
 
 on:
-  push:
-    tags:
-      - "v*"
+  # Temporarily disabled — re-enable by uncommenting the tag trigger below.
+  # push:
+  #   tags:
+  #     - "v*"
+  workflow_dispatch:
 
 permissions:
   contents: write

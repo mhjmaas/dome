@@ -6,6 +6,7 @@ on:
 jobs:
   publish:
     name: Publish to npm
+    if: ${{ false }} # Temporarily disabled — remove this line to re-enable.
     runs-on: ubuntu-latest
     permissions:
       id-token: write
