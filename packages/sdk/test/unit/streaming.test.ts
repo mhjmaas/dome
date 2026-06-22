@@ -3,13 +3,13 @@ import { resolve } from "node:path";
 import { Sandbox } from "../../src/sandbox";
 import type { FileChangeEvent } from "../../src/types";
 
-const MOCK_BIN = `bun ${resolve(import.meta.dir, "mock-shuru.ts")}`;
+const MOCK_BIN = `bun ${resolve(import.meta.dir, "mock-dome.ts")}`;
 
 describe("spawn", () => {
 	let sb: Sandbox;
 
 	beforeAll(async () => {
-		sb = await Sandbox.start({ shuruBin: MOCK_BIN });
+		sb = await Sandbox.start({ domeBin: MOCK_BIN });
 	}, 10_000);
 
 	afterAll(async () => {
@@ -83,7 +83,7 @@ describe("kill", () => {
 	let sb: Sandbox;
 
 	beforeAll(async () => {
-		sb = await Sandbox.start({ shuruBin: MOCK_BIN });
+		sb = await Sandbox.start({ domeBin: MOCK_BIN });
 	}, 10_000);
 
 	afterAll(async () => {
@@ -112,7 +112,7 @@ describe("watch", () => {
 	let sb: Sandbox;
 
 	beforeAll(async () => {
-		sb = await Sandbox.start({ shuruBin: MOCK_BIN });
+		sb = await Sandbox.start({ domeBin: MOCK_BIN });
 	}, 10_000);
 
 	afterAll(async () => {
@@ -176,7 +176,7 @@ describe("exec still works", () => {
 	let sb: Sandbox;
 
 	beforeAll(async () => {
-		sb = await Sandbox.start({ shuruBin: MOCK_BIN });
+		sb = await Sandbox.start({ domeBin: MOCK_BIN });
 	}, 10_000);
 
 	afterAll(async () => {
@@ -194,7 +194,7 @@ describe("multiple concurrent spawns", () => {
 	let sb: Sandbox;
 
 	beforeAll(async () => {
-		sb = await Sandbox.start({ shuruBin: MOCK_BIN });
+		sb = await Sandbox.start({ domeBin: MOCK_BIN });
 	}, 10_000);
 
 	afterAll(async () => {

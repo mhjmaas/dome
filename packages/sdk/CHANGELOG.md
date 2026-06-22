@@ -4,7 +4,7 @@
 
 ### Added
 
-- `exposeHost` option in `StartOptions` for forwarding host ports to the guest via `host.shuru.internal`. Format: `"HOST:GUEST"` or `"PORT"`.
+- `exposeHost` option in `StartOptions` for forwarding host ports to the guest via `host.dome.internal`. Format: `"HOST:GUEST"` or `"PORT"`.
 
 ## 0.4.0 (2026-03-13)
 
@@ -54,7 +54,7 @@ These are native protocol operations over vsock, not wrappers over shell command
 
 ### Changed
 
-- Internal `ShuruProcess` now dispatches JSON-RPC notifications (`output`, `exit`, `file_change`) to registered handlers, enabling multiplexed streaming from multiple processes.
+- Internal `DomeProcess` now dispatches JSON-RPC notifications (`output`, `exit`, `file_change`) to registered handlers, enabling multiplexed streaming from multiple processes.
 
 ## 0.2.0
 

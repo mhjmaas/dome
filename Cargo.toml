@@ -1,27 +1,27 @@
 [workspace]
 resolver = "2"
 members = [
-    "crates/shuru-cli",
-    "crates/shuru-darwin",
-    "crates/shuru-linux",
-    "crates/shuru-proto",
-    "crates/shuru-proxy",
-    "crates/shuru-sdk",
-    "crates/shuru-vm",
-    "crates/shuru-store",
-    "crates/shuru-guest",
+    "crates/dome-cli",
+    "crates/dome-darwin",
+    "crates/dome-linux",
+    "crates/dome-proto",
+    "crates/dome-proxy",
+    "crates/dome-sdk",
+    "crates/dome-vm",
+    "crates/dome-store",
+    "crates/dome-guest",
 ]
-# shuru-darwin and shuru-linux are platform-specific — only pulled in
-# transitively via shuru-vm's cfg'd deps. Excluded from default builds
+# dome-darwin and dome-linux are platform-specific — only pulled in
+# transitively via dome-vm's cfg'd deps. Excluded from default builds
 # so `cargo check` doesn't fail on the wrong OS.
 default-members = [
-    "crates/shuru-cli",
-    "crates/shuru-proto",
-    "crates/shuru-proxy",
-    "crates/shuru-sdk",
-    "crates/shuru-vm",
-    "crates/shuru-store",
-    "crates/shuru-guest",
+    "crates/dome-cli",
+    "crates/dome-proto",
+    "crates/dome-proxy",
+    "crates/dome-sdk",
+    "crates/dome-vm",
+    "crates/dome-store",
+    "crates/dome-guest",
 ]
 
 [profile.release]

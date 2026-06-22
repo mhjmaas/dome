@@ -1,10 +1,10 @@
 /**
- * Integration tests that run against the real shuru binary + VM.
+ * Integration tests that run against the real dome binary + VM.
  *
  * Prerequisites:
- *   1. cargo build -p shuru-cli
- *   2. codesign --entitlements shuru.entitlements --force -s - target/debug/shuru
- *   3. shuru init
+ *   1. cargo build -p dome-cli
+ *   2. codesign --entitlements dome.entitlements --force -s - target/debug/dome
+ *   3. dome init
  *
  * Run: bun test test/integration/
  */
@@ -15,15 +15,15 @@ import { resolve } from "node:path";
 import { Sandbox } from "../../src/sandbox";
 
 const REPO_ROOT = resolve(import.meta.dir, "../../../..");
-const SHURU_BIN = resolve(REPO_ROOT, "target/debug/shuru");
+const DOME_BIN = resolve(REPO_ROOT, "target/debug/dome");
 
-const canRun = existsSync(SHURU_BIN);
+const canRun = existsSync(DOME_BIN);
 
 describe.if(canRun)("sandbox lifecycle", () => {
 	let sb: Sandbox;
 
 	beforeAll(async () => {
-		sb = await Sandbox.start({ shuruBin: SHURU_BIN });
+		sb = await Sandbox.start({ domeBin: DOME_BIN });
 	}, 60_000);
 
 	afterAll(async () => {
@@ -65,7 +65,7 @@ describe.if(canRun)("sandbox lifecycle", () => {
 	test("checkpoint creates disk snapshot", async () => {
 		const cpPath = resolve(
 			process.env.HOME ?? "/tmp",
-			".local/share/shuru/checkpoints/sdk-integration-test.ext4",
+			".local/share/dome/checkpoints/sdk-integration-test.ext4",
 		);
 
 		try {
@@ -87,9 +87,9 @@ describe.if(canRun)("sandbox lifecycle", () => {
 });
 
 describe.if(!canRun)("sandbox lifecycle (skipped)", () => {
-	test("shuru binary not found", () => {
+	test("dome binary not found", () => {
 		console.log(
-			"Build with: cargo build -p shuru-cli && codesign --entitlements shuru.entitlements --force -s - target/debug/shuru",
+			"Build with: cargo build -p dome-cli && codesign --entitlements dome.entitlements --force -s - target/debug/dome",
 		);
 	});
 });

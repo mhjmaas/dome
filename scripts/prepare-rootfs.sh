@@ -2,14 +2,14 @@
 set -euo pipefail
 
 DEBIAN_RELEASE="trixie"
-DATA_DIR="${HOME}/.local/share/shuru"
+DATA_DIR="${HOME}/.local/share/dome"
 ROOTFS_IMG="${DATA_DIR}/rootfs.ext4"
 KERNEL_PATH="${DATA_DIR}/Image"
 INITRAMFS_PATH="${DATA_DIR}/initramfs.cpio.gz"
-GUEST_BINARY="target/aarch64-unknown-linux-musl/release/shuru-guest"
+GUEST_BINARY="target/aarch64-unknown-linux-musl/release/dome-guest"
 ROOTFS_SIZE_MB=1024
 
-echo "==> Shuru rootfs preparation script"
+echo "==> Dome rootfs preparation script"
 echo "    Debian ${DEBIAN_RELEASE} (kernel + rootfs)"
 echo ""
 
@@ -23,7 +23,7 @@ fi
 
 if [ ! -f "$GUEST_BINARY" ]; then
     echo "ERROR: Guest binary not found at ${GUEST_BINARY}"
-    echo "       Run: cargo build -p shuru-guest --target aarch64-unknown-linux-musl --release"
+    echo "       Run: cargo build -p dome-guest --target aarch64-unknown-linux-musl --release"
     exit 1
 fi
 
@@ -44,7 +44,7 @@ if [ ! -f "$INITRAMFS_PATH" ]; then
     docker run --rm \
         --platform linux/arm64/v8 \
         -v "${DATA_DIR}:/output" \
-        -v "${GUEST_BINARY}:/tmp/shuru-init:ro" \
+        -v "${GUEST_BINARY}:/tmp/dome-init:ro" \
         debian:${DEBIAN_RELEASE}-slim /bin/sh -c '
             set -e
             apt-get update -qq > /dev/null 2>&1
@@ -62,8 +62,8 @@ if [ ! -f "$INITRAMFS_PATH" ]; then
             lddtree -l /sbin/e2fsck /usr/sbin/resize2fs | sort -u \
                 | cpio --quiet -pmdL /initramfs
 
-            cp /tmp/shuru-init /initramfs/bin/shuru-init
-            chmod 755 /initramfs/bin/shuru-init
+            cp /tmp/dome-init /initramfs/bin/dome-init
+            chmod 755 /initramfs/bin/dome-init
 
             cat > /initramfs/init << '\''INITEOF'\''
 #!/bin/sh
@@ -72,15 +72,15 @@ mount -t devtmpfs none /dev
 /sbin/e2fsck -p /dev/vda > /dev/null 2>&1 || true
 /usr/sbin/resize2fs /dev/vda > /dev/null 2>&1 || true
 mount -t ext4 /dev/vda /newroot
-cp /bin/shuru-init /newroot/usr/bin/shuru-init
-chmod 755 /newroot/usr/bin/shuru-init
+cp /bin/dome-init /newroot/usr/bin/dome-init
+chmod 755 /newroot/usr/bin/dome-init
 if ifconfig eth0 up 2>/dev/null; then
     ifconfig eth0 10.0.0.2 netmask 255.255.255.0 up
     route add default gw 10.0.0.1
     echo "nameserver 10.0.0.1" > /newroot/etc/resolv.conf
 fi
 umount /proc
-exec switch_root /newroot /usr/bin/shuru-init
+exec switch_root /newroot /usr/bin/dome-init
 INITEOF
             chmod 755 /initramfs/init
 
@@ -109,7 +109,7 @@ if [[ "$(uname)" == "Darwin" ]]; then
         --platform linux/arm64/v8 \
         -e DEBIAN_RELEASE="${DEBIAN_RELEASE}" \
         -v "${ROOTFS_IMG}:/rootfs.ext4" \
-        -v "${GUEST_BINARY}:/tmp/shuru-guest:ro" \
+        -v "${GUEST_BINARY}:/tmp/dome-guest:ro" \
         debian:${DEBIAN_RELEASE}-slim /bin/sh -c '
             set -e
             apt-get update -qq
@@ -142,11 +142,11 @@ DPKGEOF
             chroot /mnt/rootfs apt-get clean
             rm -rf /mnt/rootfs/var/lib/apt/lists/*
 
-            cp /tmp/shuru-guest /mnt/rootfs/usr/bin/shuru-init
-            chmod 755 /mnt/rootfs/usr/bin/shuru-init
+            cp /tmp/dome-guest /mnt/rootfs/usr/bin/dome-init
+            chmod 755 /mnt/rootfs/usr/bin/dome-init
 
             mkdir -p /mnt/rootfs/proc /mnt/rootfs/sys /mnt/rootfs/dev /mnt/rootfs/tmp /mnt/rootfs/run
-            echo "shuru" > /mnt/rootfs/etc/hostname
+            echo "dome" > /mnt/rootfs/etc/hostname
             echo "nameserver 8.8.8.8" > /mnt/rootfs/etc/resolv.conf
 
             umount /mnt/rootfs
@@ -187,11 +187,11 @@ DPKGEOF
     sudo chroot "$MOUNT_DIR" apt-get clean
     sudo rm -rf "${MOUNT_DIR}/var/lib/apt/lists/"*
 
-    sudo cp "$GUEST_BINARY" "${MOUNT_DIR}/usr/bin/shuru-init"
-    sudo chmod 755 "${MOUNT_DIR}/usr/bin/shuru-init"
+    sudo cp "$GUEST_BINARY" "${MOUNT_DIR}/usr/bin/dome-init"
+    sudo chmod 755 "${MOUNT_DIR}/usr/bin/dome-init"
 
     sudo mkdir -p "${MOUNT_DIR}/proc" "${MOUNT_DIR}/sys" "${MOUNT_DIR}/dev" "${MOUNT_DIR}/tmp" "${MOUNT_DIR}/run"
-    echo "shuru" | sudo tee "${MOUNT_DIR}/etc/hostname" > /dev/null
+    echo "dome" | sudo tee "${MOUNT_DIR}/etc/hostname" > /dev/null
     echo "nameserver 8.8.8.8" | sudo tee "${MOUNT_DIR}/etc/resolv.conf" > /dev/null
 
     sudo umount "$MOUNT_DIR"
@@ -205,5 +205,5 @@ echo "    Kernel:     ${KERNEL_PATH}"
 echo "    Initramfs:  ${INITRAMFS_PATH}"
 echo "    Rootfs:     ${ROOTFS_IMG}"
 echo ""
-echo "    To run:  cargo build -p shuru-cli && codesign --entitlements shuru.entitlements --force -s - target/debug/shuru"
-echo "             ./target/debug/shuru run -- echo hello"
+echo "    To run:  cargo build -p dome-cli && codesign --entitlements dome.entitlements --force -s - target/debug/dome"
+echo "             ./target/debug/dome run -- echo hello"

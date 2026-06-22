@@ -1,0 +1,17 @@
+[package]
+name = "dome-linux"
+version = "0.2.1"
+edition = "2021"
+description = "KVM backend for dome"
+license = "Apache-2.0"
+repository = "https://github.com/mhjmaas/dome"
+
+[dependencies]
+kvm-ioctls = "0.18"
+kvm-bindings = { version = "0.9", features = ["fam-wrappers"] }
+vm-memory = { version = "0.15", features = ["backend-mmap"] }
+linux-loader = { version = "0.12", features = ["pe"] }
+vm-fdt = "0.3"
+vmm-sys-util = "0.12"
+libc = "0.2"
+crossbeam-channel = "0.5"

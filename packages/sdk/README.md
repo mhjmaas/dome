@@ -1,17 +1,17 @@
-# @superhq/shuru
+# @superhq/dome
 
-TypeScript SDK for [shuru](https://github.com/superhq-ai/shuru) — programmatic access to ephemeral Linux microVMs on macOS.
+TypeScript SDK for [dome](https://github.com/mhjmaas/dome) — programmatic access to ephemeral Linux microVMs on macOS.
 
 ## Install
 
 ```sh
-bun add @superhq/shuru
+bun add @superhq/dome
 ```
 
 ## Usage
 
 ```ts
-import { Sandbox } from "@superhq/shuru";
+import { Sandbox } from "@superhq/dome";
 
 const sb = await Sandbox.start();
 
@@ -83,7 +83,7 @@ const sb = await Sandbox.start({
 | `mounts` | `Record<string, string>` | Directory mounts (`{ hostPath: guestPath }`) |
 | `secrets` | `Record<string, SecretConfig>` | Secrets to inject via proxy |
 | `network` | `NetworkConfig` | Network access policy |
-| `shuruBin` | `string` | Path to shuru binary (default: `"shuru"`) |
+| `domeBin` | `string` | Path to dome binary (default: `"dome"`) |
 
 ## API
 
@@ -237,5 +237,5 @@ const tests = await sb.exec("npm test");
 ## Requirements
 
 - macOS 14+ on Apple Silicon
-- [shuru CLI](https://github.com/superhq-ai/shuru) installed
+- [dome CLI](https://github.com/mhjmaas/dome) installed
 - Bun runtime

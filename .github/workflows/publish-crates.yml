@@ -19,7 +19,7 @@ jobs:
 
       - uses: Swatinem/rust-cache@v2
 
-      - name: Publish shuru-proto and shuru-darwin
+      - name: Publish dome-proto and dome-darwin
         run: |
           publish() {
             local crate=$1
@@ -36,8 +36,8 @@ jobs:
             fi
           }
 
-          publish shuru-proto
-          publish shuru-darwin
+          publish dome-proto
+          publish dome-darwin
 
   publish-linux:
     name: Publish Linux crate
@@ -51,7 +51,7 @@ jobs:
 
       - uses: Swatinem/rust-cache@v2
 
-      - name: Publish shuru-linux
+      - name: Publish dome-linux
         run: |
           publish() {
             local crate=$1
@@ -68,7 +68,7 @@ jobs:
             fi
           }
 
-          publish shuru-linux
+          publish dome-linux
 
   publish-cross:
     name: Publish cross-platform crates
@@ -82,7 +82,7 @@ jobs:
 
       - uses: Swatinem/rust-cache@v2
 
-      - name: Publish shuru-proxy, shuru-store, shuru-vm, shuru-sdk
+      - name: Publish dome-proxy, dome-store, dome-vm, dome-sdk
         run: |
           publish() {
             local crate=$1
@@ -99,7 +99,7 @@ jobs:
             fi
           }
 
-          publish shuru-proxy
-          publish shuru-store
-          publish shuru-vm
-          publish shuru-sdk
+          publish dome-proxy
+          publish dome-store
+          publish dome-vm
+          publish dome-sdk
