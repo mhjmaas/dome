@@ -123,6 +123,9 @@ impl ProxyEngine {
 }
 
 /// Handle a single proxied TCP connection.
+// The per-connection context (ids, channels, TLS config, policy) is genuinely wide;
+// bundling it into a struct would not make the plumbing clearer.
+#[allow(clippy::too_many_arguments)]
 async fn handle_connection(
     id: ConnectionId,
     dst: SocketAddr,
@@ -310,6 +313,8 @@ async fn blind_relay(
 }
 
 /// MITM: terminate TLS on both sides, relay HTTP/1.1 with secret substitution.
+// As with `handle_connection`, the per-connection context is inherently wide.
+#[allow(clippy::too_many_arguments)]
 async fn handle_mitm(
     id: ConnectionId,
     dst: SocketAddr,

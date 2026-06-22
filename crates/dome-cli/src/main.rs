@@ -2,6 +2,7 @@ mod assets;
 mod checkpoint;
 mod cli;
 mod config;
+mod gc;
 mod lock;
 mod sandbox;
 mod session;
@@ -84,35 +85,27 @@ fn main() -> Result<()> {
         }
         Commands::Prune => {
             let data_dir = default_data_dir();
-            let instances_dir = format!("{}/instances", data_dir);
-            let entries = match std::fs::read_dir(&instances_dir) {
-                Ok(entries) => entries,
-                Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
-                    eprintln!("dome: no orphaned instances found");
-                    return Ok(());
-                }
-                Err(e) => return Err(e.into()),
-            };
 
-            let mut removed = 0u32;
-            for entry in entries {
-                let entry = entry?;
-                let name = entry.file_name();
-                let Some(pid) = name.to_str().and_then(|s| s.parse::<i32>().ok()) else {
-                    continue;
-                };
-                // Check if the process is still running
-                let alive = unsafe { libc::kill(pid, 0) } == 0;
-                if !alive {
-                    std::fs::remove_dir_all(entry.path())?;
-                    removed += 1;
-                }
-            }
-
-            if removed == 0 {
+            // 1. Reclaim instance directories left by crashed ephemeral VMs.
+            let instances = gc::prune_instances(&data_dir)?;
+            if instances == 0 {
                 eprintln!("dome: no orphaned instances found");
             } else {
-                eprintln!("dome: removed {} orphaned instance(s)", removed);
+                eprintln!("dome: removed {} orphaned instance(s)", instances);
+            }
+
+            // 2. Mark-and-sweep the CAS store: reclaim chunks and superseded base images
+            // no live sandbox or checkpoint references (deferred from `sandbox rm`).
+            let stats = gc::sweep(&data_dir)?;
+            if stats.chunks_removed == 0 && stats.bases_removed == 0 {
+                eprintln!("dome: no unreferenced chunks or base images to reclaim");
+            } else {
+                eprintln!(
+                    "dome: reclaimed {} chunk(s) ({}) and {} base image(s)",
+                    stats.chunks_removed,
+                    gc::format_bytes(stats.bytes_removed),
+                    stats.bases_removed
+                );
             }
         }
         Commands::Checkpoint { action } => match action {
@@ -152,6 +145,9 @@ fn main() -> Result<()> {
                 sandbox::create_sandbox(name, &vm, from.as_deref())?;
             }
             SandboxCommands::Ls => sandbox::list_sandboxes()?,
+            SandboxCommands::Rm { name, config } => {
+                sandbox::remove_sandbox(name, config.as_deref())?;
+            }
         },
     }
 

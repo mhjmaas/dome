@@ -5,7 +5,7 @@
 
 use std::path::{Path, PathBuf};
 
-use anyhow::{bail, Result};
+use anyhow::{bail, Context, Result};
 
 use crate::assets;
 use crate::checkpoint;
@@ -281,6 +281,55 @@ fn materialize_from_base(index_path: &str, base_path: &str, disk_size_mb: u64) -
 fn seed_sandbox_index(source_index: &str, dest_index: &str) -> Result<()> {
     let flat = dome_store::ChunkIndex::flatten_chain(source_index)?;
     flat.save_atomic(dest_index)?;
+    Ok(())
+}
+
+/// Entry point for `dome sandbox rm`. Resolves the sandbox name the same way the rest
+/// of the command group does (explicit → `dome.json` → cwd slug) and unlinks its index.
+/// Chunk reclamation is deliberately deferred to `dome prune` (mark-and-sweep), so `rm`
+/// is fast and safe: it never walks or rewrites the shared chunk pool.
+pub(crate) fn remove_sandbox(name_arg: Option<String>, config_path: Option<&str>) -> Result<()> {
+    reject_direct_storage()?;
+    let cfg = load_config(config_path)?;
+    let cwd = std::env::current_dir()?;
+    let name = resolve_name(name_arg.as_deref(), &cfg, &cwd)?;
+    dome_vm::validate_checkpoint_name(&name).map_err(|e| anyhow::anyhow!(e))?;
+
+    let data_dir = dome_vm::default_data_dir();
+    delete_sandbox_index(&data_dir, &name)?;
+    eprintln!(
+        "dome: sandbox '{}' removed. Run `dome prune` to reclaim its disk space.",
+        name
+    );
+    Ok(())
+}
+
+/// Unlink a sandbox's index (and any lock left behind by a crashed session). Errors
+/// clearly if the sandbox does not exist, and refuses to remove one that is currently
+/// open by a live session — deleting a running sandbox's index would just be recreated
+/// by that session's save on exit, so it is rejected rather than silently lost.
+/// Chunks are intentionally left untouched; `dome prune` reclaims them later.
+fn delete_sandbox_index(data_dir: &str, name: &str) -> Result<()> {
+    let index_path = format!("{}/sandboxes/{}.idx", data_dir, name);
+    let lock_path = PathBuf::from(format!("{}/sandboxes/{}.lock", data_dir, name));
+
+    if !Path::new(&index_path).exists() {
+        bail!("sandbox '{}' not found", name);
+    }
+    if lock::is_held_live(&lock_path) {
+        bail!(
+            "sandbox '{}' is currently in use by another session. \
+             Close it first, then run `dome sandbox rm {}`.",
+            name,
+            name
+        );
+    }
+
+    std::fs::remove_file(&index_path)
+        .with_context(|| format!("failed to remove sandbox index '{}'", index_path))?;
+    // A lock can linger only if a previous owner crashed; clear it so a future sandbox
+    // reusing the name is not wedged. Best-effort: a missing lock is the normal case.
+    let _ = std::fs::remove_file(&lock_path);
     Ok(())
 }
 
@@ -951,6 +1000,85 @@ mod tests {
     }
 
     #[test]
+    fn rm_removes_the_sandbox_index() {
+        // `rm` unlinks the sandbox's index quickly — the externally observable effect
+        // is that the .idx file is gone afterward.
+        let tmp = tempfile::tempdir().unwrap();
+        let data_dir = tmp.path().to_str().unwrap();
+        let sb_dir = format!("{}/sandboxes", data_dir);
+        std::fs::create_dir_all(&sb_dir).unwrap();
+        let idx = format!("{}/web.idx", sb_dir);
+        dome_store::ChunkIndex::new(64 * 1024).save(&idx).unwrap();
+
+        delete_sandbox_index(data_dir, "web").unwrap();
+        assert!(!Path::new(&idx).exists(), "rm should unlink the index");
+    }
+
+    #[test]
+    fn rm_errors_clearly_when_the_sandbox_does_not_exist() {
+        // Removing a name with no index on disk is a clear error naming the sandbox,
+        // not a silent success.
+        let tmp = tempfile::tempdir().unwrap();
+        let data_dir = tmp.path().to_str().unwrap();
+        std::fs::create_dir_all(format!("{}/sandboxes", data_dir)).unwrap();
+
+        let err = delete_sandbox_index(data_dir, "ghost").unwrap_err();
+        assert!(
+            err.to_string().contains("ghost") && err.to_string().contains("not found"),
+            "error should name the missing sandbox; got: {}",
+            err
+        );
+    }
+
+    #[test]
+    fn rm_refuses_a_running_sandbox_and_leaves_its_index_intact() {
+        // A sandbox open by a live session must not be removed: its owner would just
+        // recreate the index on save, silently losing the rm. Refuse and keep the index.
+        let tmp = tempfile::tempdir().unwrap();
+        let data_dir = tmp.path().to_str().unwrap();
+        let sb_dir = format!("{}/sandboxes", data_dir);
+        std::fs::create_dir_all(&sb_dir).unwrap();
+        let idx = format!("{}/web.idx", sb_dir);
+        dome_store::ChunkIndex::new(64 * 1024).save(&idx).unwrap();
+        // A live lock recording our own (running) PID marks the sandbox as in use.
+        std::fs::write(
+            format!("{}/web.lock", sb_dir),
+            std::process::id().to_string(),
+        )
+        .unwrap();
+
+        let err = delete_sandbox_index(data_dir, "web").unwrap_err();
+        assert!(
+            err.to_string().contains("in use"),
+            "error should explain the sandbox is in use; got: {}",
+            err
+        );
+        assert!(
+            Path::new(&idx).exists(),
+            "a refused rm must leave the index intact"
+        );
+    }
+
+    #[test]
+    fn rm_clears_a_stale_lock_left_by_a_crashed_session() {
+        // A lock recording a dead PID is stale; rm should remove both the index and the
+        // stale lock so a future sandbox reusing the name is not wedged.
+        let tmp = tempfile::tempdir().unwrap();
+        let data_dir = tmp.path().to_str().unwrap();
+        let sb_dir = format!("{}/sandboxes", data_dir);
+        std::fs::create_dir_all(&sb_dir).unwrap();
+        let idx = format!("{}/web.idx", sb_dir);
+        let lock = format!("{}/web.lock", sb_dir);
+        dome_store::ChunkIndex::new(64 * 1024).save(&idx).unwrap();
+        // PID 0 is never a live process for the liveness check, so this lock is stale.
+        std::fs::write(&lock, "0").unwrap();
+
+        delete_sandbox_index(data_dir, "web").unwrap();
+        assert!(!Path::new(&idx).exists(), "index should be removed");
+        assert!(!Path::new(&lock).exists(), "stale lock should be cleared");
+    }
+
+    #[test]
     fn direct_storage_is_rejected() {
         // Guard against leaking env state across tests in the same process.
         let prev = std::env::var("DOME_STORAGE").ok();
@@ -970,6 +1098,45 @@ mod tests {
         assert!(reject_direct_storage().is_ok());
         if let Some(v) = prev {
             std::env::set_var("DOME_STORAGE", v);
+        }
+    }
+
+    #[test]
+    fn rm_when_sandboxes_dir_is_absent_errors_clearly() {
+        // `delete_sandbox_index` must produce a clear "not found" error even when the
+        // sandboxes/ directory itself has never been created — not a misleading
+        // permissions or I/O error.
+        let tmp = tempfile::tempdir().unwrap();
+        let data_dir = tmp.path().to_str().unwrap();
+        // No sandboxes/ subdir created — the directory does not exist at all.
+
+        let err = delete_sandbox_index(data_dir, "ghost").unwrap_err();
+        assert!(
+            err.to_string().contains("ghost") && err.to_string().contains("not found"),
+            "error should name the missing sandbox even when sandboxes/ is absent; got: {}",
+            err
+        );
+    }
+
+    #[test]
+    fn rm_rejects_direct_storage_with_a_clear_message() {
+        // `remove_sandbox` must call `reject_direct_storage()` first, so users running
+        // with DOME_STORAGE=direct get a clear explanation instead of a confusing
+        // "sandbox not found" error. Since the guard fires before any filesystem access
+        // it is safe to call `remove_sandbox` with an arbitrary name here.
+        let prev = std::env::var("DOME_STORAGE").ok();
+        std::env::set_var("DOME_STORAGE", "direct");
+
+        let err = remove_sandbox(Some("web".to_string()), None).unwrap_err();
+        assert!(
+            err.to_string().contains("DOME_STORAGE=direct"),
+            "remove_sandbox should explain direct-storage rejection; got: {}",
+            err
+        );
+
+        match prev {
+            Some(v) => std::env::set_var("DOME_STORAGE", v),
+            None => std::env::remove_var("DOME_STORAGE"),
         }
     }
 }
