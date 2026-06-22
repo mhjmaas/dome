@@ -129,6 +129,10 @@ pub(crate) enum SandboxCommands {
 
         #[command(flatten)]
         vm: VmArgs,
+
+        /// Seed a new sandbox from a checkpoint or another sandbox (only when creating it)
+        #[arg(long)]
+        from: Option<String>,
     },
 
     /// Run a command in a persistent sandbox (lazily created on first use)
@@ -139,9 +143,26 @@ pub(crate) enum SandboxCommands {
         #[command(flatten)]
         vm: VmArgs,
 
+        /// Seed a new sandbox from a checkpoint or another sandbox (only when creating it)
+        #[arg(long)]
+        from: Option<String>,
+
         /// Command and arguments to run inside the sandbox
         #[arg(trailing_var_arg = true, allow_hyphen_values = true)]
         command: Vec<String>,
+    },
+
+    /// Materialize a sandbox without running it (lazily created, optionally seeded)
+    Create {
+        /// Sandbox name (defaults to the `sandbox` field in dome.json, else a cwd slug)
+        name: Option<String>,
+
+        #[command(flatten)]
+        vm: VmArgs,
+
+        /// Seed the new sandbox from a checkpoint or another sandbox
+        #[arg(long)]
+        from: Option<String>,
     },
 }
 
