@@ -1,5 +1,6 @@
 #![forbid(unsafe_code)]
 
+pub mod client;
 mod sandbox;
 
 pub use dome_proto::{

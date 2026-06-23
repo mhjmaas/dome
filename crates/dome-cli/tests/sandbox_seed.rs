@@ -74,7 +74,19 @@ fn sandbox_index(name: &str) -> String {
     format!("{}/sandboxes/{}.idx", data_dir(), name)
 }
 
+/// Stop a sandbox's persistent worker (since #24 the VM outlives a session and holds the
+/// persistence lock; there is no user-facing `sandbox stop` until #27). SIGTERM makes it
+/// save and tear the VM down, releasing the lock. Best-effort.
+fn stop_worker(name: &str) {
+    let _ = std::process::Command::new("pkill")
+        .args(["-TERM", "-f", &format!("__worker {}", name)])
+        .output();
+    std::thread::sleep(std::time::Duration::from_secs(3));
+}
+
 fn rm_sandbox(name: &str) {
+    // Since #24 a live worker owns the VM and lock; stop it before unlinking.
+    stop_worker(name);
     let dir = format!("{}/sandboxes", data_dir());
     let _ = std::fs::remove_file(format!("{}/{}.idx", dir, name));
     let _ = std::fs::remove_file(format!("{}/{}.lock", dir, name));
@@ -168,6 +180,9 @@ fn create_from_another_sandbox_inherits_saved_state() {
         "seeding the source sandbox should succeed; stderr: {}",
         String::from_utf8_lossy(&seeded.stderr)
     );
+    // Stop the source worker so its writes are flushed to its on-disk index — `create
+    // --from <sandbox>` seeds from that saved index, not the still-live VM (since #24).
+    stop_worker(&src);
 
     let created = sandbox_create(&dst, Some(&src));
     assert!(
@@ -228,6 +243,10 @@ fn from_on_existing_sandbox_errors_and_preserves_state() {
     // The existing sandbox holds the original marker.
     let original = sandbox_run(&name, "echo original > /root/marker.txt");
     assert!(original.status.success());
+    // Stop the worker so the sandbox is a stopped, on-disk index again — the next
+    // invocation then cold-boots and hits the `--from`-on-existing gate (rather than
+    // attaching to a still-running worker, which would ignore `--from`).
+    stop_worker(&name);
 
     // A checkpoint with a DIFFERENT marker that must never overwrite the sandbox.
     checkpoint_create(&ckpt, "echo clobber > /root/marker.txt");
@@ -293,11 +312,12 @@ fn create_on_a_sandbox_in_use_errors() {
     rm_sandbox(&name);
 }
 
-/// `run <name> --from <X>` on a sandbox a live session is already creating must
-/// hard-error rather than silently dropping `--from` and booting a fork from base.
+/// Since #24, `run <name> --from <X>` on an already-running sandbox does not seed (you
+/// cannot re-seed a live VM): it attaches to the running VM and ignores `--from` with a
+/// clear warning, rather than erroring or silently forking from base.
 #[test]
 #[ignore]
-fn run_from_on_a_sandbox_in_use_errors() {
+fn run_from_on_a_running_sandbox_attaches_and_warns() {
     let ckpt = unique("inuse-seed-ckpt");
     let name = unique("run-from-inuse");
     rm_checkpoint(&ckpt);
@@ -305,23 +325,25 @@ fn run_from_on_a_sandbox_in_use_errors() {
 
     checkpoint_create(&ckpt, "echo seed > /root/seed.txt");
 
-    // An owner is the first session for this name: it holds the lock and has not saved
-    // an index yet, so the sandbox does not exist on disk.
+    // An owner cold-boots the VM (from base — no --from) and keeps a session open.
     let mut owner = sandbox_spawn(&name, "sleep 25");
-    std::thread::sleep(std::time::Duration::from_secs(4));
+    std::thread::sleep(std::time::Duration::from_secs(8));
 
+    // A second invocation passes --from while the VM is already running: it attaches to
+    // the live VM and runs, ignoring --from with a warning (the VM was not re-seeded).
     let attempt = sandbox_run_from(&name, &ckpt, "true");
     assert!(
-        !attempt.status.success(),
-        "run --from on an in-use sandbox must fail, not silently fork from base"
-    );
-    assert!(
-        String::from_utf8_lossy(&attempt.stderr).contains("in use"),
-        "error should explain the sandbox is in use; stderr: {}",
+        attempt.status.success(),
+        "run --from on a running sandbox should attach and run, not fail; stderr: {}",
         String::from_utf8_lossy(&attempt.stderr)
     );
+    let stderr = String::from_utf8_lossy(&attempt.stderr);
+    assert!(
+        stderr.contains("already running") && stderr.contains("ignored"),
+        "the user should be warned that --from/flags are ignored on a running VM; stderr: {stderr}"
+    );
 
-    owner.wait().expect("owner session should exit");
+    let _ = owner.wait();
 
     rm_checkpoint(&ckpt);
     rm_sandbox(&name);

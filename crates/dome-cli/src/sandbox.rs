@@ -7,16 +7,24 @@ use std::path::{Path, PathBuf};
 
 use anyhow::{bail, Context, Result};
 
+use std::io::IsTerminal;
+
 use crate::assets;
 use crate::checkpoint;
 use crate::cli::VmArgs;
 use crate::config::{load_config, DomeConfig};
 use crate::lock::{self, Lock};
-use crate::session::{run_session, SaveTarget};
 use crate::vm::{self, SandboxSource};
+use crate::worker;
 
 /// Entry point for `dome sandbox shell` and `dome sandbox run`. An empty `command`
 /// (the `shell` case) defaults to an interactive `/bin/sh`.
+///
+/// Unlike the old in-process model, the VM is owned by a persistent per-sandbox worker:
+/// this routes through domed (auto-spawned) to ensure the worker exists — cold-booting
+/// the VM from its last saved index if it is stopped — then streams the interactive
+/// session **directly** to the worker (domed is not in the byte path). The VM stays
+/// alive after this returns, so a later `shell`/`run` attaches to the same live VM.
 pub(crate) fn run_sandbox(
     name_arg: Option<String>,
     vm_args: &VmArgs,
@@ -39,81 +47,85 @@ pub(crate) fn run_sandbox(
         vec!["/bin/sh".to_string()]
     };
 
+    // A TTY on stdin means an interactive PTY session (raw mode, resize, signals);
+    // otherwise the command is piped non-interactively. Mirrors the original
+    // `run_command` choice so behaviour is unchanged from the user's point of view.
+    let tty = std::io::stdin().is_terminal();
+
     let data_dir = dome_vm::default_data_dir();
-    let index_path = format!("{}/sandboxes/{}.idx", data_dir, name);
-    let lock_path = PathBuf::from(format!("{}/sandboxes/{}.lock", data_dir, name));
 
-    // Acquire the persistence lock. The first session to open a sandbox owns
-    // persistence (read-write, saves on exit); any concurrent session boots as a
-    // silent ephemeral fork that never saves back. A lock left by a crashed owner is
-    // reclaimed automatically via a process-liveness check.
-    let acquired = lock::acquire(&lock_path)?;
-    let is_owner = matches!(acquired, Lock::Owner(_));
+    // The boot spec is consumed by the worker only on a cold boot; it captures exactly
+    // what this invocation would have booted (resolved name, seed, cwd, and VM flags).
+    let boot = worker::BootSpec::new(&name, from, &cwd, vm_args)?;
+    let attach = crate::daemon::attach_via_daemon(&data_dir, &name, boot.to_value()?)?;
 
-    let existed = Path::new(&index_path).exists();
-    // `--from` is a creation-time seed: honored only when we own persistence and the
-    // sandbox is absent. If it already exists, or a live session is already
-    // creating/using it (we are a fork), seeding would clobber or race it — a hard
-    // error, never a silent miss.
-    let seed = match gate_from(from, existed, is_owner) {
-        FromGate::NoSeed => None,
-        FromGate::Seed(s) => Some(s),
-        FromGate::Refused(reason) => return Err(collision_error(&name, reason, true)),
-    };
-
-    // Only the persistence owner may create or seed the index. A concurrent fork never
-    // writes it (its changes are discarded), so it just boots from the current state.
-    if is_owner {
-        if let Some(seed_name) = seed {
-            let seed_idx = resolve_seed_index(seed_name, &data_dir)?;
-            seed_sandbox_index(&seed_idx, &index_path)?;
-        }
+    // Config flags only take effect on a cold boot; warn (don't silently mislead) when
+    // they were passed but the VM was already running and kept its original config.
+    if !attach.cold_booted && vm_flags_specified(vm_args, from) {
+        eprintln!(
+            "dome: sandbox '{}' is already running — its existing config is kept; the \
+             flags passed here are ignored. Stop it first to boot with new settings.",
+            name
+        );
     }
 
-    // A freshly created (or seeded) sandbox now has an index; an existing one stays
-    // pinned to the immutable base recorded in its index, regardless of any later
-    // upgrade — so an OS upgrade never silently rebases (and corrupts) it.
+    worker::attach_and_relay(&attach, &command, tty)
+}
+
+/// Whether the user passed any boot-affecting flag, used to decide if attaching to an
+/// already-running VM should warn that those flags are being ignored.
+fn vm_flags_specified(vm_args: &VmArgs, from: Option<&str>) -> bool {
+    from.is_some()
+        || vm_args.cpus.is_some()
+        || vm_args.memory.is_some()
+        || vm_args.disk_size.is_some()
+        || vm_args.allow_net
+        || vm_args.allow_host_writes
+        || !vm_args.port.is_empty()
+        || !vm_args.mount.is_empty()
+        || !vm_args.secret.is_empty()
+        || !vm_args.allow_host.is_empty()
+        || !vm_args.expose_host.is_empty()
+}
+
+/// Worker-side: resolve (creating, seeding, or pinning as needed) the CAS source a
+/// persistent sandbox cold-boots from. The worker is always the persistence owner — it
+/// holds the sandbox lock for the VM's whole lifetime — so `--from` is gated as
+/// owner-of-a-possibly-absent sandbox: honored only for a brand-new sandbox, and refused
+/// (never silently dropped) on one that already exists. An existing sandbox stays pinned
+/// to the immutable base recorded in its index; a fresh one is pinned to the current OS
+/// base. Mirrors the owner branch of [`run_sandbox`], minus the user-facing messaging
+/// (the detached worker logs instead of printing).
+pub(crate) fn prepare_sandbox_source(
+    name: &str,
+    data_dir: &str,
+    vm_args: &VmArgs,
+    from: Option<&str>,
+) -> Result<SandboxSource> {
+    dome_vm::validate_checkpoint_name(name).map_err(|e| anyhow::anyhow!(e))?;
+    let index_path = format!("{}/sandboxes/{}.idx", data_dir, name);
+
+    let existed = Path::new(&index_path).exists();
+    match gate_from(from, existed, true) {
+        FromGate::NoSeed => {}
+        FromGate::Seed(seed_name) => {
+            let seed_idx = resolve_seed_index(seed_name, data_dir)?;
+            seed_sandbox_index(&seed_idx, &index_path)?;
+        }
+        FromGate::Refused(reason) => return Err(collision_error(name, reason, true)),
+    }
+
     let now_exists = Path::new(&index_path).exists();
     let base_path = if now_exists {
         pinned_base_for_existing(&index_path)?
     } else {
-        ensure_current_base(&data_dir, vm_args)?
+        ensure_current_base(data_dir, vm_args)?
     };
 
-    let source = SandboxSource {
+    Ok(SandboxSource {
         index_path,
         base_path,
-    };
-    let prepared = vm::prepare_vm(vm_args, &cfg, None, Some(&source))?;
-
-    match acquired {
-        Lock::Owner(guard) => {
-            if existed {
-                eprintln!("dome: resuming sandbox '{}'", name);
-            } else if let Some(seed_name) = seed {
-                eprintln!("dome: creating sandbox '{}' from '{}'", name, seed_name);
-            } else {
-                eprintln!("dome: creating sandbox '{}'", name);
-            }
-            let result = run_session(&prepared, &command, &SaveTarget::Sandbox { name });
-            // Hold the lock until the session (and its save) is fully done, then
-            // release it explicitly so a crashed owner is distinguishable from a
-            // clean exit (the latter leaves no lock behind).
-            drop(guard);
-            result
-        }
-        Lock::Fork => {
-            eprintln!(
-                "dome: sandbox '{}' is already open in another session — running as an \
-                 ephemeral fork; changes made here will NOT be saved.",
-                name
-            );
-            // No save target: the fork boots from the current saved state (or the base
-            // image if the owner has not saved yet) and is fully functional, but it
-            // never writes back to the sandbox index.
-            run_session(&prepared, &command, &SaveTarget::None)
-        }
-    }
+    })
 }
 
 /// Entry point for `dome sandbox create`: materialize a sandbox's index without

@@ -370,7 +370,29 @@ pub(crate) struct RunResult {
     pub nbd_handle: Option<dome_store::NbdHandle>,
 }
 
-pub(crate) fn run_command(prepared: &PreparedVm, command: &[String]) -> Result<RunResult> {
+/// A booted, ready-to-serve VM with all its host-side support handles. Holding this
+/// alive keeps the VM, its CAS NBD server, the egress proxy, and any port forwards
+/// running; dropping it (in field order) tears them down. The one-shot `run_command`
+/// path holds it only for the duration of a single command, while the persistent worker
+/// holds it for the whole sandbox lifetime, opening many sessions against `sandbox`.
+pub(crate) struct BootedVm {
+    pub sandbox: Sandbox,
+    /// Environment to inject into every guest session (proxy secret placeholders).
+    pub env: HashMap<String, String>,
+    /// CAS NBD server handle — also the save handle (`save_sandbox`). `None` only under
+    /// `DOME_STORAGE=direct`.
+    pub nbd_handle: Option<dome_store::NbdHandle>,
+    /// Egress proxy handle; kept alive so MITM/secret injection keeps working.
+    proxy_handle: Option<dome_proxy::ProxyHandle>,
+    /// Port-forward listeners; kept alive so `-p` forwards keep serving.
+    fwd_handle: Option<dome_vm::PortForwardHandle>,
+}
+
+/// Boot the prepared VM and bring up all support services (proxy, CAS NBD, port
+/// forwards), injecting the proxy CA + secret placeholders when MITM is configured.
+/// Returns once the guest is reachable; the caller decides how long to keep it alive and
+/// what to run against it.
+pub(crate) fn boot_vm(prepared: &PreparedVm) -> Result<BootedVm> {
     if prepared.verbose {
         eprintln!("dome: kernel={}", prepared.kernel_path);
         eprintln!("dome: rootfs={} (work copy)", prepared.work_rootfs);
@@ -407,7 +429,7 @@ pub(crate) fn run_command(prepared: &PreparedVm, command: &[String]) -> Result<R
         eprintln!("dome: VM started, waiting for guest...");
     }
 
-    let _fwd = if !prepared.forwards.is_empty() {
+    let fwd_handle = if !prepared.forwards.is_empty() {
         Some(sandbox.start_port_forwarding(&prepared.forwards)?)
     } else {
         None
@@ -435,18 +457,38 @@ pub(crate) fn run_command(prepared: &PreparedVm, command: &[String]) -> Result<R
         }
     }
 
+    Ok(BootedVm {
+        sandbox,
+        env,
+        nbd_handle,
+        proxy_handle,
+        fwd_handle,
+    })
+}
+
+pub(crate) fn run_command(prepared: &PreparedVm, command: &[String]) -> Result<RunResult> {
+    let booted = boot_vm(prepared)?;
+
     let exit_code = if std::io::stdin().is_terminal() {
-        sandbox.shell(command, &env)?
+        booted.sandbox.shell(command, &booted.env)?
     } else {
-        sandbox.exec_with_env(
+        booted.sandbox.exec_with_env(
             command,
-            &env,
+            &booted.env,
             &mut std::io::stdout(),
             &mut std::io::stderr(),
         )?
     };
 
+    let BootedVm {
+        sandbox,
+        proxy_handle,
+        fwd_handle,
+        nbd_handle,
+        ..
+    } = booted;
     drop(proxy_handle);
+    drop(fwd_handle);
     let _ = sandbox.stop();
     Ok(RunResult {
         exit_code,
