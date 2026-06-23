@@ -4,28 +4,60 @@ Place `dome.json` in the project root (or pass `--config <path>`). All fields ar
 
 ## Fields
 
+VM-shape fields define how the VM boots. For a persistent sandbox they are resolved **once at creation** and stored in the sidecar (the single source of truth for every later boot).
+
 | Field | Type | Default | Description |
 |-------|------|---------|-------------|
 | `cpus` | number | 2 | Number of CPU cores |
 | `memory` | number | 2048 | Memory in MB |
-| `disk_size` | number | 4096 | Disk size in MB |
+| `disk_size` | number | 4096 | Disk size in MB — **create-only** (see below) |
 | `allow_net` | boolean | false | Enable networking |
 | `allow_host_writes` | boolean | false | Allow `:rw` mounts to write to host filesystem |
 | `ports` | string[] | [] | Port forwards, `"HOST:GUEST"` format |
 | `mounts` | string[] | [] | Directory mounts, `"HOST:GUEST[:ro\|:rw]"` format (default: ro) |
-| `command` | string[] | ["/bin/sh"] | Default command to run |
 | `secrets` | object | {} | Secrets to inject via proxy (see below) |
 | `network` | object | {} | Network access policy (see below) |
 
+Session/project keys are *not* part of the VM shape and are never persisted to the sidecar — they are read live on each invocation:
+
+| Field | Type | Default | Description |
+|-------|------|---------|-------------|
+| `command` | string[] | ["/bin/sh"] | Default command to run (live; not persisted) |
+| `sandbox` | string | cwd slug | Default sandbox name for `dome sandbox …` (live; not persisted) |
+
 ## Resolution Order
 
-CLI flags take priority over config values. Config values take priority over hardcoded defaults.
+Every field follows one rule. The highest **set** layer wins:
 
 ```
 CLI flag > dome.json > default
 ```
 
-For example, `dome run --cpus 4` with `{"cpus": 2}` in dome.json uses 4 CPUs.
+- **`--X` sets** the value. A scalar/boolean sets it; a **list flag** (`--port`, `--mount`, `--secret`, `--allow-host`, `--expose-host`) **replaces** the lower layer — it is not additive.
+- **`--no-X` clears or disables** the value: `--no-allow-net`, `--no-allow-host-writes`, `--no-port`, `--no-mount`, `--no-secret`, `--no-allow-host`, `--no-expose-host`. Passing both `--X` and `--no-X` in one command is an error.
+- **Omit the flag to inherit** the lower layer (`dome.json`, then the default).
+- **`dome.json` only fills fields you didn't set on the command line.** It never overrides a flag.
+
+For example, `dome run --cpus 4` with `{"cpus": 2}` in dome.json uses 4 CPUs; `--no-allow-net` with `{"allow_net": true}` disables networking.
+
+## Ephemeral runs vs. persistent sandboxes
+
+- **`dome run` is ephemeral.** Config is resolved from `dome.json` + flags on every invocation, the VM boots a fresh disk clone, and everything is discarded on exit. Nothing is persisted, so there is no drift.
+- **`dome sandbox …` is persistent.** A sandbox resolves its config **once at creation** and writes a versioned sidecar that is the single source of truth (sidecar-as-truth) for every later boot. After creation, **editing `dome.json` and restarting does not change an existing sandbox.** To change a persistent sandbox:
+  - **Flags always win.** Passing a config flag to `dome sandbox run`/`shell`/`config` re-resolves and updates the sidecar (applied on the next cold boot; a running VM keeps its current config until stopped).
+  - **`dome sandbox config --reload <name>`** re-applies the current `dome.json` (plus any flags) to the sandbox — the only supported way to pick up `dome.json` edits without recreating. `disk_size` stays pinned (create-only) even if `dome.json` carries a new value.
+
+```bash
+dome sandbox config myenv --no-allow-net    # disable a policy on an existing sandbox
+dome sandbox config myenv --port 9090:80    # replace the port list
+dome sandbox config myenv --no-port         # clear the port list
+dome sandbox config --reload myenv          # re-apply edited dome.json
+dome sandbox config myenv                   # print the full effective resolved config
+```
+
+## `disk_size` is create-only
+
+`--disk-size` (and `dome.json`'s `disk_size`) is honored **only when a sandbox is created**. Passing `--disk-size` to an existing sandbox (`run`, `shell`, or `config`) is a hard error, and `--reload` ignores any `disk_size` in `dome.json`. To resize, recreate: `dome sandbox rm <name>` then `dome sandbox create <name> --disk-size <MB>`.
 
 ## Secrets
 

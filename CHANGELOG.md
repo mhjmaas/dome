@@ -1,5 +1,61 @@
 # Changelog
 
+## 0.6.3
+
+### Sandbox config: sidecar-as-truth with one resolution rule
+
+Persistent sandbox config is reworked around a single, predictable model. Every
+field — resources, booleans, and lists — now follows **one rule**: `--X` sets it,
+`--no-X` clears or disables it, and omitting the flag inherits the lower layer, so
+precedence is always **flag > `dome.json` > default** (the highest *set* layer wins).
+List flags (`--port`, `--mount`, `--secret`, `--allow-host`, `--expose-host`)
+**replace** the lower layer rather than appending.
+
+A persistent sandbox resolves its config **once, at creation**, and stores it in a
+versioned sidecar that is the single source of truth for every later boot
+(sidecar-as-truth). Ephemeral `dome run` is unchanged — it re-resolves
+`dome.json` + flags on every invocation.
+
+- **New tri-state flags** to turn a setting off without recreating the sandbox:
+  `--no-allow-net`, `--no-allow-host-writes`, `--no-port`, `--no-mount`,
+  `--no-secret`, `--no-allow-host`, `--no-expose-host`. Passing a flag together
+  with its negation is rejected.
+- **Flags always win on an existing sandbox.** A config flag passed to
+  `dome sandbox run`/`shell`/`config` now updates the sidecar (applied on the next
+  cold boot; a running VM keeps its current config until stopped) instead of being
+  warned about and ignored.
+- **`dome sandbox config --reload <name>`** re-applies the current `dome.json`
+  (plus any flags) to an existing sandbox — the supported way to pick up
+  `dome.json` edits without recreating.
+- **`--disk-size` is now create-only.** Passing it to an existing sandbox
+  (`run`, `shell`, or `config`) is a hard error, and `--reload` ignores any
+  `disk_size` in `dome.json`; the disk stays pinned. Recreate the sandbox to
+  resize it.
+- **`create --from` clones disk only.** A seeded sandbox takes its config from
+  `dome.json` + flags (never the seed's config), and `disk_size` follows the
+  cloned disk so the sidecar stays truthful.
+- `dome sandbox config` (no flags) prints the full effective resolved config —
+  resources, secrets by name, the unified network allow-list, and exposed host
+  ports.
+
+#### Behavior change
+
+**Editing `dome.json` and restarting no longer auto-applies to an existing
+sandbox.** Previously every cold boot re-read `dome.json`; now the sidecar is
+authoritative. To apply `dome.json` edits to an existing sandbox, run
+`dome sandbox config --reload <name>` (or pass the specific flags, which always
+win), or recreate the sandbox. Ephemeral `dome run` is unaffected.
+
+#### Migration
+
+Legacy (unversioned) sidecars heal transparently on first boot: they are
+re-resolved against the current `dome.json` and written back versioned. The one
+exception is a **list** field set in *both* a CLI flag and `dome.json` on a
+pre-0.6.3 sandbox — under the new replace-on-set rule the CLI value wins and the
+`dome.json` entries are dropped on first boot (previously the two were merged).
+Re-add them with `dome sandbox config --port …` (etc.) or
+`dome sandbox config --reload`. Scalars and booleans are unaffected.
+
 ## 0.6.1
 
 ### Linux backend: correct wall clock and working directory mounts
