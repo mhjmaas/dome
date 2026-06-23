@@ -44,42 +44,6 @@ pub(crate) struct NetworkEntry {
     pub allow: Option<Vec<String>>,
 }
 
-impl DomeConfig {
-    /// Convert config sections into a ProxyConfig for dome-proxy.
-    pub fn to_proxy_config(&self) -> dome_proxy::config::ProxyConfig {
-        let mut proxy = dome_proxy::config::ProxyConfig::default();
-
-        if let Some(ref secrets) = self.secrets {
-            for (name, entry) in secrets {
-                proxy.secrets.insert(
-                    name.clone(),
-                    dome_proxy::config::SecretConfig {
-                        from: entry.from.clone(),
-                        hosts: entry.hosts.clone(),
-                        value: None,
-                    },
-                );
-            }
-        }
-
-        if let Some(ref network) = self.network {
-            if let Some(ref allow) = network.allow {
-                proxy.network.allow = allow.clone();
-            }
-        }
-
-        if let Some(ref expose) = self.expose_host {
-            for s in expose {
-                if let Ok(mapping) = parse_expose_host(s) {
-                    proxy.expose_host.push(mapping);
-                }
-            }
-        }
-
-        proxy
-    }
-}
-
 /// Parse "HOST_PORT:GUEST_PORT" or "PORT" into an ExposeHostMapping.
 pub(crate) fn parse_expose_host(s: &str) -> Result<dome_proxy::config::ExposeHostMapping> {
     let parts: Vec<&str> = s.split(':').collect();
@@ -109,11 +73,17 @@ pub(crate) fn parse_expose_host(s: &str) -> Result<dome_proxy::config::ExposeHos
     }
 }
 
-pub(crate) fn load_config(config_flag: Option<&str>) -> Result<DomeConfig> {
-    let path = match config_flag {
+/// The `dome.json` path a config flag resolves to: the explicit `--config` value, else
+/// `./dome.json`. Exposed so the heal path can test for the file's presence and report it.
+pub(crate) fn config_path(config_flag: Option<&str>) -> std::path::PathBuf {
+    match config_flag {
         Some(p) => std::path::PathBuf::from(p),
         None => std::path::PathBuf::from("dome.json"),
-    };
+    }
+}
+
+pub(crate) fn load_config(config_flag: Option<&str>) -> Result<DomeConfig> {
+    let path = config_path(config_flag);
 
     match std::fs::read_to_string(&path) {
         Ok(contents) => {

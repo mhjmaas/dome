@@ -60,14 +60,26 @@ fn start_then_status_then_stop_lifecycle() {
         start_out.contains("started") || start_out.contains("already running"),
         "unexpected start output: {start_out}"
     );
-    assert!(socket(home.path()).exists(), "start should create the socket");
+    assert!(
+        socket(home.path()).exists(),
+        "start should create the socket"
+    );
 
     // status reports up with the expected fields, and zero workers (no VM booted).
     let status = dome(home.path(), &["daemon", "status"]);
     let status_out = String::from_utf8_lossy(&status.stdout);
-    assert!(status_out.contains("up"), "status should be up: {status_out}");
-    assert!(status_out.contains("workers: 0"), "no VM booted: {status_out}");
-    assert!(status_out.contains("socket:"), "status shows socket: {status_out}");
+    assert!(
+        status_out.contains("up"),
+        "status should be up: {status_out}"
+    );
+    assert!(
+        status_out.contains("workers: 0"),
+        "no VM booted: {status_out}"
+    );
+    assert!(
+        status_out.contains("socket:"),
+        "status shows socket: {status_out}"
+    );
 
     // stop shuts it down and removes the socket.
     let stop = dome(home.path(), &["daemon", "stop"]);
@@ -106,7 +118,10 @@ fn ls_auto_spawns_the_daemon() {
     // No daemon is running yet; `sandbox ls` must auto-spawn one and succeed.
     assert!(!socket(home.path()).exists());
     let out = dome(home.path(), &["sandbox", "ls"]);
-    assert!(out.status.success(), "ls should succeed by auto-spawning domed");
+    assert!(
+        out.status.success(),
+        "ls should succeed by auto-spawning domed"
+    );
     let combined = format!(
         "{}{}",
         String::from_utf8_lossy(&out.stdout),

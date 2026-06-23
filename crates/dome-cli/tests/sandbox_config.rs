@@ -43,10 +43,12 @@ fn rm_sandbox(name: &str) {
     let _ = std::fs::remove_file(format!("{}/{}.config.json", dir, name));
 }
 
-/// `sandbox create` persists a config sidecar capturing the flags, without booting a VM.
+/// `sandbox create` resolves dome.json + flags into a structured, versioned config sidecar,
+/// without booting a VM. The sidecar must carry the schema `version` and the structured proxy
+/// section (so a later cold boot reproduces from it without re-reading dome.json).
 #[test]
 #[ignore]
-fn create_persists_config_without_booting() {
+fn create_persists_a_structured_versioned_sidecar_without_booting() {
     let name = unique("cfg-create");
     rm_sandbox(&name);
 
@@ -66,6 +68,14 @@ fn create_persists_config_without_booting() {
     assert!(
         cfg.contains("\"cpus\": 4") && cfg.contains("\"memory\": 3072"),
         "config must capture the create flags; got: {cfg}"
+    );
+    assert!(
+        cfg.contains("\"version\": 1"),
+        "the sidecar must be versioned; got: {cfg}"
+    );
+    assert!(
+        cfg.contains("\"proxy\""),
+        "the sidecar must carry the structured proxy section; got: {cfg}"
     );
 
     rm_sandbox(&name);

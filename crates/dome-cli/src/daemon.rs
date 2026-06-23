@@ -161,7 +161,10 @@ impl WorkerLauncher for VmWorkerLauncher {
                 bail!("sandbox '{}' failed to boot: {}", name, err);
             }
             if Instant::now() > deadline {
-                bail!("sandbox '{}' worker did not become reachable within {WORKER_BOOT_TIMEOUT:?}", name);
+                bail!(
+                    "sandbox '{}' worker did not become reachable within {WORKER_BOOT_TIMEOUT:?}",
+                    name
+                );
             }
             std::thread::sleep(POLL_INTERVAL);
         }
@@ -203,12 +206,21 @@ pub(crate) struct FakeLauncher;
 
 #[cfg(test)]
 impl WorkerLauncher for FakeLauncher {
-    fn launch(&self, name: &str, _boot: &serde_json::Value, data_dir: &str) -> Result<WorkerHandle> {
+    fn launch(
+        &self,
+        name: &str,
+        _boot: &serde_json::Value,
+        data_dir: &str,
+    ) -> Result<WorkerHandle> {
         let log_dir = worker::workers_dir(data_dir);
         std::fs::create_dir_all(&log_dir)
             .with_context(|| format!("creating worker log dir {}", log_dir.display()))?;
         let log = log_dir.join(format!("{name}.log"));
-        if let Ok(mut f) = std::fs::OpenOptions::new().create(true).append(true).open(&log) {
+        if let Ok(mut f) = std::fs::OpenOptions::new()
+            .create(true)
+            .append(true)
+            .open(&log)
+        {
             let _ = writeln!(f, "{} fake worker launched for '{}'", now_unix(), name);
         }
         Ok(WorkerHandle {
@@ -486,7 +498,9 @@ impl Supervisor {
     /// running worker.
     fn save(&self, name: &str) -> Result<()> {
         let (socket, _pid) = self.live_worker_socket(name).ok_or_else(|| {
-            anyhow::anyhow!("sandbox '{name}' is not running; nothing to save (it is already durable on disk)")
+            anyhow::anyhow!(
+                "sandbox '{name}' is not running; nothing to save (it is already durable on disk)"
+            )
         })?;
         worker::save_via_worker(&socket)
     }
@@ -499,9 +513,9 @@ impl Supervisor {
     /// no live worker to stop — an idle sandbox is already down). On success domed removes
     /// the worker from its registry and broadcasts `sandbox.stopped`.
     fn stop(&self, name: &str, force: bool) -> Result<()> {
-        let (socket, _pid) = self.live_worker_socket(name).ok_or_else(|| {
-            anyhow::anyhow!("sandbox '{name}' is not running")
-        })?;
+        let (socket, _pid) = self
+            .live_worker_socket(name)
+            .ok_or_else(|| anyhow::anyhow!("sandbox '{name}' is not running"))?;
 
         // Mark the worker stopping FIRST so the reaper attributes its exit to this clean
         // stop (not a crash) for the whole stop window. The worker is the sole decider of
@@ -551,7 +565,10 @@ impl Supervisor {
         let mut reg = self.registry.lock().unwrap();
         if let Some(entry) = reg.workers.get(name) {
             if UnixStream::connect(&entry.handle.socket_path).is_ok() {
-                return Some((entry.handle.socket_path.clone(), entry.handle.pid.unwrap_or(0)));
+                return Some((
+                    entry.handle.socket_path.clone(),
+                    entry.handle.pid.unwrap_or(0),
+                ));
             }
             // The worker is gone; forget it so the caller cold-boots a fresh one.
             reg.remove(name);
@@ -782,7 +799,10 @@ fn handle_conn(sup: &Arc<Supervisor>, stream: UnixStream) {
         let req: Request = match serde_json::from_str(trimmed) {
             Ok(r) => r,
             Err(e) => {
-                let _ = write_line(&mut writer, &Response::err(None, format!("invalid request: {e}")));
+                let _ = write_line(
+                    &mut writer,
+                    &Response::err(None, format!("invalid request: {e}")),
+                );
                 continue;
             }
         };
@@ -924,14 +944,17 @@ pub(crate) fn run_supervisor(data_dir: &str) -> Result<()> {
     // A stale socket from a crashed domed would make bind fail; the singleton lock just
     // proved no live domed owns it, so reclaiming it is safe.
     let _ = std::fs::remove_file(&sock);
-    let listener =
-        UnixListener::bind(&sock).with_context(|| format!("binding control socket {}", sock.display()))?;
+    let listener = UnixListener::bind(&sock)
+        .with_context(|| format!("binding control socket {}", sock.display()))?;
     let _ = std::fs::set_permissions(&sock, std::fs::Permissions::from_mode(0o600));
     listener
         .set_nonblocking(true)
         .context("setting control socket non-blocking")?;
 
-    let sup = Arc::new(Supervisor::new(data_dir.to_string(), Box::new(VmWorkerLauncher)));
+    let sup = Arc::new(Supervisor::new(
+        data_dir.to_string(),
+        Box::new(VmWorkerLauncher),
+    ));
     // Re-adopt any workers that survived a previous domed (and reconcile stale sockets)
     // BEFORE serving, so the first `ls`/attach already reflects them. Workers are
     // independent processes and are unaffected by domed stopping/crashing.
@@ -962,7 +985,9 @@ fn request(stream: &mut UnixStream, command: Command) -> Result<Response> {
     write_line(stream, &Request::new(Some(1), command)).context("sending request to domed")?;
     let mut reader = BufReader::new(stream.try_clone().context("cloning daemon socket")?);
     let mut line = String::new();
-    let n = reader.read_line(&mut line).context("reading daemon response")?;
+    let n = reader
+        .read_line(&mut line)
+        .context("reading daemon response")?;
     if n == 0 {
         bail!("domed closed the connection without responding");
     }
@@ -1469,7 +1494,10 @@ mod tests {
         reg.overlay(&mut infos, &counts);
         assert_eq!(infos[0].state, "running");
         assert_eq!(infos[0].attached, 2);
-        assert_eq!(infos[1].state, "idle", "a sandbox with no worker stays idle");
+        assert_eq!(
+            infos[1].state, "idle",
+            "a sandbox with no worker stays idle"
+        );
     }
 
     #[test]
@@ -1493,7 +1521,10 @@ mod tests {
         }];
         // An empty counts map mirrors "worker live, zero terminals attached".
         reg.overlay(&mut infos, &HashMap::new());
-        assert_eq!(infos[0].state, "running", "the VM is still up after all detaches");
+        assert_eq!(
+            infos[0].state, "running",
+            "the VM is still up after all detaches"
+        );
         assert_eq!(infos[0].attached, 0, "no terminals attached → count 0");
     }
 
@@ -1543,7 +1574,9 @@ mod tests {
                                 serde_json::from_str(line.trim()).unwrap_or(serde_json::json!({}));
                             let resp = match v["op"].as_str().unwrap_or("") {
                                 "mint" => serde_json::json!({ "token": "faketoken" }),
-                                "count" => serde_json::json!({ "attached": at.load(Ordering::SeqCst) }),
+                                "count" => {
+                                    serde_json::json!({ "attached": at.load(Ordering::SeqCst) })
+                                }
                                 "stop" => {
                                     // The worker is the sole decider of the attached guard:
                                     // refuse (naming the count) unless forced or idle.
@@ -1576,7 +1609,6 @@ mod tests {
                 handle: Some(handle),
             }
         }
-
     }
 
     impl Drop for FakeWorker {
@@ -1667,7 +1699,11 @@ mod tests {
             .unwrap();
         // While alive, the reaper leaves it be.
         sup.reap_dead_workers();
-        assert_eq!(sup.registry.lock().unwrap().len(), 1, "a live worker is not reaped");
+        assert_eq!(
+            sup.registry.lock().unwrap().len(),
+            1,
+            "a live worker is not reaped"
+        );
 
         drop(fw); // crash: the listener stops and the socket goes away
         while UnixStream::connect(&socket).is_ok() {
@@ -1690,7 +1726,10 @@ mod tests {
             "crash event must surface the last log lines: {data}"
         );
         // The sandbox is marked failed (retrievable after the worker is gone)…
-        assert!(worker::is_failed(dd, "web"), "a crashed sandbox is marked failed");
+        assert!(
+            worker::is_failed(dd, "web"),
+            "a crashed sandbox is marked failed"
+        );
         // …the dead worker is forgotten (no auto-restart)…
         assert_eq!(sup.registry.lock().unwrap().len(), 0, "no auto-restart");
         // …and reaping again does not re-emit (idempotent once removed).
@@ -1729,8 +1768,15 @@ mod tests {
                 .any(|e| e.event == "sandbox.crashed"),
             "an expected stop must not be reported as a crash"
         );
-        assert!(!worker::is_failed(dd, "web"), "a clean stop is not a failure");
-        assert_eq!(sup.registry.lock().unwrap().len(), 0, "the entry is still removed");
+        assert!(
+            !worker::is_failed(dd, "web"),
+            "a clean stop is not a failure"
+        );
+        assert_eq!(
+            sup.registry.lock().unwrap().len(),
+            0,
+            "the entry is still removed"
+        );
     }
 
     #[test]
@@ -1773,7 +1819,11 @@ mod tests {
             .find(|e| e.event == "sandbox.stopped")
             .expect("force stop must emit sandbox.stopped");
         assert_eq!(ev.data.clone().unwrap()["name"], "web");
-        assert_eq!(sup.registry.lock().unwrap().len(), 0, "the worker is gone after stop");
+        assert_eq!(
+            sup.registry.lock().unwrap().len(),
+            0,
+            "the worker is gone after stop"
+        );
         assert!(
             UnixStream::connect(&socket).is_err(),
             "the worker socket is torn down on stop"
@@ -1822,21 +1872,33 @@ mod tests {
         worker::write_failed_marker(dd, "web", "crashed here");
 
         // With a crash marker and no live worker, the sandbox lists as `failed`.
-        let sup = Arc::new(Supervisor::new(dd.to_string(), Box::new(FakeWorkerLauncher {
-            attached: 0,
-            started: Mutex::new(Vec::new()),
-        })));
+        let sup = Arc::new(Supervisor::new(
+            dd.to_string(),
+            Box::new(FakeWorkerLauncher {
+                attached: 0,
+                started: Mutex::new(Vec::new()),
+            }),
+        ));
         let infos = sup.list().unwrap();
         let row = infos.iter().find(|r| r.name == "web").unwrap();
-        assert_eq!(row.state, "failed", "a crash marker with no worker reads as failed");
+        assert_eq!(
+            row.state, "failed",
+            "a crash marker with no worker reads as failed"
+        );
 
         // Re-attaching cold-boots a fresh worker, which supersedes the failure.
         let boot = serde_json::json!({ "name": "web", "cwd": "/x", "vm_args": {} });
         sup.attach("web", Some(boot)).unwrap();
-        assert!(!worker::is_failed(dd, "web"), "a cold boot clears the failed marker");
+        assert!(
+            !worker::is_failed(dd, "web"),
+            "a cold boot clears the failed marker"
+        );
         let infos = sup.list().unwrap();
         let row = infos.iter().find(|r| r.name == "web").unwrap();
-        assert_eq!(row.state, "running", "after a cold boot the sandbox is running again");
+        assert_eq!(
+            row.state, "running",
+            "after a cold boot the sandbox is running again"
+        );
     }
 
     // --- Idle auto-shutdown + worker re-adoption (#29) ---
@@ -1846,7 +1908,12 @@ mod tests {
         let grace = Duration::from_secs(300);
         // Fully idle past the grace → shut down.
         assert!(should_shut_down_idle(0, 0, grace, grace));
-        assert!(should_shut_down_idle(0, 0, grace + Duration::from_secs(1), grace));
+        assert!(should_shut_down_idle(
+            0,
+            0,
+            grace + Duration::from_secs(1),
+            grace
+        ));
         // Any held client or running worker keeps it resident, no matter how long idle.
         assert!(!should_shut_down_idle(1, 0, grace * 10, grace));
         assert!(!should_shut_down_idle(0, 1, grace * 10, grace));
@@ -1947,7 +2014,10 @@ mod tests {
             let l = UnixListener::bind(&stale).unwrap();
             drop(l);
         }
-        assert!(stale.exists(), "precondition: the stale socket file is present");
+        assert!(
+            stale.exists(),
+            "precondition: the stale socket file is present"
+        );
 
         sup.readopt_workers();
 
@@ -1956,16 +2026,25 @@ mod tests {
             sup.live_worker_socket("web").is_some(),
             "a live worker must be re-adopted into the registry"
         );
-        assert_eq!(sup.registry.lock().unwrap().len(), 1, "only the live worker is adopted");
+        assert_eq!(
+            sup.registry.lock().unwrap().len(),
+            1,
+            "only the live worker is adopted"
+        );
         // The stale socket is gone, so a future cold boot can bind cleanly.
-        assert!(!stale.exists(), "a stale worker socket must be reconciled away");
+        assert!(
+            !stale.exists(),
+            "a stale worker socket must be reconciled away"
+        );
     }
 
     #[test]
     fn fake_launcher_writes_a_per_sandbox_log() {
         let d = tmp_data_dir();
         let dd = d.path().to_str().unwrap();
-        FakeLauncher.launch("web", &serde_json::json!({}), dd).unwrap();
+        FakeLauncher
+            .launch("web", &serde_json::json!({}), dd)
+            .unwrap();
         let log = worker::workers_dir(dd).join("web.log");
         assert!(log.exists(), "per-sandbox log must be written");
         let mut s = String::new();

@@ -41,7 +41,7 @@ use crate::cli::VmArgs;
 use crate::config::load_config;
 use crate::lock::{self, Lock};
 use crate::sandbox;
-use crate::sandbox_config::SandboxConfig;
+use crate::sandbox_config::{self, ResolvedConfig};
 use crate::vm;
 
 /// Accept-loop poll cadence (the listener is non-blocking so it can notice shutdown).
@@ -552,8 +552,6 @@ fn boot_and_serve(name: &str, data_dir: &str) -> Result<()> {
         // Not fatal: absolute paths still work; log and continue.
         let _ = e;
     }
-    let cfg = load_config(boot.vm_args.config.as_deref())?;
-
     // Become the sandbox's sole persistence owner for the VM's whole lifetime. A Fork
     // outcome means another live owner already holds it (a stale worker, or a legacy
     // session): refuse rather than run a second writer.
@@ -566,32 +564,38 @@ fn boot_and_serve(name: &str, data_dir: &str) -> Result<()> {
         ),
     };
 
-    // Resolve the effective boot config. A sandbox's persisted sidecar is the source of
-    // truth: every cold boot reproduces from it, ignoring the attaching client's flags. A
-    // sandbox with no sidecar yet (a lazy first boot, or one created before config
-    // persistence) adopts this invocation's flags as its config and persists them, so the
-    // next boot is reproducible. The effective config is also recorded as the live config so
+    // Resolve the effective boot config. A sandbox's structured sidecar is the source of
+    // truth: every cold boot reproduces from it and does NOT re-read `dome.json` for VM-shape
+    // fields. A legacy (unversioned) sidecar heals on first load by re-resolving against the
+    // current `dome.json` (see `load_or_heal`). A sandbox with no sidecar yet (a lazy first
+    // boot) resolves `dome.json` + this invocation's flags and persists the result, so the
+    // next boot is reproducible. The resolved config is also recorded as the live config so
     // the CLI can name the live value when warning that flags to a running sandbox are kept.
-    let effective_vm_args = match SandboxConfig::load(data_dir, name)? {
-        Some(persisted) => persisted.apply_to_vm_args(&boot.vm_args),
-        None => {
-            let captured = SandboxConfig::from_vm_args(&boot.vm_args);
-            if let Err(e) = captured.save(data_dir, name) {
-                append_log(
-                    data_dir,
-                    name,
-                    &format!("warning: could not persist sandbox config: {e:#}"),
-                );
+    let resolved =
+        match sandbox_config::load_or_heal(data_dir, name, boot.vm_args.config.as_deref())? {
+            Some(cfg) => cfg,
+            None => {
+                let dome = load_config(boot.vm_args.config.as_deref())?;
+                let cfg =
+                    ResolvedConfig::resolve(&ResolvedConfig::default(), &dome, &boot.vm_args)?;
+                if let Err(e) = cfg.save(data_dir, name) {
+                    append_log(
+                        data_dir,
+                        name,
+                        &format!("warning: could not persist sandbox config: {e:#}"),
+                    );
+                }
+                cfg
             }
-            boot.vm_args.clone()
-        }
-    };
-    SandboxConfig::from_vm_args(&effective_vm_args).save_live(data_dir, name);
+        };
+    resolved.save_live(data_dir, name);
 
-    // Resolve (creating/seeding/pinning) the CAS source, then prepare and boot the VM.
+    // Resolve (creating/seeding/pinning) the CAS source, then prepare and boot the VM. The
+    // CAS source resolution still needs the session/env flags (kernel/rootfs/disk-size) the
+    // attaching invocation carried; the VM shape itself comes from the resolved sidecar.
     let source =
-        sandbox::prepare_sandbox_source(name, data_dir, &effective_vm_args, boot.from.as_deref())?;
-    let prepared = vm::prepare_vm(&effective_vm_args, &cfg, None, Some(&source))?;
+        sandbox::prepare_sandbox_source(name, data_dir, &boot.vm_args, boot.from.as_deref())?;
+    let prepared = vm::prepare_vm(&resolved, &boot.vm_args, None, Some(&source))?;
     let instance_dir = prepared.instance_dir.clone();
 
     let booted = vm::boot_vm(&prepared)?;
@@ -631,7 +635,10 @@ fn boot_and_serve(name: &str, data_dir: &str) -> Result<()> {
         .context("setting worker socket non-blocking")?;
 
     install_signal_handlers();
-    worker.log(&format!("worker up for '{name}' (pid {})", std::process::id()));
+    worker.log(&format!(
+        "worker up for '{name}' (pid {})",
+        std::process::id()
+    ));
 
     // Background auto-flush: bound worker memory + the crash-loss window by saving on an
     // interval and when the dirty buffer exceeds the cap. Joined before the shutdown save.
@@ -655,7 +662,7 @@ fn boot_and_serve(name: &str, data_dir: &str) -> Result<()> {
     let _ = std::fs::remove_file(&worker.socket_path);
     let _ = std::fs::remove_dir_all(&instance_dir);
     // The VM is down, so the live config no longer describes a running VM; clear it.
-    SandboxConfig::clear_live(data_dir, name);
+    ResolvedConfig::clear_live(data_dir, name);
     worker.log("worker stopped");
     Ok(())
 }
@@ -663,8 +670,12 @@ fn boot_and_serve(name: &str, data_dir: &str) -> Result<()> {
 /// Read and remove the boot spec domed wrote for this worker.
 fn read_boot_spec(data_dir: &str, name: &str) -> Result<BootSpec> {
     let path = boot_spec_path(data_dir, name);
-    let bytes = std::fs::read(&path)
-        .with_context(|| format!("reading boot spec {} (was domed supposed to write it?)", path.display()))?;
+    let bytes = std::fs::read(&path).with_context(|| {
+        format!(
+            "reading boot spec {} (was domed supposed to write it?)",
+            path.display()
+        )
+    })?;
     let boot: BootSpec = serde_json::from_slice(&bytes).context("parsing boot spec")?;
     let _ = std::fs::remove_file(&path);
     Ok(boot)
@@ -686,7 +697,12 @@ fn spawn_auto_flusher(worker: Arc<Worker>) -> std::thread::JoinHandle<()> {
             if worker.shutdown.load(Ordering::SeqCst) || signal_shutdown_requested() {
                 break;
             }
-            if flush_is_due(worker.dirty_bytes(), last_save.elapsed(), FLUSH_INTERVAL, DIRTY_CAP) {
+            if flush_is_due(
+                worker.dirty_bytes(),
+                last_save.elapsed(),
+                FLUSH_INTERVAL,
+                DIRTY_CAP,
+            ) {
                 match worker.save() {
                     Ok(()) => last_save = Instant::now(),
                     Err(e) => worker.log(&format!("auto-flush save failed: {e:#}")),
@@ -730,7 +746,13 @@ fn handle_conn(worker: &Arc<Worker>, mut stream: UnixStream) {
     let req: WorkerRequest = match serde_json::from_str(line.trim()) {
         Ok(r) => r,
         Err(e) => {
-            let _ = write_line(&mut stream, &AttachAck { ok: false, error: Some(format!("invalid request: {e}")) });
+            let _ = write_line(
+                &mut stream,
+                &AttachAck {
+                    ok: false,
+                    error: Some(format!("invalid request: {e}")),
+                },
+            );
             return;
         }
     };
@@ -746,10 +768,16 @@ fn handle_conn(worker: &Arc<Worker>, mut stream: UnixStream) {
         }
         WorkerRequest::Save => {
             let resp = match worker.save() {
-                Ok(()) => SaveResponse { ok: true, error: None },
+                Ok(()) => SaveResponse {
+                    ok: true,
+                    error: None,
+                },
                 Err(e) => {
                     worker.log(&format!("explicit save failed: {e:#}"));
-                    SaveResponse { ok: false, error: Some(format!("{e:#}")) }
+                    SaveResponse {
+                        ok: false,
+                        error: Some(format!("{e:#}")),
+                    }
                 }
             };
             let _ = write_line(&mut stream, &resp);
@@ -759,13 +787,25 @@ fn handle_conn(worker: &Arc<Worker>, mut stream: UnixStream) {
             match worker.commit_stop(force) {
                 Ok(()) => {
                     worker.shutdown.store(true, Ordering::SeqCst);
-                    let _ = write_line(&mut stream, &StopResponse { ok: true, attached: 0 });
+                    let _ = write_line(
+                        &mut stream,
+                        &StopResponse {
+                            ok: true,
+                            attached: 0,
+                        },
+                    );
                 }
                 Err(attached) => {
                     worker.log(&format!(
                         "stop refused: {attached} attached terminal(s) (use --force)"
                     ));
-                    let _ = write_line(&mut stream, &StopResponse { ok: false, attached });
+                    let _ = write_line(
+                        &mut stream,
+                        &StopResponse {
+                            ok: false,
+                            attached,
+                        },
+                    );
                 }
             }
         }
@@ -791,7 +831,13 @@ fn handle_attach(
     cols: u16,
 ) {
     if !worker.tokens.lock().unwrap().take(token) {
-        let _ = write_line(&mut stream, &AttachAck { ok: false, error: Some("invalid or expired token".to_string()) });
+        let _ = write_line(
+            &mut stream,
+            &AttachAck {
+                ok: false,
+                error: Some("invalid or expired token".to_string()),
+            },
+        );
         return;
     }
 
@@ -800,7 +846,13 @@ fn handle_attach(
     // count-then-stop had. Reserve BEFORE opening the guest session (and before the count is
     // observable), so a concurrent non-forced stop sees this attach.
     if !worker.begin_session() {
-        let _ = write_line(&mut stream, &AttachAck { ok: false, error: Some("sandbox is stopping".to_string()) });
+        let _ = write_line(
+            &mut stream,
+            &AttachAck {
+                ok: false,
+                error: Some("sandbox is stopping".to_string()),
+            },
+        );
         return;
     }
 
@@ -816,7 +868,13 @@ fn handle_attach(
         Err(e) => {
             worker.log(&format!("attach: opening session failed: {e:#}"));
             worker.end_session();
-            let _ = write_line(&mut stream, &AttachAck { ok: false, error: Some(format!("{e:#}")) });
+            let _ = write_line(
+                &mut stream,
+                &AttachAck {
+                    ok: false,
+                    error: Some(format!("{e:#}")),
+                },
+            );
             return;
         }
     };
@@ -824,7 +882,15 @@ fn handle_attach(
     // Acknowledge before the splice so the client knows the session is live before it
     // enters raw mode. The ack read is unbuffered on the client side, so no guest output
     // is lost between the ack and the relay starting.
-    if write_line(&mut stream, &AttachAck { ok: true, error: None }).is_err() {
+    if write_line(
+        &mut stream,
+        &AttachAck {
+            ok: true,
+            error: None,
+        },
+    )
+    .is_err()
+    {
         worker.end_session();
         return;
     }
@@ -880,8 +946,10 @@ pub(crate) fn mint_token(socket_path: &Path) -> Result<String> {
 pub(crate) fn attached_count(socket_path: &Path) -> Result<usize> {
     let mut stream = UnixStream::connect(socket_path)
         .with_context(|| format!("connecting to worker socket {}", socket_path.display()))?;
-    write_line(&mut stream, &WorkerRequest::Count).context("requesting attached count from worker")?;
-    let resp: CountResponse = read_line_json(&mut stream).context("reading worker attached count")?;
+    write_line(&mut stream, &WorkerRequest::Count)
+        .context("requesting attached count from worker")?;
+    let resp: CountResponse =
+        read_line_json(&mut stream).context("reading worker attached count")?;
     Ok(resp.attached)
 }
 
@@ -1043,8 +1111,14 @@ extern "C" fn on_term_signal(_sig: libc::c_int) {
 
 fn install_signal_handlers() {
     unsafe {
-        libc::signal(libc::SIGTERM, on_term_signal as *const () as libc::sighandler_t);
-        libc::signal(libc::SIGINT, on_term_signal as *const () as libc::sighandler_t);
+        libc::signal(
+            libc::SIGTERM,
+            on_term_signal as *const () as libc::sighandler_t,
+        );
+        libc::signal(
+            libc::SIGINT,
+            on_term_signal as *const () as libc::sighandler_t,
+        );
     }
 }
 
@@ -1065,7 +1139,10 @@ mod tests {
         let mut store = TokenStore::new();
         let token = store.mint();
         assert!(!token.is_empty(), "a minted token is non-empty");
-        assert!(store.take(&token), "a freshly minted token is accepted once");
+        assert!(
+            store.take(&token),
+            "a freshly minted token is accepted once"
+        );
         assert!(
             !store.take(&token),
             "the same token must not be accepted twice (one-time use)"
@@ -1088,7 +1165,10 @@ mod tests {
         let a = store.mint();
         let b = store.mint();
         assert_ne!(a, b, "each mint yields a distinct token");
-        assert!(store.take(&a) && store.take(&b), "both remain independently valid");
+        assert!(
+            store.take(&a) && store.take(&b),
+            "both remain independently valid"
+        );
     }
 
     #[test]
@@ -1113,7 +1193,10 @@ mod tests {
             cols: 120,
         };
         let line = serde_json::to_string(&req).unwrap();
-        assert!(line.contains("\"op\":\"attach\""), "op tag must be flat: {line}");
+        assert!(
+            line.contains("\"op\":\"attach\""),
+            "op tag must be flat: {line}"
+        );
         let back: WorkerRequest = serde_json::from_str(&line).unwrap();
         assert_eq!(back, req);
     }
@@ -1161,7 +1244,11 @@ mod tests {
     #[test]
     fn worker_socket_path_is_under_the_daemon_workers_dir() {
         let p = worker_socket_path("/data", "web");
-        assert!(p.ends_with("daemon/workers/web.sock"), "got {}", p.display());
+        assert!(
+            p.ends_with("daemon/workers/web.sock"),
+            "got {}",
+            p.display()
+        );
     }
 
     #[test]
@@ -1180,7 +1267,11 @@ mod tests {
             take_worker_error(data_dir, "web").as_deref(),
             Some("boot blew up")
         );
-        assert_eq!(take_worker_error(data_dir, "web"), None, "error is cleared after reading");
+        assert_eq!(
+            take_worker_error(data_dir, "web"),
+            None,
+            "error is cleared after reading"
+        );
 
         // A stale error from a previous failed boot must not survive into the next boot:
         // writing a fresh boot spec clears it, so the launcher's poll loop can't read a
@@ -1197,7 +1288,10 @@ mod tests {
     #[test]
     fn a_count_request_and_response_roundtrip() {
         let line = serde_json::to_string(&WorkerRequest::Count).unwrap();
-        assert!(line.contains("\"op\":\"count\""), "op tag must be flat: {line}");
+        assert!(
+            line.contains("\"op\":\"count\""),
+            "op tag must be flat: {line}"
+        );
         let back: WorkerRequest = serde_json::from_str(&line).unwrap();
         assert_eq!(back, WorkerRequest::Count);
 
@@ -1210,13 +1304,23 @@ mod tests {
     #[test]
     fn a_save_request_and_response_roundtrip() {
         let line = serde_json::to_string(&WorkerRequest::Save).unwrap();
-        assert!(line.contains("\"op\":\"save\""), "op tag must be flat: {line}");
+        assert!(
+            line.contains("\"op\":\"save\""),
+            "op tag must be flat: {line}"
+        );
         let back: WorkerRequest = serde_json::from_str(&line).unwrap();
         assert_eq!(back, WorkerRequest::Save);
 
-        let ok = serde_json::to_string(&SaveResponse { ok: true, error: None }).unwrap();
+        let ok = serde_json::to_string(&SaveResponse {
+            ok: true,
+            error: None,
+        })
+        .unwrap();
         assert!(!ok.contains("error"), "ok save omits error: {ok}");
-        let bad = SaveResponse { ok: false, error: Some("disk full".to_string()) };
+        let bad = SaveResponse {
+            ok: false,
+            error: Some("disk full".to_string()),
+        };
         let back: SaveResponse =
             serde_json::from_str(&serde_json::to_string(&bad).unwrap()).unwrap();
         assert_eq!(back, bad);
@@ -1239,13 +1343,21 @@ mod tests {
         assert!(flush_is_due(cap, Duration::from_secs(0), interval, cap));
         assert!(flush_is_due(cap + 1, Duration::from_secs(1), interval, cap));
         // Just under the cap, early in the interval → not yet (bounded buffer still OK).
-        assert!(!flush_is_due(cap - 1, Duration::from_secs(1), interval, cap));
+        assert!(!flush_is_due(
+            cap - 1,
+            Duration::from_secs(1),
+            interval,
+            cap
+        ));
     }
 
     #[test]
     fn a_stop_request_roundtrips_with_a_flat_op_tag_and_defaulted_force() {
         let line = serde_json::to_string(&WorkerRequest::Stop { force: true }).unwrap();
-        assert!(line.contains("\"op\":\"stop\""), "op tag must be flat: {line}");
+        assert!(
+            line.contains("\"op\":\"stop\""),
+            "op tag must be flat: {line}"
+        );
         let back: WorkerRequest = serde_json::from_str(&line).unwrap();
         assert_eq!(back, WorkerRequest::Stop { force: true });
         // A stop line omitting `force` defaults to false.
@@ -1255,14 +1367,22 @@ mod tests {
 
     #[test]
     fn a_stop_response_carries_the_count_only_on_refusal() {
-        let refused = StopResponse { ok: false, attached: 3 };
+        let refused = StopResponse {
+            ok: false,
+            attached: 3,
+        };
         let back: StopResponse =
             serde_json::from_str(&serde_json::to_string(&refused).unwrap()).unwrap();
         assert_eq!(back, refused);
         // An accepted stop round-trips with a zero count.
-        let ok: StopResponse =
-            serde_json::from_str(&serde_json::to_string(&StopResponse { ok: true, attached: 0 }).unwrap())
-                .unwrap();
+        let ok: StopResponse = serde_json::from_str(
+            &serde_json::to_string(&StopResponse {
+                ok: true,
+                attached: 0,
+            })
+            .unwrap(),
+        )
+        .unwrap();
         assert!(ok.ok);
     }
 
@@ -1273,12 +1393,22 @@ mod tests {
         // Idle → a stop commits immediately, and then blocks any new session.
         let mut idle = SessionState::new();
         assert_eq!(idle.commit_stop(false), Ok(()));
-        assert!(!idle.begin(), "no session may start once a stop has committed");
+        assert!(
+            !idle.begin(),
+            "no session may start once a stop has committed"
+        );
 
         // Attached + not forced → refused, naming the count, and the worker stays runnable.
         assert!(s.begin() && s.begin(), "two sessions start");
-        assert_eq!(s.commit_stop(false), Err(2), "refusal carries the live count");
-        assert!(s.begin(), "a refused stop leaves the worker accepting sessions");
+        assert_eq!(
+            s.commit_stop(false),
+            Err(2),
+            "refusal carries the live count"
+        );
+        assert!(
+            s.begin(),
+            "a refused stop leaves the worker accepting sessions"
+        );
 
         // Forced → commits regardless of the attached count; commit is idempotent.
         assert_eq!(s.commit_stop(true), Ok(()));
@@ -1303,7 +1433,10 @@ mod tests {
         assert!(is_failed(data_dir, "web"), "marker present after a crash");
 
         clear_failed_marker(data_dir, "web");
-        assert!(!is_failed(data_dir, "web"), "marker cleared on a fresh boot");
+        assert!(
+            !is_failed(data_dir, "web"),
+            "marker cleared on a fresh boot"
+        );
 
         // read_last_log_lines returns the tail of the worker log (and empty when absent).
         assert_eq!(read_last_log_lines(data_dir, "web", 5), "");
@@ -1320,7 +1453,11 @@ mod tests {
 
     #[test]
     fn an_attach_ack_carries_an_error_only_on_failure() {
-        let ok = serde_json::to_string(&AttachAck { ok: true, error: None }).unwrap();
+        let ok = serde_json::to_string(&AttachAck {
+            ok: true,
+            error: None,
+        })
+        .unwrap();
         assert!(!ok.contains("error"), "ok ack omits error: {ok}");
         let bad = serde_json::to_string(&AttachAck {
             ok: false,
