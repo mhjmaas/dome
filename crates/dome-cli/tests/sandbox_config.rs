@@ -43,6 +43,22 @@ fn rm_sandbox(name: &str) {
     let _ = std::fs::remove_file(format!("{}/{}.config.json", dir, name));
 }
 
+fn rm_checkpoint(name: &str) {
+    let dir = format!("{}/checkpoints", data_dir());
+    let _ = std::fs::remove_file(format!("{}/{}.idx", dir, name));
+    let _ = std::fs::remove_file(format!("{}/{}.ext4", dir, name));
+}
+
+/// Write a throwaway empty `dome.json` and return its path, so config resolution in a test
+/// is isolated from whatever `dome.json` happens to sit in the test process's cwd. With an
+/// empty config, any field the test does not pass as a flag resolves to its default — which
+/// is exactly what lets us prove a seed's config was NOT inherited.
+fn empty_config(name: &str) -> String {
+    let path = format!("{}/dome-{}.json", std::env::temp_dir().display(), name);
+    std::fs::write(&path, "{}").expect("failed to write temp dome.json");
+    path
+}
+
 /// `sandbox create` resolves dome.json + flags into a structured, versioned config sidecar,
 /// without booting a VM. The sidecar must carry the schema `version` and the structured proxy
 /// section (so a later cold boot reproduces from it without re-reading dome.json).
@@ -365,4 +381,143 @@ fn cold_boot_applies_invocation_flags_and_updates_sidecar() {
     );
 
     rm_sandbox(&name);
+}
+
+/// `create --from` a sandbox clones disk/index state ONLY (#43): the new sandbox's config is
+/// resolved solely from dome.json + flags, never inherited from the seed. A seed created with
+/// distinctive config (cpus/memory/allow-net/disk-size) does not leak any of it into the new
+/// sandbox's sidecar — except disk_size, which follows the cloned disk (not dome.json), so the
+/// sidecar stays truthful about the real pinned disk.
+#[test]
+#[ignore]
+fn create_from_a_sandbox_resolves_config_from_dome_json_and_flags_not_the_seed() {
+    let seed = unique("from-seed");
+    let derived = unique("from-derived");
+    let cfg_file = empty_config(&derived);
+    rm_sandbox(&seed);
+    rm_sandbox(&derived);
+
+    // Seed carries a distinctive config and a non-default disk size.
+    let created = Command::new(dome_bin())
+        .args([
+            "sandbox",
+            "create",
+            &seed,
+            "--config",
+            &cfg_file,
+            "--cpus",
+            "8",
+            "--memory",
+            "4096",
+            "--allow-net",
+            "--disk-size",
+            "2048",
+        ])
+        .output()
+        .expect("failed to spawn dome");
+    assert!(
+        created.status.success(),
+        "seed create should succeed; stderr: {}",
+        String::from_utf8_lossy(&created.stderr)
+    );
+
+    // Derive from the seed, passing only --cpus 3. Disk is cloned; config comes from flags.
+    let derived_out = Command::new(dome_bin())
+        .args([
+            "sandbox", "create", &derived, "--from", &seed, "--config", &cfg_file, "--cpus", "3",
+        ])
+        .output()
+        .expect("failed to spawn dome");
+    assert!(
+        derived_out.status.success(),
+        "create --from a sandbox should succeed; stderr: {}",
+        String::from_utf8_lossy(&derived_out.stderr)
+    );
+
+    let cfg = std::fs::read_to_string(config_path(&derived)).expect("config sidecar must exist");
+    assert!(
+        cfg.contains("\"cpus\": 3"),
+        "the flag wins: derived cpus must be 3, not the seed's 8; got: {cfg}"
+    );
+    assert!(
+        cfg.contains("\"memory\": null"),
+        "the seed's memory must NOT be inherited (no flag, empty dome.json → null); got: {cfg}"
+    );
+    assert!(
+        cfg.contains("\"allow_net\": false"),
+        "the seed's allow_net=true must NOT be inherited; got: {cfg}"
+    );
+    assert!(
+        cfg.contains("\"disk_size\": 2048"),
+        "disk_size follows the cloned disk (2048), keeping the sidecar truthful; got: {cfg}"
+    );
+
+    let _ = std::fs::remove_file(&cfg_file);
+    rm_sandbox(&seed);
+    rm_sandbox(&derived);
+}
+
+/// `create --from` a checkpoint resolves config identically to seeding from a sandbox (#43):
+/// solely from dome.json + flags, with no dependence on the seed (a checkpoint has no config
+/// sidecar at all). Boots a real VM to mint the checkpoint.
+#[test]
+#[ignore]
+fn create_from_a_checkpoint_resolves_config_from_dome_json_and_flags() {
+    let cp = unique("from-cp");
+    let derived = unique("from-cp-derived");
+    let cfg_file = empty_config(&derived);
+    rm_checkpoint(&cp);
+    rm_sandbox(&derived);
+
+    // Mint a checkpoint with a distinctive disk size (boots a VM).
+    let made = Command::new(dome_bin())
+        .args([
+            "checkpoint",
+            "create",
+            &cp,
+            "--disk-size",
+            "2048",
+            "--",
+            "sh",
+            "-c",
+            "true",
+        ])
+        .output()
+        .expect("failed to spawn dome");
+    assert!(
+        made.status.success(),
+        "checkpoint create should succeed; stderr: {}",
+        String::from_utf8_lossy(&made.stderr)
+    );
+
+    // Derive a sandbox from the checkpoint, passing only --cpus 3.
+    let derived_out = Command::new(dome_bin())
+        .args([
+            "sandbox", "create", &derived, "--from", &cp, "--config", &cfg_file, "--cpus", "3",
+        ])
+        .output()
+        .expect("failed to spawn dome");
+    assert!(
+        derived_out.status.success(),
+        "create --from a checkpoint should succeed; stderr: {}",
+        String::from_utf8_lossy(&derived_out.stderr)
+    );
+
+    let cfg = std::fs::read_to_string(config_path(&derived)).expect("config sidecar must exist");
+    assert!(
+        cfg.contains("\"cpus\": 3"),
+        "config comes from the flag (cpus=3); got: {cfg}"
+    );
+    assert!(
+        cfg.contains("\"allow_net\": false") && cfg.contains("\"memory\": null"),
+        "unset fields resolve to defaults, identical to seeding from a sandbox; got: {cfg}"
+    );
+    assert!(
+        cfg.contains("\"disk_size\": 2048"),
+        "disk_size follows the cloned checkpoint disk (2048); got: {cfg}"
+    );
+
+    let _ = std::fs::remove_file(&cfg_file);
+    rm_checkpoint(&cp);
+    rm_sandbox(&derived);
 }
