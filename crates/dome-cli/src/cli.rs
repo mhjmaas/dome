@@ -122,8 +122,28 @@ pub(crate) enum Commands {
         action: SandboxCommands,
     },
 
+    /// Manage the domed control-plane daemon (start, stop, status)
+    Daemon {
+        #[command(subcommand)]
+        action: DaemonCommands,
+    },
+
     /// Remove leftover instance data from crashed VMs
     Prune,
+
+    /// Internal: run as the domed supervisor (re-exec target; not for direct use)
+    #[command(name = "__domed", hide = true)]
+    Domed,
+}
+
+#[derive(clap::Subcommand)]
+pub(crate) enum DaemonCommands {
+    /// Start the daemon (pre-warm the control plane); no-op if already running
+    Start,
+    /// Stop the daemon; running sandboxes are left untouched
+    Stop,
+    /// Report whether the daemon is up, with pid, uptime, worker count, and socket path
+    Status,
 }
 
 #[derive(clap::Subcommand)]

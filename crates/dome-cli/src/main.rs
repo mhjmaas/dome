@@ -2,6 +2,7 @@ mod assets;
 mod checkpoint;
 mod cli;
 mod config;
+mod daemon;
 mod gc;
 mod lock;
 mod retention;
@@ -17,7 +18,7 @@ use clap::Parser;
 
 use dome_vm::{default_data_dir, VmState};
 
-use cli::{CheckpointCommands, Cli, Commands, SandboxCommands};
+use cli::{CheckpointCommands, Cli, Commands, DaemonCommands, SandboxCommands};
 use config::load_config;
 
 fn main() -> Result<()> {
@@ -166,6 +167,17 @@ fn main() -> Result<()> {
                 sandbox::remove_sandbox(name, config.as_deref())?;
             }
         },
+        Commands::Daemon { action } => {
+            let data_dir = default_data_dir();
+            match action {
+                DaemonCommands::Start => daemon::start(&data_dir)?,
+                DaemonCommands::Stop => daemon::stop(&data_dir)?,
+                DaemonCommands::Status => daemon::status(&data_dir)?,
+            }
+        }
+        Commands::Domed => {
+            daemon::run_supervisor(&default_data_dir())?;
+        }
     }
 
     Ok(())
