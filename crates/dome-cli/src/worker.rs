@@ -179,6 +179,10 @@ enum WorkerRequest {
         rows: u16,
         cols: u16,
     },
+    /// domed asks the worker how many terminals are currently attached. The worker is
+    /// the source of truth for this count: it owns the byte path, so it (not domed) sees
+    /// every session start and end. Used to drive the `ATTACHED` column in `ls`.
+    Count,
     /// Stop the worker: save the sandbox and shut the VM down.
     Stop,
 }
@@ -186,6 +190,11 @@ enum WorkerRequest {
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 struct MintResponse {
     token: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+struct CountResponse {
+    attached: usize,
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
@@ -445,6 +454,10 @@ fn handle_conn(worker: &Arc<Worker>, mut stream: UnixStream) {
             let token = worker.tokens.lock().unwrap().mint();
             let _ = write_line(&mut stream, &MintResponse { token });
         }
+        WorkerRequest::Count => {
+            let attached = worker.attached.load(Ordering::SeqCst);
+            let _ = write_line(&mut stream, &CountResponse { attached });
+        }
         WorkerRequest::Stop => {
             worker.shutdown.store(true, Ordering::SeqCst);
             let _ = write_line(&mut stream, &AttachAck { ok: true, error: None });
@@ -542,6 +555,17 @@ pub(crate) fn mint_token(socket_path: &Path) -> Result<String> {
     write_line(&mut stream, &WorkerRequest::Mint).context("requesting token from worker")?;
     let resp: MintResponse = read_line_json(&mut stream).context("reading worker token")?;
     Ok(resp.token)
+}
+
+/// domed-side: ask a running worker how many terminals are currently attached. domed is
+/// not in the byte path, so it cannot count attaches itself — the worker, which owns the
+/// data plane, is the source of truth. Drives the `ATTACHED` column in `ls`.
+pub(crate) fn attached_count(socket_path: &Path) -> Result<usize> {
+    let mut stream = UnixStream::connect(socket_path)
+        .with_context(|| format!("connecting to worker socket {}", socket_path.display()))?;
+    write_line(&mut stream, &WorkerRequest::Count).context("requesting attached count from worker")?;
+    let resp: CountResponse = read_line_json(&mut stream).context("reading worker attached count")?;
+    Ok(resp.attached)
 }
 
 /// CLI-side: connect directly to the worker, authorize with the one-time token, and run
@@ -731,6 +755,7 @@ mod tests {
     fn every_worker_request_variant_roundtrips() {
         for req in [
             WorkerRequest::Mint,
+            WorkerRequest::Count,
             WorkerRequest::Stop,
             WorkerRequest::Attach {
                 token: "t".to_string(),
@@ -799,6 +824,19 @@ mod tests {
             None,
             "writing a fresh boot spec clears a stale error"
         );
+    }
+
+    #[test]
+    fn a_count_request_and_response_roundtrip() {
+        let line = serde_json::to_string(&WorkerRequest::Count).unwrap();
+        assert!(line.contains("\"op\":\"count\""), "op tag must be flat: {line}");
+        let back: WorkerRequest = serde_json::from_str(&line).unwrap();
+        assert_eq!(back, WorkerRequest::Count);
+
+        let resp = CountResponse { attached: 3 };
+        let back: CountResponse =
+            serde_json::from_str(&serde_json::to_string(&resp).unwrap()).unwrap();
+        assert_eq!(back.attached, 3);
     }
 
     #[test]

@@ -194,11 +194,11 @@ impl WorkerLauncher for FakeLauncher {
 // Registry
 // ---------------------------------------------------------------------------
 
-/// A registry entry: the worker handle plus how many terminals are attached.
-#[allow(dead_code)] // `handle` is read by the worker-lifecycle slice (#24+).
+/// A registry entry wrapping the worker handle. The attached-terminal count is NOT held
+/// here: domed is not in the byte path, so it never observes session start/end. The
+/// worker owns that count and domed queries it on demand (see [`worker::attached_count`]).
 struct WorkerEntry {
     handle: WorkerHandle,
-    attached: usize,
 }
 
 /// domed's in-memory registry of live workers, keyed by sandbox name. Enforces
@@ -221,13 +221,8 @@ impl Registry {
         if self.workers.contains_key(&handle.name) {
             bail!("a worker is already running for sandbox '{}'", handle.name);
         }
-        self.workers.insert(
-            handle.name.clone(),
-            WorkerEntry {
-                handle,
-                attached: 0,
-            },
-        );
+        self.workers
+            .insert(handle.name.clone(), WorkerEntry { handle });
         Ok(())
     }
 
@@ -242,14 +237,25 @@ impl Registry {
     }
 
     /// Overlay live-worker state onto disk-derived rows: a sandbox with a live worker
-    /// reads as `running` with its attached-terminal count.
-    fn overlay(&self, infos: &mut [SandboxInfo]) {
+    /// reads as `running`, and its `ATTACHED` count comes from `counts` — the live values
+    /// domed queried from each worker (the source of truth). A running worker missing from
+    /// `counts` (its count query failed) still reads as `running` with 0 attached.
+    fn overlay(&self, infos: &mut [SandboxInfo], counts: &HashMap<String, usize>) {
         for info in infos.iter_mut() {
-            if let Some(entry) = self.workers.get(&info.name) {
+            if self.workers.contains_key(&info.name) {
                 info.state = "running".to_string();
-                info.attached = entry.attached;
+                info.attached = counts.get(&info.name).copied().unwrap_or(0);
             }
         }
+    }
+
+    /// Snapshot each live worker's name + data-plane socket, so the caller can query their
+    /// attached counts without holding the registry lock across the socket round-trips.
+    fn worker_sockets(&self) -> Vec<(String, PathBuf)> {
+        self.workers
+            .iter()
+            .map(|(name, entry)| (name.clone(), entry.handle.socket_path.clone()))
+            .collect()
     }
 }
 
@@ -301,10 +307,21 @@ impl Supervisor {
         }
     }
 
-    /// Build the current sandbox listing: disk scan overlaid with live-worker state.
+    /// Build the current sandbox listing: disk scan overlaid with live-worker state. The
+    /// attached-terminal count for each running worker is queried from the worker itself
+    /// (domed is not in the byte path), so `ls` reflects attaches/detaches live.
     fn list(&self) -> Result<Vec<SandboxInfo>> {
         let mut infos = sandbox::collect_sandbox_infos(&self.data_dir)?;
-        self.registry.lock().unwrap().overlay(&mut infos);
+        // Snapshot live workers under the lock, then query their counts WITHOUT holding it
+        // (each query is a socket round-trip) so concurrent attaches/status stay responsive.
+        let sockets = self.registry.lock().unwrap().worker_sockets();
+        let mut counts = HashMap::new();
+        for (name, socket) in sockets {
+            if let Ok(n) = worker::attached_count(&socket) {
+                counts.insert(name, n);
+            }
+        }
+        self.registry.lock().unwrap().overlay(&mut infos, &counts);
         Ok(infos)
     }
 
@@ -965,8 +982,9 @@ mod tests {
             .launch("api", &serde_json::json!({}), d.path().to_str().unwrap())
             .unwrap();
         reg.insert(h).unwrap();
-        // Simulate two attached terminals.
-        reg.workers.get_mut("api").unwrap().attached = 2;
+        // Simulate two attached terminals: the count comes from the (queried) worker, not
+        // from the registry entry, so we pass it in the live-counts map.
+        let counts = HashMap::from([("api".to_string(), 2usize)]);
 
         let mut infos = vec![
             SandboxInfo {
@@ -986,10 +1004,35 @@ mod tests {
                 created_unix: 0,
             },
         ];
-        reg.overlay(&mut infos);
+        reg.overlay(&mut infos, &counts);
         assert_eq!(infos[0].state, "running");
         assert_eq!(infos[0].attached, 2);
         assert_eq!(infos[1].state, "idle", "a sandbox with no worker stays idle");
+    }
+
+    #[test]
+    fn overlay_keeps_a_worker_running_with_zero_attached_when_all_terminals_close() {
+        // After the last terminal detaches the worker reports 0 attached but the VM stays
+        // up: the sandbox must still read as `running` (count 0), not `idle`.
+        let mut reg = Registry::new();
+        let d = tmp_data_dir();
+        let h = FakeLauncher
+            .launch("api", &serde_json::json!({}), d.path().to_str().unwrap())
+            .unwrap();
+        reg.insert(h).unwrap();
+
+        let mut infos = vec![SandboxInfo {
+            name: "api".to_string(),
+            size_bytes: 0,
+            base: "1.2.3".to_string(),
+            state: "idle".to_string(),
+            attached: 7, // stale value that overlay must overwrite
+            created_unix: 0,
+        }];
+        // An empty counts map mirrors "worker live, zero terminals attached".
+        reg.overlay(&mut infos, &HashMap::new());
+        assert_eq!(infos[0].state, "running", "the VM is still up after all detaches");
+        assert_eq!(infos[0].attached, 0, "no terminals attached → count 0");
     }
 
     #[test]
