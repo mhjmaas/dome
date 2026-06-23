@@ -7,6 +7,7 @@ mod gc;
 mod lock;
 mod retention;
 mod sandbox;
+mod sandbox_config;
 mod session;
 mod stdio;
 mod vm;
@@ -162,6 +163,9 @@ fn main() -> Result<()> {
             }
             SandboxCommands::Create { name, vm, from } => {
                 sandbox::create_sandbox(name, &vm, from.as_deref())?;
+            }
+            SandboxCommands::Config { name, vm } => {
+                sandbox::config_sandbox(name, &vm)?;
             }
             SandboxCommands::Save { name, config } => {
                 sandbox::save_sandbox(name, config.as_deref())?;

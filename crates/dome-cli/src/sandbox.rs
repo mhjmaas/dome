@@ -14,6 +14,7 @@ use crate::checkpoint;
 use crate::cli::VmArgs;
 use crate::config::{load_config, DomeConfig};
 use crate::lock::{self, Lock};
+use crate::sandbox_config::SandboxConfig;
 use crate::vm::{self, SandboxSource};
 use crate::worker;
 
@@ -60,13 +61,11 @@ pub(crate) fn run_sandbox(
     let attach = crate::daemon::attach_via_daemon(&data_dir, &name, boot.to_value()?)?;
 
     // Config flags only take effect on a cold boot; warn (don't silently mislead) when
-    // they were passed but the VM was already running and kept its original config.
+    // they were passed but the VM was already running and kept its original config. When
+    // the live config is readable, name the specific conflicting live values; otherwise
+    // fall back to a generic notice.
     if !attach.cold_booted && vm_flags_specified(vm_args, from) {
-        eprintln!(
-            "dome: sandbox '{}' is already running — its existing config is kept; the \
-             flags passed here are ignored. Stop it first to boot with new settings.",
-            name
-        );
+        warn_ignored_flags(&data_dir, &name, vm_args, from);
     }
 
     worker::attach_and_relay(&attach, &command, tty)
@@ -86,6 +85,37 @@ fn vm_flags_specified(vm_args: &VmArgs, from: Option<&str>) -> bool {
         || !vm_args.secret.is_empty()
         || !vm_args.allow_host.is_empty()
         || !vm_args.expose_host.is_empty()
+}
+
+/// Warn that boot flags passed to an already-running sandbox are ignored. When the worker's
+/// live config is readable, name the specific conflicting live values (e.g. `--cpus 8 (live:
+/// 2)`) so the user sees exactly what was kept; otherwise emit a generic notice. `--from` is
+/// always a creation-time-only seed, so it is called out separately when present.
+fn warn_ignored_flags(data_dir: &str, name: &str, vm_args: &VmArgs, from: Option<&str>) {
+    let conflicts = SandboxConfig::load_live(data_dir, name)
+        .map(|live| live.conflicts(vm_args))
+        .unwrap_or_default();
+
+    if conflicts.is_empty() && from.is_none() {
+        eprintln!(
+            "dome: sandbox '{}' is already running — its existing config is kept; the \
+             flags passed here are ignored. Stop it first to boot with new settings.",
+            name
+        );
+        return;
+    }
+
+    eprintln!(
+        "dome: sandbox '{}' is already running — these flags are ignored (its live config \
+         is kept; stop it first, or use `dome sandbox config {}`, to change it):",
+        name, name
+    );
+    for line in &conflicts {
+        eprintln!("  {line}");
+    }
+    if from.is_some() {
+        eprintln!("  --from (only seeds a brand-new sandbox; never re-seeds a running one)");
+    }
 }
 
 /// Worker-side: resolve (creating, seeding, or pinning as needed) the CAS source a
@@ -177,6 +207,10 @@ pub(crate) fn create_sandbox(
             eprintln!("dome: created sandbox '{}'", name);
         }
     }
+
+    // Persist the per-sandbox config so every cold boot reproduces this VM shape, rather
+    // than depending on whatever flags a later `shell`/`run` invocation happens to pass.
+    SandboxConfig::from_vm_args(vm_args).save(&data_dir, &name)?;
     Ok(())
 }
 
@@ -334,6 +368,78 @@ pub(crate) fn save_sandbox(name_arg: Option<String>, config_path: Option<&str>) 
     Ok(())
 }
 
+/// `dome sandbox config <name> [flags]`: view or edit a sandbox's persisted config. With no
+/// boot flags it prints the current config; with flags it merges them into the persisted
+/// metadata (atomically) and reports that the change applies on the **next** cold boot, not
+/// to a running VM. The sandbox must already exist (created lazily by `shell`/`run` or
+/// explicitly by `create`). Disk size remains pinned by the index guardrail regardless.
+pub(crate) fn config_sandbox(name_arg: Option<String>, vm_args: &VmArgs) -> Result<()> {
+    reject_direct_storage()?;
+    let cfg = load_config(vm_args.config.as_deref())?;
+    let cwd = std::env::current_dir()?;
+    let name = resolve_name(name_arg.as_deref(), &cfg, &cwd)?;
+    dome_vm::validate_checkpoint_name(&name).map_err(|e| anyhow::anyhow!(e))?;
+
+    let data_dir = dome_vm::default_data_dir();
+    let index_path = format!("{}/sandboxes/{}.idx", data_dir, name);
+    if !Path::new(&index_path).exists() {
+        bail!(
+            "sandbox '{}' not found. Create it first with `dome sandbox create {}` \
+             (or `dome sandbox shell {}`).",
+            name,
+            name,
+            name
+        );
+    }
+
+    // An existing sandbox created before config persistence has no sidecar yet; treat a
+    // missing sidecar as an empty config so editing it still works.
+    let mut config = SandboxConfig::load(&data_dir, &name)?.unwrap_or_default();
+
+    // No boot-affecting flags ⇒ a read-only view; otherwise merge the edit.
+    if !vm_flags_specified(vm_args, None) {
+        print_sandbox_config(&name, &config);
+        return Ok(());
+    }
+
+    config.merge_update(vm_args);
+    config.save(&data_dir, &name)?;
+    eprintln!(
+        "dome: updated config for sandbox '{}'. It applies on the next cold boot; a \
+         running VM keeps its current config until stopped.",
+        name
+    );
+    print_sandbox_config(&name, &config);
+    Ok(())
+}
+
+/// Pretty-print a sandbox's persisted config, showing unset scalars as `default` and empty
+/// lists as `none`, so `dome sandbox config <name>` reads clearly.
+fn print_sandbox_config(name: &str, c: &SandboxConfig) {
+    let scalar = |v: Option<u64>| v.map(|n| n.to_string()).unwrap_or_else(|| "default".into());
+    let list = |v: &[String]| {
+        if v.is_empty() {
+            "none".to_string()
+        } else {
+            v.join(", ")
+        }
+    };
+    eprintln!("config for sandbox '{}':", name);
+    eprintln!(
+        "  cpus:             {}",
+        c.cpus.map(|n| n.to_string()).unwrap_or_else(|| "default".into())
+    );
+    eprintln!("  memory (MB):      {}", scalar(c.memory));
+    eprintln!("  disk_size (MB):   {}", scalar(c.disk_size));
+    eprintln!("  allow_net:        {}", c.allow_net);
+    eprintln!("  allow_host_writes:{}", c.allow_host_writes);
+    eprintln!("  ports:            {}", list(&c.ports));
+    eprintln!("  mounts:           {}", list(&c.mounts));
+    eprintln!("  secrets:          {}", list(&c.secrets));
+    eprintln!("  allow_host:       {}", list(&c.allow_host));
+    eprintln!("  expose_host:      {}", list(&c.expose_host));
+}
+
 /// `dome sandbox stop [--force] <name>`: stop a running sandbox — flush+save and shut its
 /// VM down. Resolves the name the same way the rest of the command group does, then routes
 /// through domed, which refuses (naming the count) when terminals are still attached unless
@@ -385,6 +491,10 @@ pub(crate) fn delete_sandbox_index(data_dir: &str, name: &str) -> Result<()> {
     // Drop any crash marker too, so a sandbox later reusing this name does not inherit a
     // stale `failed` state in `ls` before its first cold boot. Best-effort.
     worker::clear_failed_marker(data_dir, name);
+    // Drop the persisted config sidecar (and any live marker) so a sandbox later reusing
+    // this name starts from a clean slate rather than inheriting the removed one's config.
+    SandboxConfig::remove(data_dir, name);
+    SandboxConfig::clear_live(data_dir, name);
     Ok(())
 }
 

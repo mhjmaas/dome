@@ -41,6 +41,7 @@ use crate::cli::VmArgs;
 use crate::config::load_config;
 use crate::lock::{self, Lock};
 use crate::sandbox;
+use crate::sandbox_config::SandboxConfig;
 use crate::vm;
 
 /// Accept-loop poll cadence (the listener is non-blocking so it can notice shutdown).
@@ -418,15 +419,21 @@ impl SessionState {
     }
 }
 
+/// Append a line to a worker's on-disk log. A free function so the boot path can log
+/// (naming the data dir + sandbox) before the [`Worker`] struct itself exists.
+fn append_log(data_dir: &str, name: &str, msg: &str) {
+    if let Ok(mut f) = std::fs::OpenOptions::new()
+        .create(true)
+        .append(true)
+        .open(log_path(data_dir, name))
+    {
+        let _ = writeln!(f, "{} {}", now_unix(), msg);
+    }
+}
+
 impl Worker {
     fn log(&self, msg: &str) {
-        if let Ok(mut f) = std::fs::OpenOptions::new()
-            .create(true)
-            .append(true)
-            .open(log_path(&self.data_dir, &self.name))
-        {
-            let _ = writeln!(f, "{} {}", now_unix(), msg);
-        }
+        append_log(&self.data_dir, &self.name, msg);
     }
 
     /// Bytes currently buffered in the in-memory dirty map (0 in flat-file mode).
@@ -536,9 +543,32 @@ fn boot_and_serve(name: &str, data_dir: &str) -> Result<()> {
         ),
     };
 
+    // Resolve the effective boot config. A sandbox's persisted sidecar is the source of
+    // truth: every cold boot reproduces from it, ignoring the attaching client's flags. A
+    // sandbox with no sidecar yet (a lazy first boot, or one created before config
+    // persistence) adopts this invocation's flags as its config and persists them, so the
+    // next boot is reproducible. The effective config is also recorded as the live config so
+    // the CLI can name the live value when warning that flags to a running sandbox are kept.
+    let effective_vm_args = match SandboxConfig::load(data_dir, name)? {
+        Some(persisted) => persisted.apply_to_vm_args(&boot.vm_args),
+        None => {
+            let captured = SandboxConfig::from_vm_args(&boot.vm_args);
+            if let Err(e) = captured.save(data_dir, name) {
+                append_log(
+                    data_dir,
+                    name,
+                    &format!("warning: could not persist sandbox config: {e:#}"),
+                );
+            }
+            boot.vm_args.clone()
+        }
+    };
+    SandboxConfig::from_vm_args(&effective_vm_args).save_live(data_dir, name);
+
     // Resolve (creating/seeding/pinning) the CAS source, then prepare and boot the VM.
-    let source = sandbox::prepare_sandbox_source(name, data_dir, &boot.vm_args, boot.from.as_deref())?;
-    let prepared = vm::prepare_vm(&boot.vm_args, &cfg, None, Some(&source))?;
+    let source =
+        sandbox::prepare_sandbox_source(name, data_dir, &effective_vm_args, boot.from.as_deref())?;
+    let prepared = vm::prepare_vm(&effective_vm_args, &cfg, None, Some(&source))?;
     let instance_dir = prepared.instance_dir.clone();
 
     let booted = vm::boot_vm(&prepared)?;
@@ -601,6 +631,8 @@ fn boot_and_serve(name: &str, data_dir: &str) -> Result<()> {
     drop(nbd_handle);
     let _ = std::fs::remove_file(&worker.socket_path);
     let _ = std::fs::remove_dir_all(&instance_dir);
+    // The VM is down, so the live config no longer describes a running VM; clear it.
+    SandboxConfig::clear_live(data_dir, name);
     worker.log("worker stopped");
     Ok(())
 }
