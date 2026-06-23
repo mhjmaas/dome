@@ -38,10 +38,23 @@ fn ephemeral_run(guest_cmd: &str) -> std::process::Output {
         .expect("failed to spawn dome — is DOME_BIN correct?")
 }
 
+/// Stop a sandbox's persistent worker (since #24 the VM outlives a session; there is no
+/// user-facing `sandbox stop` until #27). SIGTERM makes the worker save the sandbox and
+/// shut the VM down cleanly, releasing the persistence lock. Best-effort; waits for the
+/// save + teardown to complete.
+fn stop_worker(name: &str) {
+    let _ = std::process::Command::new("pkill")
+        .args(["-TERM", "-f", &format!("__worker {}", name)])
+        .output();
+    std::thread::sleep(std::time::Duration::from_secs(3));
+}
+
 fn rm_sandbox(name: &str) {
-    // Best-effort cleanup independent of the binary under test: remove the index (and
+    // Best-effort cleanup independent of the binary under test. Since #24 a live worker
+    // owns the VM and the persistence lock, so stop it first; then remove the index (and
     // any lock left by a crashed session) directly via the data dir so a broken `rm`
     // can never strand other tests.
+    stop_worker(name);
     let home = std::env::var("HOME").unwrap_or_else(|_| "/tmp".to_string());
     let dir = format!("{}/.local/share/dome/sandboxes", home);
     let _ = std::fs::remove_file(format!("{}/{}.idx", dir, name));
@@ -140,7 +153,10 @@ fn save_happens_on_nonzero_exit() {
         "exit code should propagate from the guest command"
     );
 
-    // The disk state must still have been saved.
+    // Stop the worker so it flushes the sandbox to its on-disk index, then the next
+    // session cold-boots from that saved state — proving a non-zero-exit session's
+    // writes are durable (since #24 the save happens on worker stop, not per session).
+    stop_worker(&name);
     let read = sandbox_run(&name, "cat /root/artifact.txt");
     assert!(
         String::from_utf8_lossy(&read.stdout).contains("built"),
@@ -180,57 +196,44 @@ fn lazy_create_then_resume() {
     rm_sandbox(&name);
 }
 
-/// A second concurrent session on a locked sandbox must boot as an ephemeral fork:
-/// it runs fully but never writes back to the owner's saved index, and it announces
-/// itself so the user knows its changes are discarded.
+/// Since #24 the ephemeral-fork model is gone: a sandbox is owned by one persistent
+/// worker, and a second concurrent session attaches to the SAME live VM with full write
+/// access (a shared, writable filesystem). So a write from a concurrent session is
+/// immediately visible to the owner — the opposite of the old fork behaviour.
 #[test]
 #[ignore]
-fn concurrent_fork_does_not_alter_owner_saved_state() {
+fn concurrent_session_shares_the_same_live_vm() {
     let name = sandbox_name("concurrent");
     rm_sandbox(&name);
 
-    // Seed the sandbox with a known marker and let the owner persist it.
-    let seed = sandbox_run(&name, "echo owner-original > /root/marker.txt");
-    assert!(
-        seed.status.success(),
-        "seeding the sandbox should succeed; stderr: {}",
-        String::from_utf8_lossy(&seed.stderr)
-    );
-
-    // The owner holds the persistence lock for a while without changing the marker.
-    // It acquires the lock early (before the slow VM boot), so by the time the fork
-    // starts the lock is already held.
+    // Owner cold-boots the VM and keeps a session open while a second session runs.
     let mut owner = sandbox_spawn(&name, "sleep 25");
+    // Give the worker time to cold-boot before the second session attaches.
+    std::thread::sleep(std::time::Duration::from_secs(8));
 
-    // Give the owner time to start and acquire the lock before the fork begins.
-    std::thread::sleep(std::time::Duration::from_secs(6));
-
-    // The fork tries to overwrite the marker. Because the sandbox is locked, this
-    // session is an ephemeral fork and its write must be discarded.
-    let fork = sandbox_run(&name, "echo fork-wrote-this > /root/marker.txt");
+    // A concurrent session writes a marker; it must NOT announce itself as a fork
+    // (that model is gone) and its write lands on the shared live filesystem.
+    let writer = sandbox_run(&name, "echo shared-write > /root/marker.txt");
     assert!(
-        String::from_utf8_lossy(&fork.stderr).contains("ephemeral fork"),
-        "a concurrent session should announce itself as an ephemeral fork; stderr: {}",
-        String::from_utf8_lossy(&fork.stderr)
+        writer.status.success(),
+        "a concurrent session should attach and run; stderr: {}",
+        String::from_utf8_lossy(&writer.stderr)
+    );
+    assert!(
+        !String::from_utf8_lossy(&writer.stderr).contains("ephemeral fork"),
+        "the ephemeral-fork model was removed in #24; stderr: {}",
+        String::from_utf8_lossy(&writer.stderr)
     );
 
-    // Let the owner exit cleanly and save (the marker unchanged).
-    owner.wait().expect("owner session should exit");
-
-    // Resuming the sandbox must show the OWNER's state, never the fork's write.
+    // A third session sees the concurrent write immediately — same live VM, shared fs.
     let read = sandbox_run(&name, "cat /root/marker.txt");
-    let out = String::from_utf8_lossy(&read.stdout);
     assert!(
-        out.contains("owner-original"),
-        "saved state should reflect the owner, not the fork; stdout: {}",
-        out
-    );
-    assert!(
-        !out.contains("fork-wrote-this"),
-        "the ephemeral fork's write must NOT be persisted; stdout: {}",
-        out
+        String::from_utf8_lossy(&read.stdout).contains("shared-write"),
+        "concurrent sessions share one live writable filesystem; stdout: {}",
+        String::from_utf8_lossy(&read.stdout)
     );
 
+    let _ = owner.wait();
     rm_sandbox(&name);
 }
 
@@ -284,6 +287,12 @@ fn rm_then_prune_reclaims_orphans_while_keeping_referenced() {
         "seeding the victim sandbox should succeed; stderr: {}",
         String::from_utf8_lossy(&v.stderr)
     );
+
+    // Since #24 the save happens on worker stop, not per session, and a live worker
+    // holds the persistence lock (so `rm` would refuse). Stop both workers so their
+    // writes are flushed to their on-disk indexes and the lock is released.
+    stop_worker(&keeper);
+    stop_worker(&victim);
 
     let before = chunk_count();
 

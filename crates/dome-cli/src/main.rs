@@ -10,6 +10,7 @@ mod sandbox;
 mod session;
 mod stdio;
 mod vm;
+mod worker;
 
 use std::process;
 
@@ -177,6 +178,9 @@ fn main() -> Result<()> {
         }
         Commands::Domed => {
             daemon::run_supervisor(&default_data_dir())?;
+        }
+        Commands::Worker { name } => {
+            worker::run_worker(&name, &default_data_dir())?;
         }
     }
 

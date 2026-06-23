@@ -1,5 +1,5 @@
 use std::collections::HashMap;
-use std::io::{BufReader, BufWriter, Read, Write};
+use std::io::{Read, Write};
 use std::net::{Shutdown, TcpListener, TcpStream};
 use std::os::fd::AsRawFd;
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -713,91 +713,9 @@ impl Sandbox {
         };
         frame::send_json(&mut writer, frame::EXEC_REQ, &req)?;
 
-        // Enter raw mode - TerminalState restores on drop
-        let _raw_guard = terminal::TerminalState::enter_raw_mode(stdin_fd);
-
-        // Set up kqueue-based stdin relay (zero-latency I/O multiplexing)
-        let (relay, shutdown_signal) =
-            terminal::StdinRelay::new(stdin_fd).expect("failed to init stdin relay");
-
-        let exit_code = Arc::new(Mutex::new(0i32));
-
-        // Thread A: stdin → vsock (kqueue blocks until data/resize/shutdown)
-        let mut vsock_writer = writer.try_clone()?;
-        let stdin_thread = std::thread::spawn(move || {
-            let mut buf = [0u8; 4096];
-            loop {
-                match relay.wait() {
-                    terminal::StdinEvent::Ready => {
-                        let n = terminal::read_raw(stdin_fd, &mut buf);
-                        if n == 0 {
-                            break;
-                        }
-                        if frame::write_frame(&mut vsock_writer, frame::STDIN, &buf[..n]).is_err() {
-                            break;
-                        }
-                    }
-                    terminal::StdinEvent::Resize => {
-                        let (rows, cols) = terminal::terminal_size(stdin_fd);
-                        let payload = frame::resize_payload(rows, cols);
-                        if frame::write_frame(&mut vsock_writer, frame::RESIZE, &payload).is_err() {
-                            break;
-                        }
-                    }
-                    terminal::StdinEvent::Shutdown => break,
-                }
-            }
-        });
-
-        // Thread B: vsock -> stdout (read binary frames, write raw output)
-        // Uses BufWriter + deferred flush to batch rapid TUI updates into
-        // fewer terminal writes, preventing visible tearing/flickering.
-        let exit_code_b = exit_code.clone();
-        let vsock_thread = std::thread::spawn(move || {
-            let mut reader = BufReader::new(reader);
-            let mut stdout = BufWriter::new(std::io::stdout());
-            loop {
-                match frame::read_frame(&mut reader) {
-                    Ok(Some((frame::STDOUT, payload))) => {
-                        let _ = stdout.write_all(&payload);
-                        // Only flush to the terminal when no more data is
-                        // already buffered from the vsock. This batches
-                        // rapid sequential messages (e.g. a full TUI
-                        // screen redraw) into a single terminal write.
-                        if reader.buffer().is_empty() {
-                            let _ = stdout.flush();
-                        }
-                    }
-                    Ok(Some((frame::EXIT, payload))) => {
-                        let _ = stdout.flush();
-                        *exit_code_b.lock().unwrap() =
-                            frame::parse_exit_code(&payload).unwrap_or(0);
-                        break;
-                    }
-                    Ok(Some((frame::ERROR, payload))) => {
-                        let _ = stdout.flush();
-                        let msg = String::from_utf8_lossy(&payload);
-                        let _ = std::io::stderr()
-                            .write_all(format!("guest error: {}\r\n", msg).as_bytes());
-                        *exit_code_b.lock().unwrap() = 1;
-                        break;
-                    }
-                    Ok(Some(_)) => {} // unknown type, skip
-                    Ok(None) | Err(_) => break,
-                }
-            }
-            let _ = stdout.flush();
-            shutdown_signal.signal();
-        });
-
-        // Wait for threads
-        let _ = vsock_thread.join();
-        let _ = stdin_thread.join();
-
-        // Terminal restored by _raw_guard drop
-        // SIGWINCH restored by StdinRelay drop
-        let code = *exit_code.lock().unwrap();
-        Ok(code)
+        // The mount + ExecRequest handshake is done; the rest is the shared interactive
+        // relay (raw mode, stdin/resize out, stdout/exit in) over the vsock stream.
+        Ok(crate::client::run_pty_client(writer, reader, stdin_fd))
     }
 
     /// Start port forwarding proxies. Returns a handle that stops all

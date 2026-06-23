@@ -55,6 +55,19 @@ pub enum Command {
     /// Ask domed to shut down. Running workers are NOT affected — they outlive domed and
     /// are re-adopted on the next start.
     Shutdown,
+    /// Attach to a sandbox: ensure its worker exists (cold-booting the VM from its last
+    /// saved index if it is not already running) and return the worker's data-plane
+    /// socket plus a one-time token. domed is NOT in the byte path — the client connects
+    /// directly to the worker socket and presents the token. `boot` is an opaque,
+    /// client-supplied boot spec used only when a cold boot is required (ignored, with a
+    /// warning, when the worker is already running).
+    Attach {
+        /// Sandbox name to attach to.
+        name: String,
+        /// Opaque boot spec (serialized by the CLI) used only on cold boot.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        boot: Option<serde_json::Value>,
+    },
 }
 
 /// domed's reply to a [`Request`] — one JSON object per line. Distinguished from an
@@ -141,6 +154,23 @@ pub struct ListResult {
 }
 
 /// One sandbox as reported by `dome sandbox ls`.
+/// Result payload for [`Command::Attach`]: where and how the client connects to the
+/// worker's data plane. The token is single-use — the worker consumes it on the first
+/// successful attach so a leaked socket path alone cannot open a session.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct AttachResult {
+    /// Sandbox name attached to.
+    pub name: String,
+    /// Absolute path of the worker's user-private (0600) data-plane socket.
+    pub worker_socket: String,
+    /// One-time token the client presents to the worker to authorize the session.
+    pub token: String,
+    /// The worker process id (for diagnostics / `ls`).
+    pub worker_pid: u32,
+    /// True if this attach cold-booted the VM; false if it joined an already-running one.
+    pub cold_booted: bool,
+}
+
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct SandboxInfo {
     /// Sandbox name.
@@ -187,6 +217,14 @@ mod tests {
             Command::List,
             Command::Subscribe,
             Command::Shutdown,
+            Command::Attach {
+                name: "web".to_string(),
+                boot: None,
+            },
+            Command::Attach {
+                name: "api".to_string(),
+                boot: Some(serde_json::json!({ "cpus": 4 })),
+            },
         ] {
             let req = Request::new(None, cmd.clone());
             let back: Request = serde_json::from_str(&serde_json::to_string(&req).unwrap()).unwrap();
@@ -269,5 +307,42 @@ mod tests {
         let back: ListResult =
             serde_json::from_str(&serde_json::to_string(&list).unwrap()).unwrap();
         assert_eq!(back, list);
+    }
+
+    /// `attach` flattens its `verb` tag and carries the sandbox name (and optional boot
+    /// spec) at the top level, like the other commands.
+    #[test]
+    fn attach_command_roundtrips_with_a_flat_verb_and_name() {
+        let req = Request::new(
+            Some(3),
+            Command::Attach {
+                name: "web".to_string(),
+                boot: None,
+            },
+        );
+        let line = serde_json::to_string(&req).unwrap();
+        assert!(
+            line.contains("\"verb\":\"attach\"") && line.contains("\"name\":\"web\""),
+            "attach must carry a flat verb tag and name: {line}"
+        );
+        assert!(!line.contains("boot"), "absent boot is omitted: {line}");
+        let back: Request = serde_json::from_str(&line).unwrap();
+        assert_eq!(back, req);
+    }
+
+    /// The attach result payload round-trips, preserving the one-time token and the
+    /// cold-boot flag the client uses to decide whether to warn about ignored flags.
+    #[test]
+    fn attach_result_roundtrips() {
+        let res = AttachResult {
+            name: "web".to_string(),
+            worker_socket: "/tmp/web.sock".to_string(),
+            token: "deadbeef".to_string(),
+            worker_pid: 4321,
+            cold_booted: true,
+        };
+        let back: AttachResult =
+            serde_json::from_str(&serde_json::to_string(&res).unwrap()).unwrap();
+        assert_eq!(back, res);
     }
 }

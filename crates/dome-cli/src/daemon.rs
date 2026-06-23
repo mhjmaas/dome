@@ -26,11 +26,13 @@ use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 use anyhow::{bail, Context, Result};
 
 use dome_proto::control::{
-    Command, Event, ListResult, Request, Response, SandboxInfo, StatusResult, PROTOCOL_VERSION,
+    AttachResult, Command, Event, ListResult, Request, Response, SandboxInfo, StatusResult,
+    PROTOCOL_VERSION,
 };
 
 use crate::lock::{self, Lock};
 use crate::sandbox;
+use crate::worker;
 
 /// How long the CLI waits for an auto-spawned domed to come up before giving up.
 const SPAWN_TIMEOUT: Duration = Duration::from_secs(5);
@@ -67,43 +69,113 @@ fn log_path(data_dir: &str) -> PathBuf {
 // WorkerLauncher seam
 // ---------------------------------------------------------------------------
 
-/// A live worker domed is supervising. In this slice no real VM is attached; the handle
-/// just records identity and start time so the registry and `ls` can report it.
-///
-/// `pid`/`started` and the launch/registry machinery below are the seam the worker-boot
-/// slice builds on; they are exercised by tests here but not yet driven by a production
-/// code path, hence the `dead_code` allowances.
-#[allow(dead_code)]
+/// A live worker domed is supervising: its identity, OS pid (if a real process), start
+/// time, and the user-private data-plane socket clients connect to directly.
+#[allow(dead_code)] // `started` drives future uptime/age reporting.
 pub(crate) struct WorkerHandle {
     /// Sandbox name this worker serves.
     pub name: String,
-    /// Worker process id, if it is a real OS process (None for the fake).
+    /// Worker process id, if it is a real OS process (None for the fake / re-adopted).
     pub pid: Option<u32>,
     /// When the worker was launched (drives uptime/age reporting).
     pub started: Instant,
+    /// Absolute path of the worker's data-plane socket.
+    pub socket_path: PathBuf,
 }
 
-/// The single new seam between domed and the VM backend. domed cold-boots and manages
-/// workers exclusively through this trait, so the control plane is testable against a
-/// fake and a later slice can drop in the real hypervisor-backed launcher unchanged.
-#[allow(dead_code)] // `launch` is the worker-boot seam: used by tests now, prod in #24.
+/// The single seam between domed and the VM backend. domed cold-boots and manages
+/// workers exclusively through this trait, so the control plane stays testable against a
+/// fake while the real hypervisor-backed launcher ([`VmWorkerLauncher`]) is dropped in
+/// for production.
 pub(crate) trait WorkerLauncher: Send + Sync {
-    /// Cold-boot a worker for sandbox `name`, writing its log under `log_dir`. Returns a
-    /// handle domed tracks in its registry.
+    /// Ensure a worker process for sandbox `name` is running and reachable, cold-booting
+    /// it with `boot` if needed. Returns a handle domed tracks in its registry.
     ///
-    /// domed *startup* never calls this — only an explicit shell/run/create will, in a
-    /// later slice — so the daemon boots zero VMs on its own.
-    fn launch(&self, name: &str, log_dir: &Path) -> Result<WorkerHandle>;
+    /// domed *startup* never calls this — only an explicit attach does — so the daemon
+    /// boots zero VMs on its own.
+    fn launch(&self, name: &str, boot: &serde_json::Value, data_dir: &str) -> Result<WorkerHandle>;
 }
 
-/// A hypervisor-free launcher used in this slice and in tests. It boots no VM; it only
-/// records the worker and writes a per-sandbox log line, demonstrating the per-sandbox
-/// log path the real launcher will use.
+/// How long to wait for a freshly launched worker to cold-boot its VM and bind its
+/// socket. A real VM boot takes seconds, so this is generous.
+const WORKER_BOOT_TIMEOUT: Duration = Duration::from_secs(60);
+
+/// The production launcher: re-execs the signed binary as a detached `dome __worker
+/// <name>`, then waits for it to either become reachable or report a boot error.
+pub(crate) struct VmWorkerLauncher;
+
+impl WorkerLauncher for VmWorkerLauncher {
+    fn launch(&self, name: &str, boot: &serde_json::Value, data_dir: &str) -> Result<WorkerHandle> {
+        // Hand the worker its boot spec, then spawn it detached.
+        worker::write_boot_spec(data_dir, name, boot)?;
+        let pid = spawn_worker(name)?;
+        let socket = worker::worker_socket_path(data_dir, name);
+
+        // Wait until the worker is reachable, or it records a boot error, or it dies.
+        let deadline = Instant::now() + WORKER_BOOT_TIMEOUT;
+        loop {
+            if UnixStream::connect(&socket).is_ok() {
+                return Ok(WorkerHandle {
+                    name: name.to_string(),
+                    pid: Some(pid),
+                    started: Instant::now(),
+                    socket_path: socket,
+                });
+            }
+            if let Some(err) = worker::take_worker_error(data_dir, name) {
+                bail!("sandbox '{}' failed to boot: {}", name, err);
+            }
+            if !pid_alive(pid) {
+                let err = worker::take_worker_error(data_dir, name)
+                    .unwrap_or_else(|| "worker exited during boot (see its log)".to_string());
+                bail!("sandbox '{}' failed to boot: {}", name, err);
+            }
+            if Instant::now() > deadline {
+                bail!("sandbox '{}' worker did not become reachable within {WORKER_BOOT_TIMEOUT:?}", name);
+            }
+            std::thread::sleep(POLL_INTERVAL);
+        }
+    }
+}
+
+/// Re-exec this binary as a detached `dome __worker <name>` in its own session, so it
+/// outlives both the spawning CLI and domed. Returns the worker pid.
+fn spawn_worker(name: &str) -> Result<u32> {
+    use std::os::unix::process::CommandExt;
+    use std::process::{Command, Stdio};
+
+    let exe = std::env::current_exe().context("locating current executable")?;
+    let mut cmd = Command::new(exe);
+    cmd.arg("__worker")
+        .arg(name)
+        .stdin(Stdio::null())
+        .stdout(Stdio::null())
+        .stderr(Stdio::null());
+    unsafe {
+        cmd.pre_exec(|| {
+            libc::setsid();
+            Ok(())
+        });
+    }
+    let child = cmd.spawn().context("spawning worker")?;
+    Ok(child.id())
+}
+
+/// Whether `pid` is a live process (POSIX `kill(pid, 0)`).
+fn pid_alive(pid: u32) -> bool {
+    unsafe { libc::kill(pid as i32, 0) == 0 }
+}
+
+/// A hypervisor-free launcher used in tests. It boots no VM; it only records the worker
+/// and writes a per-sandbox log line, and reports a socket path under the workers dir.
+#[cfg(test)]
 pub(crate) struct FakeLauncher;
 
+#[cfg(test)]
 impl WorkerLauncher for FakeLauncher {
-    fn launch(&self, name: &str, log_dir: &Path) -> Result<WorkerHandle> {
-        std::fs::create_dir_all(log_dir)
+    fn launch(&self, name: &str, _boot: &serde_json::Value, data_dir: &str) -> Result<WorkerHandle> {
+        let log_dir = worker::workers_dir(data_dir);
+        std::fs::create_dir_all(&log_dir)
             .with_context(|| format!("creating worker log dir {}", log_dir.display()))?;
         let log = log_dir.join(format!("{name}.log"));
         if let Ok(mut f) = std::fs::OpenOptions::new().create(true).append(true).open(&log) {
@@ -113,6 +185,7 @@ impl WorkerLauncher for FakeLauncher {
             name: name.to_string(),
             pid: None,
             started: Instant::now(),
+            socket_path: worker::worker_socket_path(data_dir, name),
         })
     }
 }
@@ -245,6 +318,74 @@ impl Supervisor {
         }
     }
 
+    /// Attach to a sandbox: reuse its live worker if one is reachable, otherwise
+    /// cold-boot one through the launcher (with the client-supplied `boot` spec). Mints a
+    /// one-time token from the worker and returns where the client connects. domed is
+    /// never in the resulting byte path.
+    fn attach(&self, name: &str, boot: Option<serde_json::Value>) -> Result<AttachResult> {
+        // Fast path: an already-running, reachable worker — just mint a token.
+        if let Some((socket, pid)) = self.live_worker_socket(name) {
+            let token = worker::mint_token(&socket)?;
+            self.broadcast(&Event::bare("sandbox.attached"));
+            return Ok(AttachResult {
+                name: name.to_string(),
+                worker_socket: socket.to_string_lossy().to_string(),
+                token,
+                worker_pid: pid,
+                cold_booted: false,
+            });
+        }
+
+        // Cold boot. The launcher blocks until the worker is reachable or fails; we hold
+        // no registry lock across it, so concurrent status/list stay responsive.
+        let boot = boot.ok_or_else(|| {
+            anyhow::anyhow!("no boot spec supplied to cold-boot sandbox '{name}'")
+        })?;
+        self.log(&format!("cold-booting worker for '{name}'"));
+        let handle = self.launcher.launch(name, &boot, &self.data_dir)?;
+        let socket = handle.socket_path.clone();
+        let pid = handle.pid.unwrap_or(0);
+        // Register it (ignore a duplicate from a concurrent attach that raced us).
+        let _ = self.registry.lock().unwrap().insert(handle);
+        let token = worker::mint_token(&socket)?;
+        self.broadcast(&Event::bare("sandbox.started"));
+        Ok(AttachResult {
+            name: name.to_string(),
+            worker_socket: socket.to_string_lossy().to_string(),
+            token,
+            worker_pid: pid,
+            cold_booted: true,
+        })
+    }
+
+    /// The data-plane socket of a live worker for `name`, if one is reachable. Drops a
+    /// registry entry whose worker has died, and re-adopts a worker whose socket is live
+    /// on disk but missing from the registry (e.g. after a domed restart).
+    fn live_worker_socket(&self, name: &str) -> Option<(PathBuf, u32)> {
+        let mut reg = self.registry.lock().unwrap();
+        if let Some(entry) = reg.workers.get(name) {
+            if UnixStream::connect(&entry.handle.socket_path).is_ok() {
+                return Some((entry.handle.socket_path.clone(), entry.handle.pid.unwrap_or(0)));
+            }
+            // The worker is gone; forget it so the caller cold-boots a fresh one.
+            reg.remove(name);
+            return None;
+        }
+        // Not tracked, but a worker socket may be live on disk — re-adopt it.
+        let socket = worker::worker_socket_path(&self.data_dir, name);
+        if UnixStream::connect(&socket).is_ok() {
+            let handle = WorkerHandle {
+                name: name.to_string(),
+                pid: None,
+                started: Instant::now(),
+                socket_path: socket.clone(),
+            };
+            let _ = reg.insert(handle);
+            return Some((socket, 0));
+        }
+        None
+    }
+
     /// Push an event to every subscriber, dropping any whose connection has died.
     fn broadcast(&self, event: &Event) {
         let mut subs = self.subscribers.lock().unwrap();
@@ -363,6 +504,15 @@ fn handle_conn(sup: &Arc<Supervisor>, stream: UnixStream) {
                 sup.shutdown.store(true, Ordering::SeqCst);
                 break;
             }
+            Command::Attach { name, boot } => match sup.attach(&name, boot) {
+                Ok(result) => {
+                    let result = serde_json::to_value(result).unwrap();
+                    let _ = write_line(&mut writer, &Response::ok(req.id, result));
+                }
+                Err(e) => {
+                    let _ = write_line(&mut writer, &Response::err(req.id, format!("{e:#}")));
+                }
+            },
         }
     }
 }
@@ -414,7 +564,7 @@ pub(crate) fn run_supervisor(data_dir: &str) -> Result<()> {
         .set_nonblocking(true)
         .context("setting control socket non-blocking")?;
 
-    let sup = Arc::new(Supervisor::new(data_dir.to_string(), Box::new(FakeLauncher)));
+    let sup = Arc::new(Supervisor::new(data_dir.to_string(), Box::new(VmWorkerLauncher)));
     serve(&sup, listener);
 
     let _ = std::fs::remove_file(&sock);
@@ -507,6 +657,25 @@ pub(crate) fn list_via_daemon(data_dir: &str) -> Result<Vec<SandboxInfo>> {
     let resp = request(&mut stream, Command::List)?;
     let result: ListResult = decode_result(resp)?;
     Ok(result.sandboxes)
+}
+
+/// `dome sandbox shell`/`run` data path: route an attach through domed (auto-spawning
+/// it), returning where to connect to the worker plus a one-time token. The actual
+/// session bytes flow directly CLI↔worker afterwards — domed is not in that path.
+pub(crate) fn attach_via_daemon(
+    data_dir: &str,
+    name: &str,
+    boot: serde_json::Value,
+) -> Result<AttachResult> {
+    let mut stream = ensure_daemon(data_dir)?;
+    let resp = request(
+        &mut stream,
+        Command::Attach {
+            name: name.to_string(),
+            boot: Some(boot),
+        },
+    )?;
+    decode_result(resp)
 }
 
 // ---------------------------------------------------------------------------
@@ -758,17 +927,24 @@ mod tests {
 
     // --- Registry unit tests (one-worker-per-name + overlay) ---
 
+    /// A throwaway data dir for launcher tests.
+    fn tmp_data_dir() -> tempfile::TempDir {
+        tempfile::tempdir().unwrap()
+    }
+
     #[test]
     fn registry_enforces_one_worker_per_name() {
         let mut reg = Registry::new();
+        let d = tmp_data_dir();
+        let dd = d.path().to_str().unwrap();
         let h = FakeLauncher
-            .launch("web", tempfile::tempdir().unwrap().path())
+            .launch("web", &serde_json::json!({}), dd)
             .unwrap();
         reg.insert(h).unwrap();
         assert_eq!(reg.len(), 1);
 
         let dup = FakeLauncher
-            .launch("web", tempfile::tempdir().unwrap().path())
+            .launch("web", &serde_json::json!({}), dd)
             .unwrap();
         let err = reg.insert(dup).unwrap_err();
         assert!(
@@ -784,8 +960,9 @@ mod tests {
     #[test]
     fn registry_overlay_marks_a_live_worker_running() {
         let mut reg = Registry::new();
+        let d = tmp_data_dir();
         let h = FakeLauncher
-            .launch("api", tempfile::tempdir().unwrap().path())
+            .launch("api", &serde_json::json!({}), d.path().to_str().unwrap())
             .unwrap();
         reg.insert(h).unwrap();
         // Simulate two attached terminals.
@@ -817,9 +994,10 @@ mod tests {
 
     #[test]
     fn fake_launcher_writes_a_per_sandbox_log() {
-        let log_dir = tempfile::tempdir().unwrap();
-        FakeLauncher.launch("web", log_dir.path()).unwrap();
-        let log = log_dir.path().join("web.log");
+        let d = tmp_data_dir();
+        let dd = d.path().to_str().unwrap();
+        FakeLauncher.launch("web", &serde_json::json!({}), dd).unwrap();
+        let log = worker::workers_dir(dd).join("web.log");
         assert!(log.exists(), "per-sandbox log must be written");
         let mut s = String::new();
         std::fs::File::open(&log)

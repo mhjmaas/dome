@@ -1,7 +1,8 @@
-//! Unified session core. `run`, `checkpoint create`, and `sandbox` all boot a VM,
-//! run a command, and then differ only in what they do with the resulting disk
-//! state on teardown. That variation is captured by [`SaveTarget`]; the booting
-//! and running is shared via [`run_session`].
+//! Unified session core for the one-shot paths. `dome run` and `checkpoint create` both
+//! boot a VM, run a command, and then differ only in what they do with the resulting
+//! disk state on teardown. That variation is captured by [`SaveTarget`]; the booting and
+//! running is shared via [`run_session`]. (Persistent `dome sandbox` sessions no longer
+//! go through here — their VM is owned by a long-lived worker that saves directly.)
 
 use anyhow::Result;
 
@@ -13,9 +14,6 @@ pub(crate) enum SaveTarget {
     None,
     /// Atomically save the disk state as a checkpoint at `checkpoints/<name>.idx`.
     Checkpoint { name: String },
-    /// Flatten + atomically save the disk state as a persistent sandbox at
-    /// `sandboxes/<name>.idx`.
-    Sandbox { name: String },
 }
 
 /// Boot the prepared VM, run the command, then persist (or not) per `save`.
@@ -41,7 +39,6 @@ fn persist(prepared: &PreparedVm, result: &RunResult, save: &SaveTarget) -> Resu
     match save {
         SaveTarget::None => Ok(()),
         SaveTarget::Checkpoint { name } => save_checkpoint(prepared, result, name),
-        SaveTarget::Sandbox { name } => save_sandbox(result, name),
     }
 }
 
@@ -60,23 +57,5 @@ fn save_checkpoint(prepared: &PreparedVm, result: &RunResult, name: &str) -> Res
         vm::clone_file(&prepared.work_rootfs, &ext4_path)?;
     }
     eprintln!("dome: checkpoint '{}' saved", name);
-    Ok(())
-}
-
-fn save_sandbox(result: &RunResult, name: &str) -> Result<()> {
-    let data_dir = dome_vm::default_data_dir();
-    let sandboxes_dir = format!("{}/sandboxes", data_dir);
-    std::fs::create_dir_all(&sandboxes_dir)?;
-    let index_path = format!("{}/{}.idx", sandboxes_dir, name);
-
-    // Persistence requires CAS — the caller rejects DOME_STORAGE=direct before we
-    // get here, so a missing handle is a real error rather than a graceful fallback.
-    let nbd_handle = result.nbd_handle.as_ref().ok_or_else(|| {
-        anyhow::anyhow!("persistent sandbox requires CAS storage but no CAS backend was started")
-    })?;
-
-    eprintln!("dome: saving sandbox '{}'...", name);
-    nbd_handle.save_sandbox(&index_path)?;
-    eprintln!("dome: sandbox '{}' saved", name);
     Ok(())
 }

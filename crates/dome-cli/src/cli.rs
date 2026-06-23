@@ -1,6 +1,13 @@
 use clap::Parser;
+use serde::{Deserialize, Serialize};
 
-#[derive(clap::Args)]
+// `VmArgs` is parsed by clap on the CLI, but it is also serialized into the worker boot
+// spec (see `worker::BootSpec`) so a detached `dome __worker` re-exec can reconstruct the
+// exact session config the user asked for. Every field is a plain Option/Vec/bool/scalar,
+// so the serde derives are mechanical; `#[serde(default)]` keeps older boot specs
+// forward-compatible if a field is added later.
+#[derive(clap::Args, Serialize, Deserialize, Default, Clone, Debug)]
+#[serde(default)]
 pub(crate) struct VmArgs {
     /// Number of CPU cores
     #[arg(long)]
@@ -134,6 +141,15 @@ pub(crate) enum Commands {
     /// Internal: run as the domed supervisor (re-exec target; not for direct use)
     #[command(name = "__domed", hide = true)]
     Domed,
+
+    /// Internal: run as a per-sandbox worker that owns one persistent VM (re-exec
+    /// target; not for direct use). domed launches this; it reads its boot spec from
+    /// the daemon dir and serves the sandbox's data-plane socket until stopped.
+    #[command(name = "__worker", hide = true)]
+    Worker {
+        /// Sandbox name this worker serves.
+        name: String,
+    },
 }
 
 #[derive(clap::Subcommand)]
