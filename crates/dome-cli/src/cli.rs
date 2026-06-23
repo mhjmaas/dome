@@ -332,6 +332,12 @@ pub(crate) enum SandboxCommands {
         /// Sandbox name (defaults to the `sandbox` field in dome.json, else a cwd slug)
         name: Option<String>,
 
+        /// Re-apply the current dome.json (plus any flags) to the sandbox: re-resolves the
+        /// sidecar from dome.json + flags. The only supported way to pick up dome.json edits
+        /// on an existing sandbox without recreating it. disk_size stays pinned (create-only).
+        #[arg(long)]
+        reload: bool,
+
         #[command(flatten)]
         vm: VmArgs,
     },
