@@ -124,6 +124,60 @@ fn disk_writes_persist_across_sessions() {
     cleanup(&name);
 }
 
+/// Stop domed itself (the control plane) without touching running worker VMs.
+fn daemon_stop() {
+    let _ = Command::new(dome_bin())
+        .args(["daemon", "stop"])
+        .output()
+        .expect("failed to spawn dome");
+    std::thread::sleep(std::time::Duration::from_millis(500));
+}
+
+/// #29: workers survive a domed restart, and a fresh domed re-adopts them. Stopping domed
+/// must NOT kill the VM; the next command auto-spawns a new domed that re-adopts the live
+/// worker (the session still reaches the SAME VM, proven by the surviving tmpfs marker)
+/// rather than cold-booting a new one.
+#[test]
+#[ignore]
+fn domed_restart_readopts_the_running_worker() {
+    let name = sandbox_name("readopt");
+    cleanup(&name);
+
+    // Cold-boot the VM and drop a tmpfs marker that lives only as long as THIS VM.
+    let s1 = sandbox_run(&name, "echo readopt-marker-$$ > /run/dome-live; echo wrote");
+    assert!(
+        s1.status.success(),
+        "first session should cold-boot and run; stderr: {}",
+        String::from_utf8_lossy(&s1.stderr)
+    );
+
+    // Stop domed. The worker process is independent and must keep its VM running.
+    daemon_stop();
+    let status = daemon_status();
+    assert!(
+        status.contains("daemon is down"),
+        "domed should be down after `daemon stop`; status:\n{status}"
+    );
+
+    // A fresh `daemon status` auto-spawns a new domed, which re-adopts the live worker.
+    let status = daemon_status();
+    assert!(
+        status.contains("workers: 1"),
+        "the restarted domed must re-adopt the surviving worker; status:\n{status}"
+    );
+
+    // The re-attached session reaches the SAME VM (tmpfs marker survived), proving the VM
+    // was re-adopted, not cold-booted afresh.
+    let s2 = sandbox_run(&name, "cat /run/dome-live");
+    assert!(
+        String::from_utf8_lossy(&s2.stdout).contains("readopt-marker-"),
+        "re-adopted worker must still be the same live VM; stdout: {}",
+        String::from_utf8_lossy(&s2.stdout)
+    );
+
+    cleanup(&name);
+}
+
 /// Stopping the worker tears the VM down: afterwards the daemon reports no workers.
 #[test]
 #[ignore]

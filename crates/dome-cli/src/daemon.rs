@@ -19,7 +19,7 @@ use std::io::{BufRead, BufReader, Write};
 use std::os::unix::fs::PermissionsExt;
 use std::os::unix::net::{UnixListener, UnixStream};
 use std::path::{Path, PathBuf};
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
@@ -40,6 +40,23 @@ const SPAWN_TIMEOUT: Duration = Duration::from_secs(5);
 const POLL_INTERVAL: Duration = Duration::from_millis(25);
 /// Accept-loop poll cadence (the listener is non-blocking so it can notice shutdown).
 const ACCEPT_POLL: Duration = Duration::from_millis(50);
+/// How long domed stays resident with no workers AND no clients before shutting itself
+/// down. Long enough that a burst of one-off commands keeps reusing one daemon, short
+/// enough that a truly idle daemon does not linger. Re-armed on any client connection or
+/// while any worker runs.
+const IDLE_GRACE: Duration = Duration::from_secs(300);
+
+/// Pure idle-shutdown predicate: domed should exit itself only when nothing is using it —
+/// no client connection is held AND no worker VM is running — and it has been so for at
+/// least the grace period. Factored out so the timing is unit-testable without a daemon.
+fn should_shut_down_idle(
+    clients: usize,
+    workers: usize,
+    idle_for: Duration,
+    grace: Duration,
+) -> bool {
+    clients == 0 && workers == 0 && idle_for >= grace
+}
 
 // ---------------------------------------------------------------------------
 // Paths
@@ -332,6 +349,16 @@ struct Supervisor {
     /// Write-halves of connections that issued `subscribe`, for pushing events.
     subscribers: Mutex<Vec<UnixStream>>,
     shutdown: AtomicBool,
+    /// Number of currently-open client connections. domed stays resident while any client
+    /// holds a connection (e.g. a subscribed UI), and the idle monitor only considers
+    /// shutting down when this is zero.
+    clients: AtomicUsize,
+    /// When domed last saw activity (a client connection, or while a worker ran). The idle
+    /// grace period is measured from here, so a one-off command re-arms it.
+    last_active: Mutex<Instant>,
+    /// How long to stay resident while fully idle before self-shutdown (see [`IDLE_GRACE`];
+    /// shortened in tests).
+    idle_grace: Duration,
 }
 
 impl Supervisor {
@@ -348,7 +375,18 @@ impl Supervisor {
             launcher,
             subscribers: Mutex::new(Vec::new()),
             shutdown: AtomicBool::new(false),
+            clients: AtomicUsize::new(0),
+            last_active: Mutex::new(Instant::now()),
+            idle_grace: IDLE_GRACE,
         }
+    }
+
+    /// Builder override for the idle-shutdown grace period (tests use a short one so the
+    /// idle monitor fires promptly).
+    #[cfg(test)]
+    fn with_idle_grace(mut self, grace: Duration) -> Self {
+        self.idle_grace = grace;
+        self
     }
 
     /// Append a timestamped line to the domed log (best-effort).
@@ -570,6 +608,60 @@ impl Supervisor {
             });
         }
     }
+
+    /// Discover workers that survived a previous domed (a crash, a restart, or simply a
+    /// `daemon stop` that left the VMs running) and re-adopt them into the registry, so
+    /// `ls`/attach see them immediately and sessions remain usable. Workers are independent
+    /// processes keyed by their on-disk socket: a socket that answers the wire protocol is a
+    /// live worker (re-adopted with `pid: None`, so the reaper falls back to socket liveness
+    /// — see [`worker_is_alive`]); a socket file that no longer has a listener is stale from
+    /// a crash and is reconciled away so a future cold boot can bind cleanly. Called once on
+    /// startup, before serving.
+    fn readopt_workers(&self) {
+        for (name, socket) in worker::scan_worker_sockets(&self.data_dir) {
+            // Liveness handshake: a real round-trip (not just a connect) confirms the worker
+            // is actually serving, not a half-open socket.
+            if worker::attached_count(&socket).is_ok() {
+                let handle = WorkerHandle {
+                    name: name.clone(),
+                    pid: None,
+                    started: Instant::now(),
+                    socket_path: socket,
+                };
+                if self.registry.lock().unwrap().insert(handle).is_ok() {
+                    self.log(&format!("re-adopted running worker for '{name}'"));
+                }
+            } else {
+                // Stale socket from a crashed worker: reconcile it (same liveness-then-reclaim
+                // pattern domed uses for its own socket and the lock module uses for locks).
+                let _ = std::fs::remove_file(&socket);
+                self.log(&format!("reconciled stale worker socket for '{name}'"));
+            }
+        }
+    }
+
+    /// Idle self-shutdown check: if no client connection is held and no worker is running,
+    /// and that has been true for the whole grace period, domed shuts itself down so a
+    /// daemon spun up for a one-off `ls` does not linger. While anything is using domed the
+    /// idle timer is continually re-armed, so a busy or subscribed daemon never trips this.
+    fn maybe_idle_shutdown(&self) {
+        let clients = self.clients.load(Ordering::SeqCst);
+        let workers = self.registry.lock().unwrap().len();
+        if clients > 0 || workers > 0 {
+            // Busy: re-arm the idle timer so the grace period only ever counts true idleness.
+            *self.last_active.lock().unwrap() = Instant::now();
+            return;
+        }
+        let idle_for = self.last_active.lock().unwrap().elapsed();
+        if should_shut_down_idle(clients, workers, idle_for, self.idle_grace) {
+            self.log(&format!(
+                "idle for {:?} with no workers and no clients; shutting down",
+                self.idle_grace
+            ));
+            self.broadcast(&Event::bare("daemon.stopping"));
+            self.shutdown.store(true, Ordering::SeqCst);
+        }
+    }
 }
 
 /// Crash-reaper poll cadence: how often domed scans its registry for workers that have
@@ -590,6 +682,26 @@ fn spawn_reaper(sup: &Arc<Supervisor>) -> std::thread::JoinHandle<()> {
             break;
         }
         sup.reap_dead_workers();
+    })
+}
+
+/// Spawn the background idle monitor. It periodically evaluates
+/// [`Supervisor::maybe_idle_shutdown`] and exits on shutdown. The tick is derived from the
+/// grace period — frequent enough to notice an explicit shutdown promptly (so joining it on
+/// stop is quick) and to fire soon after the grace elapses, capped so a long grace doesn't
+/// busy-spin.
+fn spawn_idle_monitor(sup: &Arc<Supervisor>) -> std::thread::JoinHandle<()> {
+    let sup = Arc::clone(sup);
+    let tick = (sup.idle_grace / 10).clamp(Duration::from_millis(25), Duration::from_millis(500));
+    std::thread::spawn(move || loop {
+        if sup.shutdown.load(Ordering::SeqCst) {
+            break;
+        }
+        std::thread::sleep(tick);
+        if sup.shutdown.load(Ordering::SeqCst) {
+            break;
+        }
+        sup.maybe_idle_shutdown();
     })
 }
 
@@ -626,10 +738,29 @@ fn serve(sup: &Arc<Supervisor>, listener: UnixListener) {
     sup.log("domed shutting down");
 }
 
+/// Decrements the live client count (and re-arms the idle timer) when a connection handler
+/// returns — by normal close, error, or panic — so the count can never be left inflated.
+struct ClientGuard<'a>(&'a Supervisor);
+
+impl Drop for ClientGuard<'_> {
+    fn drop(&mut self) {
+        self.0.clients.fetch_sub(1, Ordering::SeqCst);
+        // Start the idle grace from the moment the last client left.
+        *self.0.last_active.lock().unwrap() = Instant::now();
+    }
+}
+
 /// Handle one client connection: read newline-JSON requests, reply per request, and —
 /// after a `subscribe` — keep the connection registered as an event subscriber until it
 /// closes.
 fn handle_conn(sup: &Arc<Supervisor>, stream: UnixStream) {
+    // Count this connection so the idle monitor keeps domed resident while it is held, and
+    // re-arm the idle timer (so even a brief one-off command resets the grace window). The
+    // guard restores both on return, including the early try_clone failure below.
+    sup.clients.fetch_add(1, Ordering::SeqCst);
+    *sup.last_active.lock().unwrap() = Instant::now();
+    let _client = ClientGuard(sup);
+
     let mut writer = match stream.try_clone() {
         Ok(w) => w,
         Err(_) => return,
@@ -801,9 +932,15 @@ pub(crate) fn run_supervisor(data_dir: &str) -> Result<()> {
         .context("setting control socket non-blocking")?;
 
     let sup = Arc::new(Supervisor::new(data_dir.to_string(), Box::new(VmWorkerLauncher)));
+    // Re-adopt any workers that survived a previous domed (and reconcile stale sockets)
+    // BEFORE serving, so the first `ls`/attach already reflects them. Workers are
+    // independent processes and are unaffected by domed stopping/crashing.
+    sup.readopt_workers();
     let reaper = spawn_reaper(&sup);
+    let idle = spawn_idle_monitor(&sup);
     serve(&sup, listener);
     let _ = reaper.join();
+    let _ = idle.join();
 
     let _ = std::fs::remove_file(&sock);
     drop(guard); // releases the singleton lock
@@ -1700,6 +1837,128 @@ mod tests {
         let infos = sup.list().unwrap();
         let row = infos.iter().find(|r| r.name == "web").unwrap();
         assert_eq!(row.state, "running", "after a cold boot the sandbox is running again");
+    }
+
+    // --- Idle auto-shutdown + worker re-adoption (#29) ---
+
+    #[test]
+    fn idle_shutdown_predicate_requires_no_clients_no_workers_and_the_full_grace() {
+        let grace = Duration::from_secs(300);
+        // Fully idle past the grace → shut down.
+        assert!(should_shut_down_idle(0, 0, grace, grace));
+        assert!(should_shut_down_idle(0, 0, grace + Duration::from_secs(1), grace));
+        // Any held client or running worker keeps it resident, no matter how long idle.
+        assert!(!should_shut_down_idle(1, 0, grace * 10, grace));
+        assert!(!should_shut_down_idle(0, 1, grace * 10, grace));
+        // Idle, but not yet for the full grace → stay up.
+        assert!(!should_shut_down_idle(0, 0, grace / 2, grace));
+    }
+
+    #[test]
+    fn idle_monitor_shuts_down_when_there_are_no_workers_and_no_clients() {
+        let d = tmp_data_dir();
+        let dd = d.path().to_str().unwrap();
+        let sup = Arc::new(
+            Supervisor::new(dd.to_string(), Box::new(FakeLauncher))
+                .with_idle_grace(Duration::from_millis(120)),
+        );
+        let monitor = spawn_idle_monitor(&sup);
+        // No clients, no workers: after the grace elapses the monitor self-shuts.
+        std::thread::sleep(Duration::from_millis(400));
+        assert!(
+            sup.shutdown.load(Ordering::SeqCst),
+            "an idle daemon must shut itself down after the grace period"
+        );
+        let _ = monitor.join();
+    }
+
+    #[test]
+    fn idle_monitor_stays_resident_while_a_worker_is_running() {
+        let d = tmp_data_dir();
+        let dd = d.path().to_str().unwrap();
+        let sup = Arc::new(
+            Supervisor::new(dd.to_string(), Box::new(FakeLauncher))
+                .with_idle_grace(Duration::from_millis(120)),
+        );
+        // A registered worker keeps domed resident even with no clients attached.
+        sup.registry
+            .lock()
+            .unwrap()
+            .insert(WorkerHandle {
+                name: "web".to_string(),
+                pid: None,
+                started: Instant::now(),
+                socket_path: worker::worker_socket_path(dd, "web"),
+            })
+            .unwrap();
+        let monitor = spawn_idle_monitor(&sup);
+        std::thread::sleep(Duration::from_millis(400));
+        assert!(
+            !sup.shutdown.load(Ordering::SeqCst),
+            "domed must stay resident while a worker is running"
+        );
+        // Stop the monitor thread.
+        sup.shutdown.store(true, Ordering::SeqCst);
+        let _ = monitor.join();
+    }
+
+    #[test]
+    fn idle_monitor_stays_resident_while_a_client_is_connected_then_shuts_after_it_leaves() {
+        let d = tmp_data_dir();
+        let dd = d.path().to_str().unwrap();
+        let sup = Arc::new(
+            Supervisor::new(dd.to_string(), Box::new(FakeLauncher))
+                .with_idle_grace(Duration::from_millis(120)),
+        );
+        // A held client connection (e.g. a subscribed UI) keeps the timer re-armed.
+        sup.clients.fetch_add(1, Ordering::SeqCst);
+        let monitor = spawn_idle_monitor(&sup);
+        std::thread::sleep(Duration::from_millis(400));
+        assert!(
+            !sup.shutdown.load(Ordering::SeqCst),
+            "domed must stay resident while a client connection is held"
+        );
+        // The client leaves; after the grace from its departure domed shuts down.
+        sup.clients.fetch_sub(1, Ordering::SeqCst);
+        *sup.last_active.lock().unwrap() = Instant::now();
+        std::thread::sleep(Duration::from_millis(400));
+        assert!(
+            sup.shutdown.load(Ordering::SeqCst),
+            "once the last client leaves, the idle grace elapses and domed shuts down"
+        );
+        let _ = monitor.join();
+    }
+
+    #[test]
+    fn readopt_adopts_a_live_worker_and_reconciles_a_stale_socket() {
+        let d = tmp_data_dir();
+        let dd = d.path().to_str().unwrap();
+        let sup = Arc::new(Supervisor::new(dd.to_string(), Box::new(FakeLauncher)));
+
+        // A live worker (answers the wire protocol on its socket) must be re-adopted.
+        let live = worker::worker_socket_path(dd, "web");
+        let _fw = FakeWorker::start(live.clone(), 0);
+
+        // A stale socket file with no listener (a crashed worker's leftover) must be
+        // reconciled away. Binding then dropping a listener leaves the path on disk but
+        // with nothing accepting, mirroring a crash.
+        let stale = worker::worker_socket_path(dd, "ghost");
+        {
+            let l = UnixListener::bind(&stale).unwrap();
+            drop(l);
+        }
+        assert!(stale.exists(), "precondition: the stale socket file is present");
+
+        sup.readopt_workers();
+
+        // The live worker is now tracked; the sandbox reads as running and is attachable.
+        assert!(
+            sup.live_worker_socket("web").is_some(),
+            "a live worker must be re-adopted into the registry"
+        );
+        assert_eq!(sup.registry.lock().unwrap().len(), 1, "only the live worker is adopted");
+        // The stale socket is gone, so a future cold boot can bind cleanly.
+        assert!(!stale.exists(), "a stale worker socket must be reconciled away");
     }
 
     #[test]
