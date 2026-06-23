@@ -54,6 +54,15 @@ pub(crate) fn run_sandbox(
     let tty = std::io::stdin().is_terminal();
 
     let data_dir = dome_vm::default_data_dir();
+    let index_path = format!("{}/sandboxes/{}.idx", data_dir, name);
+
+    // disk_size is create-only: the disk is physically pinned to the index's chunk count, so
+    // a `--disk-size` change cannot take effect on an existing sandbox. Reject it loudly (any
+    // path) rather than accepting-and-ignoring it, so the sidecar never records a size that
+    // does not match the real disk.
+    if vm_args.disk_size.is_some() && Path::new(&index_path).exists() {
+        reject_disk_size_on_existing(&name)?;
+    }
 
     // The boot spec is consumed by the worker only on a cold boot; it captures exactly
     // what this invocation would have booted (resolved name, seed, cwd, and VM flags).
@@ -64,7 +73,6 @@ pub(crate) fn run_sandbox(
     // A brand-new sandbox (no index yet) has its sidecar written by the worker's first-boot
     // resolve instead, so we only update an already-existing one here. `--from` is a
     // creation-only seed, never a config edit, so it does not by itself trigger an update.
-    let index_path = format!("{}/sandboxes/{}.idx", data_dir, name);
     let updated_existing = if Path::new(&index_path).exists() && vm_flags_specified(vm_args) {
         // Load (healing a legacy unversioned sidecar in place); merge the flags in and
         // persist. A sandbox with NO sidecar yet (legacy, pre-persistence) returns None:
@@ -103,6 +111,18 @@ pub(crate) fn run_sandbox(
     }
 
     worker::attach_and_relay(&attach, &command, tty)
+}
+
+/// `--disk-size` is honored only at creation: the disk is physically pinned to the index's
+/// chunk count, so a later change can never take effect and must not be recorded in the
+/// sidecar (which would then lie about the real disk). Hard-error on any existing sandbox
+/// with a recreate-it message instead of the old accept-store-then-ignore behavior.
+fn reject_disk_size_on_existing(name: &str) -> Result<()> {
+    bail!(
+        "disk size is fixed when a sandbox is created and cannot be changed afterward (the \
+         disk is physically pinned). To change it, recreate the sandbox: `dome sandbox rm \
+         {name}` then `dome sandbox create {name} --disk-size <MB>`."
+    );
 }
 
 /// Whether the user passed any config-affecting flag. Used to decide whether to resolve the
@@ -417,6 +437,13 @@ pub(crate) fn config_sandbox(name_arg: Option<String>, vm_args: &VmArgs) -> Resu
         );
     }
 
+    // disk_size is create-only: the materialized disk is pinned at creation, so `config
+    // --disk-size` can never take effect. Reject it before touching the sidecar (rather than
+    // the old accept-store-then-ignore) so the recorded size always matches the real disk.
+    if vm_args.disk_size.is_some() {
+        reject_disk_size_on_existing(&name)?;
+    }
+
     // Load the resolved sidecar, healing a legacy one in place. A sandbox created before
     // config persistence has no sidecar yet; treat that as an empty config so editing works.
     let mut config = sandbox_config::load_or_heal(&data_dir, &name, vm_args.config.as_deref())?
@@ -435,19 +462,6 @@ pub(crate) fn config_sandbox(name_arg: Option<String>, vm_args: &VmArgs) -> Resu
          running VM keeps its current config until stopped.",
         name
     );
-    // Disk size is pinned to the materialized index at creation: the cold-boot guardrail
-    // (`vm::prepare_vm`) always re-pins an existing sandbox to its index's chunk count and
-    // prints an "ignoring --disk-size" notice. So unlike the other fields, a `--disk-size`
-    // edit here never takes effect — say so explicitly rather than letting the generic
-    // "applies on the next cold boot" line above contradict that notice.
-    if vm_args.disk_size.is_some() {
-        eprintln!(
-            "dome: note — disk size is fixed when a sandbox is created and cannot be changed \
-             by `config`; this value is ignored on cold boot. Recreate the sandbox \
-             (`dome sandbox rm {}` then `create`) to change its disk size.",
-            name
-        );
-    }
     print_sandbox_config(&name, &config);
     Ok(())
 }

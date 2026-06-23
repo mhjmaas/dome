@@ -200,6 +200,52 @@ fn flag_on_a_running_sandbox_persists_and_reports_next_boot() {
     rm_sandbox(&name);
 }
 
+/// disk_size is create-only (#46): `--disk-size` on an existing sandbox is a hard error with a
+/// recreate-it message and a non-zero exit, and it leaves the sidecar untouched (the recorded
+/// disk size always reflects the real pinned disk). `config --disk-size` no longer
+/// accepts-stores-then-ignores the value.
+#[test]
+#[ignore]
+fn disk_size_on_an_existing_sandbox_is_a_hard_error_and_does_not_touch_the_sidecar() {
+    let name = unique("cfg-disksize");
+    rm_sandbox(&name);
+
+    // Create with an explicit disk size; the sidecar records it once, at creation.
+    let created = Command::new(dome_bin())
+        .args(["sandbox", "create", &name, "--disk-size", "4096"])
+        .output()
+        .expect("failed to spawn dome");
+    assert!(
+        created.status.success(),
+        "create should succeed; stderr: {}",
+        String::from_utf8_lossy(&created.stderr)
+    );
+    let before = std::fs::read_to_string(config_path(&name)).expect("config sidecar must exist");
+
+    // `config --disk-size` on the existing sandbox must hard-error and not rewrite the sidecar.
+    let edited = Command::new(dome_bin())
+        .args(["sandbox", "config", &name, "--disk-size", "8192"])
+        .output()
+        .expect("failed to spawn dome");
+    assert!(
+        !edited.status.success(),
+        "config --disk-size on an existing sandbox must exit non-zero"
+    );
+    let stderr = String::from_utf8_lossy(&edited.stderr);
+    assert!(
+        stderr.contains("disk size is fixed") && stderr.contains("recreate"),
+        "the error must explain disk size is create-only and direct the user to recreate; \
+         stderr: {stderr}"
+    );
+    let after = std::fs::read_to_string(config_path(&name)).expect("config sidecar must exist");
+    assert_eq!(
+        before, after,
+        "a rejected --disk-size must leave the sidecar unchanged"
+    );
+
+    rm_sandbox(&name);
+}
+
 /// Flags always win on an existing sandbox (#45): a config flag passed to `run` resolves
 /// into and updates the sidecar before the cold boot, so a sandbox created with 2 cpus boots
 /// with 1 when `run` passes `--cpus 1`, and the sidecar is updated to match.
