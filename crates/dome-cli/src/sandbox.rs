@@ -14,8 +14,8 @@ use crate::checkpoint;
 use crate::cli::VmArgs;
 use crate::config::{load_config, DomeConfig};
 use crate::lock::{self, Lock};
-use crate::sandbox_config::SandboxConfig;
-use crate::vm::{self, SandboxSource};
+use crate::sandbox_config::{self, ResolvedConfig};
+use crate::vm::SandboxSource;
 use crate::worker;
 
 /// Entry point for `dome sandbox shell` and `dome sandbox run`. An empty `command`
@@ -92,7 +92,7 @@ fn vm_flags_specified(vm_args: &VmArgs, from: Option<&str>) -> bool {
 /// 2)`) so the user sees exactly what was kept; otherwise emit a generic notice. `--from` is
 /// always a creation-time-only seed, so it is called out separately when present.
 fn warn_ignored_flags(data_dir: &str, name: &str, vm_args: &VmArgs, from: Option<&str>) {
-    let conflicts = SandboxConfig::load_live(data_dir, name)
+    let conflicts = ResolvedConfig::load_live(data_dir, name)
         .map(|live| live.conflicts(vm_args))
         .unwrap_or_default();
 
@@ -202,15 +202,17 @@ pub(crate) fn create_sandbox(
         }
         None => {
             let base_path = ensure_current_base(&data_dir, vm_args)?;
-            let disk_size_mb = vm::resolve_session(vm_args.disk_size, cfg.disk_size, 4096);
+            let disk_size_mb = vm_args.disk_size.or(cfg.disk_size).unwrap_or(4096);
             materialize_from_base(&index_path, &base_path, disk_size_mb)?;
             eprintln!("dome: created sandbox '{}'", name);
         }
     }
 
-    // Persist the per-sandbox config so every cold boot reproduces this VM shape, rather
-    // than depending on whatever flags a later `shell`/`run` invocation happens to pass.
-    SandboxConfig::from_vm_args(vm_args).save(&data_dir, &name)?;
+    // Resolve `dome.json` + flags once and write the structured, versioned sidecar. From
+    // here on the sidecar is the source of truth: every cold boot reproduces this VM shape
+    // without re-reading `dome.json`, regardless of the flags a later `shell`/`run` passes.
+    let resolved = ResolvedConfig::resolve(&ResolvedConfig::default(), &cfg, vm_args)?;
+    resolved.save(&data_dir, &name)?;
     Ok(())
 }
 
@@ -392,9 +394,10 @@ pub(crate) fn config_sandbox(name_arg: Option<String>, vm_args: &VmArgs) -> Resu
         );
     }
 
-    // An existing sandbox created before config persistence has no sidecar yet; treat a
-    // missing sidecar as an empty config so editing it still works.
-    let mut config = SandboxConfig::load(&data_dir, &name)?.unwrap_or_default();
+    // Load the resolved sidecar, healing a legacy one in place. A sandbox created before
+    // config persistence has no sidecar yet; treat that as an empty config so editing works.
+    let mut config = sandbox_config::load_or_heal(&data_dir, &name, vm_args.config.as_deref())?
+        .unwrap_or_default();
 
     // No boot-affecting flags ⇒ a read-only view; otherwise merge the edit.
     if !vm_flags_specified(vm_args, None) {
@@ -402,7 +405,7 @@ pub(crate) fn config_sandbox(name_arg: Option<String>, vm_args: &VmArgs) -> Resu
         return Ok(());
     }
 
-    config.merge_update(vm_args);
+    config.merge_update(vm_args)?;
     config.save(&data_dir, &name)?;
     eprintln!(
         "dome: updated config for sandbox '{}'. It applies on the next cold boot; a \
@@ -426,9 +429,11 @@ pub(crate) fn config_sandbox(name_arg: Option<String>, vm_args: &VmArgs) -> Resu
     Ok(())
 }
 
-/// Pretty-print a sandbox's persisted config, showing unset scalars as `default` and empty
-/// lists as `none`, so `dome sandbox config <name>` reads clearly.
-fn print_sandbox_config(name: &str, c: &SandboxConfig) {
+/// Pretty-print a sandbox's full effective resolved config, showing unset scalars as
+/// `default` and empty lists as `none`, so `dome sandbox config <name>` shows exactly what
+/// the sandbox will boot with — including secrets by name, the unified network allow-list,
+/// and exposed host ports.
+fn print_sandbox_config(name: &str, c: &ResolvedConfig) {
     let scalar = |v: Option<u64>| v.map(|n| n.to_string()).unwrap_or_else(|| "default".into());
     let list = |v: &[String]| {
         if v.is_empty() {
@@ -437,10 +442,23 @@ fn print_sandbox_config(name: &str, c: &SandboxConfig) {
             v.join(", ")
         }
     };
+    // Secrets are shown by name only — values live in host env vars, never on disk.
+    let secrets = if c.proxy.secrets.is_empty() {
+        "none".to_string()
+    } else {
+        c.proxy
+            .secrets
+            .iter()
+            .map(|s| format!("{} (from ${} → {})", s.name, s.from, s.hosts.join(",")))
+            .collect::<Vec<_>>()
+            .join(", ")
+    };
     eprintln!("config for sandbox '{}':", name);
     eprintln!(
         "  cpus:             {}",
-        c.cpus.map(|n| n.to_string()).unwrap_or_else(|| "default".into())
+        c.cpus
+            .map(|n| n.to_string())
+            .unwrap_or_else(|| "default".into())
     );
     eprintln!("  memory (MB):      {}", scalar(c.memory));
     eprintln!(
@@ -451,9 +469,9 @@ fn print_sandbox_config(name: &str, c: &SandboxConfig) {
     eprintln!("  allow_host_writes:{}", c.allow_host_writes);
     eprintln!("  ports:            {}", list(&c.ports));
     eprintln!("  mounts:           {}", list(&c.mounts));
-    eprintln!("  secrets:          {}", list(&c.secrets));
-    eprintln!("  allow_host:       {}", list(&c.allow_host));
-    eprintln!("  expose_host:      {}", list(&c.expose_host));
+    eprintln!("  secrets:          {}", secrets);
+    eprintln!("  network allow:    {}", list(&c.proxy.allow));
+    eprintln!("  expose_host:      {}", list(&c.proxy.expose_host));
 }
 
 /// `dome sandbox stop [--force] <name>`: stop a running sandbox — flush+save and shut its
@@ -518,8 +536,8 @@ pub(crate) fn delete_sandbox_index(data_dir: &str, name: &str) -> Result<()> {
     worker::clear_failed_marker(data_dir, name);
     // Drop the persisted config sidecar (and any live marker) so a sandbox later reusing
     // this name starts from a clean slate rather than inheriting the removed one's config.
-    SandboxConfig::remove(data_dir, name);
-    SandboxConfig::clear_live(data_dir, name);
+    ResolvedConfig::remove(data_dir, name);
+    ResolvedConfig::clear_live(data_dir, name);
     Ok(())
 }
 
@@ -643,7 +661,9 @@ pub(crate) fn list_sandboxes() -> Result<()> {
 /// every sandbox index under `{data_dir}/sandboxes`. Live-worker state (running/attached)
 /// is overlaid by the registry on top of this; here every sandbox is reported with its
 /// on-disk `idle`/lock-based status. Reuses the same robust walker as the listing logic.
-pub(crate) fn collect_sandbox_infos(data_dir: &str) -> Result<Vec<dome_proto::control::SandboxInfo>> {
+pub(crate) fn collect_sandbox_infos(
+    data_dir: &str,
+) -> Result<Vec<dome_proto::control::SandboxInfo>> {
     Ok(collect_sandbox_rows(data_dir)?
         .into_iter()
         .map(|row| {

@@ -77,7 +77,10 @@ fn stop_guard_force_and_rm_guard() {
 
     // `stop` (no --force) is refused while a terminal is attached, naming the count.
     let stop = dome(&["sandbox", "stop", &name]);
-    assert!(!stop.status.success(), "stop must refuse with a terminal attached");
+    assert!(
+        !stop.status.success(),
+        "stop must refuse with a terminal attached"
+    );
     assert!(
         String::from_utf8_lossy(&stop.stderr).contains("attached"),
         "stop refusal must name the attached terminals; stderr: {}",
@@ -142,7 +145,9 @@ fn crash_marks_failed_and_reshell_cold_boots_from_last_save() {
     let ls = dome(&["sandbox", "ls"]);
     let ls_out = String::from_utf8_lossy(&ls.stdout);
     assert!(
-        ls_out.lines().any(|l| l.contains(&name) && l.contains("failed")),
+        ls_out
+            .lines()
+            .any(|l| l.contains(&name) && l.contains("failed")),
         "a crashed sandbox must list as failed; ls:\n{ls_out}"
     );
 

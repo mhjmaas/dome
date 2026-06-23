@@ -31,7 +31,7 @@ use dome_vm::{MountConfig, PortMapping, Sandbox};
 
 use crate::assets;
 use crate::cli::VmArgs;
-use crate::config::DomeConfig;
+use crate::sandbox_config::ResolvedConfig;
 
 /// A persistent sandbox's storage binding: where its CAS index lives and the
 /// immutable, version-pinned base image its never-written chunks resolve through.
@@ -60,14 +60,6 @@ pub(crate) struct PreparedVm {
     pub mounts: Vec<MountConfig>,
 }
 
-/// Resolve a per-boot config value with session-only precedence: a CLI flag wins,
-/// then the `dome.json` value, then the built-in default. The inputs are taken by
-/// value and nothing is written back, so a flag override applies to this session
-/// only — `dome.json` stays the source of truth for the next boot.
-pub(crate) fn resolve_session<T>(flag: Option<T>, config: Option<T>, default: T) -> T {
-    flag.or(config).unwrap_or(default)
-}
-
 /// Resolve the disk size for booting an *existing* sandbox. Disk size is pinned at
 /// creation: the index encodes a fixed chunk count, so booting at a different size
 /// would corrupt the filesystem. The stored size therefore always wins. When the
@@ -83,77 +75,43 @@ pub(crate) fn pin_sandbox_disk_size(flag_mb: Option<u64>, stored_mb: u64) -> (u6
     (stored_mb, ignored)
 }
 
+/// Prepare a VM from a single resolved config plus the session/environment fields the
+/// resolved config deliberately does not carry. `cfg` holds the already-merged VM shape
+/// (the `defaults <- dome.json <- flags` merge happened in [`ResolvedConfig::resolve`], so
+/// this function no longer takes the raw `dome.json`); `env` supplies only the host/session
+/// fields — kernel/rootfs/initrd paths and verbosity — read fresh each invocation.
 pub(crate) fn prepare_vm(
-    vm: &VmArgs,
-    cfg: &DomeConfig,
+    cfg: &ResolvedConfig,
+    env: &VmArgs,
     from: Option<&str>,
     sandbox: Option<&SandboxSource>,
 ) -> Result<PreparedVm> {
-    let cpus = resolve_session(vm.cpus, cfg.cpus, 2);
-    let memory = resolve_session(vm.memory, cfg.memory, 2048);
-    let mut disk_size = resolve_session(vm.disk_size, cfg.disk_size, 4096);
-    let allow_net = vm.allow_net || cfg.allow_net.unwrap_or(false);
-    let allow_host_writes = vm.allow_host_writes || cfg.allow_host_writes.unwrap_or(false);
-    let verbose = vm.verbose;
+    let cpus = cfg.cpus.unwrap_or(2);
+    let memory = cfg.memory.unwrap_or(2048);
+    let mut disk_size = cfg.disk_size.unwrap_or(4096);
+    let allow_net = cfg.allow_net;
+    let allow_host_writes = cfg.allow_host_writes;
+    let verbose = env.verbose;
 
+    // Secrets, the unified allow-list, and expose-host mappings are all resolved already;
+    // the proxy only exists when networking is enabled.
     let proxy_config = if allow_net {
-        let mut proxy = cfg.to_proxy_config();
-
-        // Merge --secret flags: NAME=ENV_VAR@host1,host2
-        for s in &vm.secret {
-            let (name, from, hosts) = parse_secret_flag(s).with_context(|| {
-                format!("invalid --secret: '{}' (expected NAME=ENV@host1,host2)", s)
-            })?;
-            proxy.secrets.insert(
-                name,
-                dome_proxy::config::SecretConfig {
-                    from,
-                    hosts,
-                    value: None,
-                },
-            );
-        }
-
-        // Merge --allow-domain flags
-        for d in &vm.allow_host {
-            proxy.network.allow.push(d.clone());
-        }
-
-        // Merge --expose-host flags
-        for s in &vm.expose_host {
-            let mapping = crate::config::parse_expose_host(s)
-                .with_context(|| format!("invalid --expose-host: '{}'", s))?;
-            proxy.expose_host.push(mapping);
-        }
-
-        Some(proxy)
+        Some(cfg.proxy.to_proxy_config()?)
     } else {
         None
     };
 
-    // Merge port forwards: CLI flags + config file
-    let mut port_strs: Vec<&str> = vm.port.iter().map(|s| s.as_str()).collect();
-    if let Some(ref cfg_ports) = cfg.ports {
-        for p in cfg_ports {
-            port_strs.push(p.as_str());
-        }
-    }
+    // Port forwards (already merged across layers in `resolve`).
     let mut forwards = Vec::new();
-    for s in &port_strs {
+    for s in &cfg.ports {
         let mapping =
             parse_port_mapping(s).with_context(|| format!("invalid port mapping: '{}'", s))?;
         forwards.push(mapping);
     }
 
-    // Merge mounts: CLI flags + config file
-    let mut mount_strs: Vec<&str> = vm.mount.iter().map(|s| s.as_str()).collect();
-    if let Some(ref cfg_mounts) = cfg.mounts {
-        for m in cfg_mounts {
-            mount_strs.push(m.as_str());
-        }
-    }
+    // Mounts (already merged across layers in `resolve`).
     let mut mounts = Vec::new();
-    for s in &mount_strs {
+    for s in &cfg.mounts {
         let mc = parse_mount_spec(s).with_context(|| format!("invalid mount spec: '{}'", s))?;
         mounts.push(mc);
     }
@@ -165,26 +123,26 @@ pub(crate) fn prepare_vm(
     let data_dir = dome_vm::default_data_dir();
 
     // Auto-download assets when using default paths
-    if vm.kernel.is_none()
-        && vm.rootfs.is_none()
-        && vm.initrd.is_none()
+    if env.kernel.is_none()
+        && env.rootfs.is_none()
+        && env.initrd.is_none()
         && !assets::assets_ready(&data_dir)
     {
         assets::download_os_image(&data_dir)?;
     }
 
-    let kernel_path = vm
+    let kernel_path = env
         .kernel
         .clone()
         .unwrap_or_else(|| format!("{}/Image", data_dir));
     // Ephemeral runs and checkpoints resolve the base via the immutable, versioned
     // rootfs path of the installed OS version — the same file sandboxes pin to.
-    let rootfs_path = vm.rootfs.clone().unwrap_or_else(|| {
+    let rootfs_path = env.rootfs.clone().unwrap_or_else(|| {
         let version = assets::installed_version(&data_dir)
             .unwrap_or_else(|| assets::CURRENT_VERSION.to_string());
         assets::versioned_rootfs_path(&data_dir, &version)
     });
-    let initrd_path_str = vm
+    let initrd_path_str = env
         .initrd
         .clone()
         .unwrap_or_else(|| format!("{}/initramfs.cpio.gz", data_dir));
@@ -208,7 +166,7 @@ pub(crate) fn prepare_vm(
             // encodes a fixed chunk count, so honoring a differing --disk-size here
             // would corrupt the filesystem.
             let stored = dome_store::ChunkIndex::load(&sb.index_path)?.disk_size() / (1024 * 1024);
-            let (resolved, ignored) = pin_sandbox_disk_size(vm.disk_size, stored);
+            let (resolved, ignored) = pin_sandbox_disk_size(cfg.disk_size, stored);
             if let Some(requested) = ignored {
                 eprintln!(
                     "dome: ignoring --disk-size {}MB; sandbox is pinned to {}MB",
@@ -579,8 +537,9 @@ fn validate_mounts_with_cwd(
     Ok(())
 }
 
-/// Parse `NAME=ENV_VAR@host1,host2` into (name, from, hosts).
-fn parse_secret_flag(s: &str) -> Result<(String, String, Vec<String>)> {
+/// Parse `NAME=ENV_VAR@host1,host2` into (name, from, hosts). Used by config resolution
+/// to turn `--secret` flags into the structured secret mapping stored in the sidecar.
+pub(crate) fn parse_secret_flag(s: &str) -> Result<(String, String, Vec<String>)> {
     let (name, rest) = s
         .split_once('=')
         .ok_or_else(|| anyhow::anyhow!("missing '=' separator"))?;
@@ -614,26 +573,6 @@ fn parse_port_mapping(s: &str) -> Result<PortMapping> {
 #[cfg(test)]
 mod tests {
     use super::*;
-
-    #[test]
-    fn session_config_precedence_flag_over_config_over_default() {
-        // Flag wins when present.
-        assert_eq!(resolve_session(Some(8u32), Some(4), 2), 8);
-        // Config is used when no flag is given.
-        assert_eq!(resolve_session(None, Some(4u32), 2), 4);
-        // Default applies when neither is set.
-        assert_eq!(resolve_session(None::<u32>, None, 2), 2);
-    }
-
-    #[test]
-    fn session_config_does_not_mutate_config_value() {
-        // The resolution is session-only: it reads the config Option without taking
-        // ownership of (or writing back to) the caller's config, so the same config
-        // resolves the same way on the next boot regardless of a one-off flag.
-        let config = Some(4u32);
-        assert_eq!(resolve_session(Some(8u32), config, 2), 8);
-        assert_eq!(resolve_session(None, config, 2), 4);
-    }
 
     #[test]
     fn pinned_disk_size_wins_and_a_differing_flag_is_reported() {

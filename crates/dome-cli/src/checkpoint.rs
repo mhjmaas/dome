@@ -6,6 +6,7 @@ use dome_vm::default_data_dir;
 
 use crate::cli::VmArgs;
 use crate::config::load_config;
+use crate::sandbox_config::ResolvedConfig;
 use crate::session::{run_session, SaveTarget};
 use crate::vm;
 
@@ -32,7 +33,9 @@ pub(crate) fn create(
         bail!("checkpoint '{}' already exists, delete it first", name);
     }
 
-    let prepared = vm::prepare_vm(vm_args, &cfg, from, None)?;
+    // A checkpoint run is ephemeral in spirit: resolve `dome.json` + flags once, persist nothing.
+    let resolved = ResolvedConfig::resolve(&ResolvedConfig::default(), &cfg, vm_args)?;
+    let prepared = vm::prepare_vm(&resolved, vm_args, from, None)?;
     run_session(&prepared, &command, &SaveTarget::Checkpoint { name })
 }
 

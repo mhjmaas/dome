@@ -52,7 +52,13 @@ fn main() -> Result<()> {
                 vec!["/bin/sh".to_string()]
             };
 
-            let prepared = vm::prepare_vm(&vm, &cfg, from.as_deref(), None)?;
+            // Ephemeral runs resolve `dome.json` + flags per invocation and persist nothing.
+            let resolved = sandbox_config::ResolvedConfig::resolve(
+                &sandbox_config::ResolvedConfig::default(),
+                &cfg,
+                &vm,
+            )?;
+            let prepared = vm::prepare_vm(&resolved, &vm, from.as_deref(), None)?;
 
             let result = if stdio {
                 let r = stdio::run_stdio(&prepared);
