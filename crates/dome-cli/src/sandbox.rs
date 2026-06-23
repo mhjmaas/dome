@@ -237,24 +237,49 @@ pub(crate) fn create_sandbox(
         return Err(collision_error(&name, Collision::Exists, from.is_some()));
     }
 
-    match from {
+    // `--from` clones disk/index state ONLY: the new sandbox's config is always resolved
+    // from `dome.json` + flags below, never inherited from the seed (the seed's sidecar is
+    // never read). The one field that follows the disk rather than `dome.json` is
+    // `disk_size`: a seeded sandbox's disk is the clone, so its size is fixed by that clone.
+    // We capture the cloned disk's real size and stamp it onto the sidecar so the sidecar
+    // stays truthful (the #46 invariant: a sidecar's `disk_size` always equals the pinned
+    // disk, so a cold boot never has to ignore-and-warn a mismatched `--disk-size`).
+    let seeded_disk_size_mb = match from {
         Some(seed_name) => {
             let seed_idx = resolve_seed_index(seed_name, &data_dir)?;
             seed_sandbox_index(&seed_idx, &index_path)?;
+            let mb = dome_store::ChunkIndex::load(&index_path)?.disk_size() / (1024 * 1024);
+            // A `--disk-size` cannot resize a clone; say so rather than silently dropping it.
+            if let Some(requested) = vm_args.disk_size {
+                if requested != mb {
+                    eprintln!(
+                        "dome: ignoring --disk-size {}MB; '{}' clones the disk of '{}' \
+                         (pinned to {}MB)",
+                        requested, name, seed_name, mb
+                    );
+                }
+            }
             eprintln!("dome: created sandbox '{}' from '{}'", name, seed_name);
+            Some(mb)
         }
         None => {
             let base_path = ensure_current_base(&data_dir, vm_args)?;
             let disk_size_mb = vm_args.disk_size.or(cfg.disk_size).unwrap_or(4096);
             materialize_from_base(&index_path, &base_path, disk_size_mb)?;
             eprintln!("dome: created sandbox '{}'", name);
+            None
         }
-    }
+    };
 
     // Resolve `dome.json` + flags once and write the structured, versioned sidecar. From
     // here on the sidecar is the source of truth: every cold boot reproduces this VM shape
     // without re-reading `dome.json`, regardless of the flags a later `shell`/`run` passes.
-    let resolved = ResolvedConfig::resolve(&ResolvedConfig::default(), &cfg, vm_args)?;
+    let mut resolved = ResolvedConfig::resolve(&ResolvedConfig::default(), &cfg, vm_args)?;
+    // For a seeded sandbox, the disk size is dictated by the clone, not by `dome.json`/flags,
+    // so override the resolved value with the cloned disk's real size before persisting.
+    if let Some(mb) = seeded_disk_size_mb {
+        resolved.disk_size = Some(mb);
+    }
     resolved.save(&data_dir, &name)?;
     Ok(())
 }
