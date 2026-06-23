@@ -37,3 +37,8 @@ jobs:
       - uses: dtolnay/rust-toolchain@stable
       - uses: Swatinem/rust-cache@v2
       - run: cargo check -p dome-cli
+      # Run the hypervisor-free unit + control-protocol tests. Plain `cargo test`
+      # targets the workspace's default-members (the macOS-buildable crates;
+      # dome-darwin/dome-linux are platform-specific and excluded), and skips the
+      # `#[ignore]`d integration tests that need a real hypervisor + codesigned binary.
+      - run: cargo test

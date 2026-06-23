@@ -12,3 +12,5 @@
 
 # Environment
 .env
+
+scripts/dev-cycle/**/*
