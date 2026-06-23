@@ -8,6 +8,10 @@ use std::collections::HashMap;
 /// Max frame size: 1 MB.
 pub mod frame;
 
+/// Control-plane protocol spoken between the CLI/UI and the `domed` supervisor
+/// (newline-delimited JSON over a unix domain socket).
+pub mod control;
+
 // --- Exec protocol ---
 
 #[derive(Serialize, Deserialize)]

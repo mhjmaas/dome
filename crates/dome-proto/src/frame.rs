@@ -153,3 +153,118 @@ pub fn parse_exit_code(payload: &[u8]) -> Option<i32> {
         payload[0], payload[1], payload[2], payload[3],
     ]))
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use serde::{Deserialize, Serialize};
+    use std::io::Cursor;
+
+    /// A written frame reads back with the same type byte and payload.
+    #[test]
+    fn frame_roundtrips_through_a_buffer() {
+        let mut buf = Vec::new();
+        write_frame(&mut buf, STDOUT, b"hello world").unwrap();
+        let mut cursor = Cursor::new(buf);
+        let (msg_type, payload) = read_frame(&mut cursor).unwrap().unwrap();
+        assert_eq!(msg_type, STDOUT);
+        assert_eq!(payload, b"hello world");
+        // A second read on the exhausted cursor is a clean EOF.
+        assert!(read_frame(&mut cursor).unwrap().is_none());
+    }
+
+    /// An empty payload is a valid frame (length == 1, just the type byte).
+    #[test]
+    fn empty_payload_frame_roundtrips() {
+        let mut buf = Vec::new();
+        write_frame(&mut buf, EXIT, &[]).unwrap();
+        let mut cursor = Cursor::new(buf);
+        let (msg_type, payload) = read_frame(&mut cursor).unwrap().unwrap();
+        assert_eq!(msg_type, EXIT);
+        assert!(payload.is_empty());
+    }
+
+    /// Multiple frames written back-to-back read back in order.
+    #[test]
+    fn back_to_back_frames_read_in_order() {
+        let mut buf = Vec::new();
+        write_frame(&mut buf, STDIN, b"a").unwrap();
+        write_frame(&mut buf, STDOUT, b"bb").unwrap();
+        write_frame(&mut buf, STDERR, b"ccc").unwrap();
+        let mut cursor = Cursor::new(buf);
+        assert_eq!(read_frame(&mut cursor).unwrap().unwrap(), (STDIN, b"a".to_vec()));
+        assert_eq!(read_frame(&mut cursor).unwrap().unwrap(), (STDOUT, b"bb".to_vec()));
+        assert_eq!(read_frame(&mut cursor).unwrap().unwrap(), (STDERR, b"ccc".to_vec()));
+        assert!(read_frame(&mut cursor).unwrap().is_none());
+    }
+
+    /// A frame whose declared length is zero is rejected as a protocol violation.
+    #[test]
+    fn zero_length_frame_is_rejected() {
+        let mut cursor = Cursor::new(vec![0, 0, 0, 0]);
+        assert!(read_frame(&mut cursor).is_err());
+    }
+
+    /// A frame whose declared length exceeds the cap is rejected.
+    #[test]
+    fn oversize_frame_is_rejected() {
+        let mut bytes = (MAX_FRAME + 1).to_be_bytes().to_vec();
+        bytes.push(STDOUT);
+        let mut cursor = Cursor::new(bytes);
+        assert!(read_frame(&mut cursor).is_err());
+    }
+
+    /// `send_json` frames a serializable value that round-trips back to the same struct.
+    #[test]
+    fn send_json_roundtrips_a_struct() {
+        #[derive(Serialize, Deserialize, PartialEq, Debug)]
+        struct Msg {
+            a: u32,
+            b: String,
+        }
+        let msg = Msg {
+            a: 5,
+            b: "hi".to_string(),
+        };
+        let mut buf = Vec::new();
+        send_json(&mut buf, EXEC_REQ, &msg).unwrap();
+        let mut cursor = Cursor::new(buf);
+        let (msg_type, payload) = read_frame(&mut cursor).unwrap().unwrap();
+        assert_eq!(msg_type, EXEC_REQ);
+        let back: Msg = serde_json::from_slice(&payload).unwrap();
+        assert_eq!(back, msg);
+    }
+
+    /// `resize_payload` / `parse_resize` are inverses.
+    #[test]
+    fn resize_payload_roundtrips() {
+        let payload = resize_payload(40, 120);
+        assert_eq!(parse_resize(&payload), Some((40, 120)));
+        assert_eq!(parse_resize(&[1, 2]), None, "a short payload yields None");
+    }
+
+    /// `exit_payload` / `parse_exit_code` are inverses, including negative codes.
+    #[test]
+    fn exit_payload_roundtrips() {
+        for code in [0, 1, 137, -1, i32::MIN, i32::MAX] {
+            assert_eq!(parse_exit_code(&exit_payload(code)), Some(code));
+        }
+        assert_eq!(parse_exit_code(&[0, 0]), None, "a short payload yields None");
+    }
+
+    /// `try_parse` reports a complete frame's type and bounds without consuming input,
+    /// and asks for more bytes when the buffer holds only part of a frame.
+    #[test]
+    fn try_parse_reports_complete_frames_only() {
+        let mut buf = Vec::new();
+        write_frame(&mut buf, STDOUT, b"xyz").unwrap();
+        // Full frame present.
+        let (msg_type, start, total) = try_parse(&buf).unwrap();
+        assert_eq!(msg_type, STDOUT);
+        assert_eq!(&buf[start..total], b"xyz");
+        assert_eq!(total, buf.len());
+        // A truncated buffer needs more data.
+        assert!(try_parse(&buf[..buf.len() - 1]).is_none());
+        assert!(try_parse(&buf[..2]).is_none());
+    }
+}

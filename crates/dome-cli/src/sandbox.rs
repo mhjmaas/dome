@@ -415,35 +415,63 @@ fn ensure_current_base(data_dir: &str, vm_args: &VmArgs) -> Result<String> {
     Ok(base_path)
 }
 
-/// Entry point for `dome sandbox ls`. Lists every sandbox with NAME, SIZE (CAS delta),
-/// BASE (pinned OS version), STATUS (`running` if a live session holds the lock, else
-/// `idle`), and CREATED age — reusing the checkpoint-list size/age rendering. Output
-/// stays flat: flatten-in-place leaves no parent lineage to show.
+/// Entry point for `dome sandbox ls`. Always routes through domed (auto-spawning it if
+/// needed) for a single code path and uniform rich output: NAME, SIZE (CAS delta), BASE
+/// (pinned OS version), STATE (`running` with attached-terminal count when a live worker
+/// owns it, else `idle`), and CREATED age. Output stays flat: flatten-in-place leaves no
+/// parent lineage to show.
 pub(crate) fn list_sandboxes() -> Result<()> {
     let data_dir = dome_vm::default_data_dir();
-    let rows = collect_sandbox_rows(&data_dir)?;
+    let infos = crate::daemon::list_via_daemon(&data_dir)?;
 
-    if rows.is_empty() {
+    if infos.is_empty() {
         eprintln!("No sandboxes found.");
         return Ok(());
     }
 
-    let header = ["NAME", "SIZE", "BASE", "STATUS", "CREATED"];
-    let cells: Vec<Vec<String>> = rows
+    let header = ["NAME", "SIZE", "BASE", "STATE", "ATTACHED", "CREATED"];
+    let cells: Vec<Vec<String>> = infos
         .iter()
-        .map(|row| {
+        .map(|info| {
+            let created = std::time::UNIX_EPOCH + std::time::Duration::from_secs(info.created_unix);
             vec![
-                row.name.clone(),
-                checkpoint::format_cas_size(row.size_bytes),
-                row.base.clone(),
-                if row.running { "running" } else { "idle" }.to_string(),
-                checkpoint::format_age(row.mtime),
+                info.name.clone(),
+                checkpoint::format_cas_size(info.size_bytes),
+                info.base.clone(),
+                info.state.clone(),
+                info.attached.to_string(),
+                checkpoint::format_age(created),
             ]
         })
         .collect();
 
     print!("{}", checkpoint::render_table(&header, &cells));
     Ok(())
+}
+
+/// Disk-scan side of `dome sandbox ls`, used by domed to build a [`SandboxInfo`] for
+/// every sandbox index under `{data_dir}/sandboxes`. Live-worker state (running/attached)
+/// is overlaid by the registry on top of this; here every sandbox is reported with its
+/// on-disk `idle`/lock-based status. Reuses the same robust walker as the listing logic.
+pub(crate) fn collect_sandbox_infos(data_dir: &str) -> Result<Vec<dome_proto::control::SandboxInfo>> {
+    Ok(collect_sandbox_rows(data_dir)?
+        .into_iter()
+        .map(|row| {
+            let created_unix = row
+                .mtime
+                .duration_since(std::time::UNIX_EPOCH)
+                .map(|d| d.as_secs())
+                .unwrap_or(0);
+            dome_proto::control::SandboxInfo {
+                name: row.name,
+                size_bytes: row.size_bytes,
+                base: row.base,
+                state: if row.running { "running" } else { "idle" }.to_string(),
+                attached: 0,
+                created_unix,
+            }
+        })
+        .collect())
 }
 
 /// One row of `dome sandbox ls`: a sandbox's name, CAS delta size, pinned base

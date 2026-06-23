@@ -2,9 +2,13 @@
 //! tests, listing never boots a VM, so these run by default (no `DOME_BIN` /
 //! codesigning needed): they drive the cargo-built binary against a temp data dir
 //! seeded with real CAS index and lock files, and assert on the rendered table.
+//!
+//! `ls` now routes through the domed control plane (auto-spawning it), so each test
+//! tears the daemon down afterwards via [`stop_daemon`] to avoid leaking a process.
 
 use std::path::Path;
 use std::process::Command;
+use std::time::{Duration, Instant};
 
 use dome_store::ChunkIndex;
 
@@ -19,6 +23,19 @@ fn sandbox_ls(home: &Path) -> std::process::Output {
         .env("HOME", home)
         .output()
         .expect("failed to spawn dome binary")
+}
+
+/// Stop the daemon `ls` auto-spawned so it does not outlive the test's temp dir.
+fn stop_daemon(home: &Path) {
+    let _ = Command::new(DOME_BIN)
+        .args(["daemon", "stop"])
+        .env("HOME", home)
+        .output();
+    let sock = home.join(".local/share/dome/daemon/domed.sock");
+    let deadline = Instant::now() + Duration::from_secs(2);
+    while sock.exists() && Instant::now() < deadline {
+        std::thread::sleep(Duration::from_millis(20));
+    }
 }
 
 fn sandboxes_dir(home: &Path) -> std::path::PathBuf {
@@ -57,6 +74,7 @@ fn ls_on_an_empty_set_prints_a_clear_message() {
         combined.to_lowercase().contains("no sandboxes"),
         "expected a clear 'no sandboxes' message, got: {combined}"
     );
+    stop_daemon(home.path());
 }
 
 #[test]
@@ -72,7 +90,7 @@ fn ls_lists_name_size_base_and_idle_status() {
     // Header carries the sandbox-specific columns.
     assert!(stdout.contains("NAME"), "missing NAME header: {stdout}");
     assert!(stdout.contains("BASE"), "missing BASE header: {stdout}");
-    assert!(stdout.contains("STATUS"), "missing STATUS header: {stdout}");
+    assert!(stdout.contains("STATE"), "missing STATE header: {stdout}");
 
     let row = stdout
         .lines()
@@ -84,6 +102,7 @@ fn ls_lists_name_size_base_and_idle_status() {
         row.contains("idle"),
         "an unlocked sandbox must be idle: {row}"
     );
+    stop_daemon(home.path());
 }
 
 #[test]
@@ -108,4 +127,5 @@ fn ls_reports_running_when_a_live_session_holds_the_lock() {
         row.contains("running"),
         "a sandbox with a live lock must be running: {row}"
     );
+    stop_daemon(home.path());
 }
