@@ -150,6 +150,86 @@ fn no_flag_disables_a_previously_enabled_policy_in_the_sidecar() {
     rm_sandbox(&name);
 }
 
+/// Lists are replace-on-set and clearable (#42): a sandbox created with two `--port` forwards
+/// records both; `config --port` replaces the list with exactly what was passed; and
+/// `config --no-port` clears it to empty in the sidecar.
+#[test]
+#[ignore]
+fn no_list_flag_clears_the_list_in_the_sidecar() {
+    let name = unique("cfg-no-port");
+    rm_sandbox(&name);
+
+    Command::new(dome_bin())
+        .args([
+            "sandbox", "create", &name, "--port", "8080:80", "--port", "443:443",
+        ])
+        .output()
+        .expect("failed to spawn dome");
+    let cfg = std::fs::read_to_string(config_path(&name)).expect("config sidecar must exist");
+    assert!(
+        cfg.contains("8080:80") && cfg.contains("443:443"),
+        "create --port must record both forwards; got: {cfg}"
+    );
+
+    // A passed list replaces (not merges): only 9000:9000 remains.
+    let edited = Command::new(dome_bin())
+        .args(["sandbox", "config", &name, "--port", "9000:9000"])
+        .output()
+        .expect("failed to spawn dome");
+    assert!(
+        edited.status.success(),
+        "config --port should succeed; stderr: {}",
+        String::from_utf8_lossy(&edited.stderr)
+    );
+    let cfg = std::fs::read_to_string(config_path(&name)).expect("config sidecar must exist");
+    assert!(
+        cfg.contains("9000:9000") && !cfg.contains("8080:80"),
+        "--port must replace the list, not merge; got: {cfg}"
+    );
+
+    // `--no-port` clears the list to empty.
+    let cleared = Command::new(dome_bin())
+        .args(["sandbox", "config", &name, "--no-port"])
+        .output()
+        .expect("failed to spawn dome");
+    assert!(
+        cleared.status.success(),
+        "config --no-port should succeed; stderr: {}",
+        String::from_utf8_lossy(&cleared.stderr)
+    );
+    let cfg = std::fs::read_to_string(config_path(&name)).expect("config sidecar must exist");
+    assert!(
+        cfg.contains("\"ports\": []"),
+        "--no-port must clear the list in the sidecar; got: {cfg}"
+    );
+
+    rm_sandbox(&name);
+}
+
+/// Passing both a list flag and its `--no-` counterpart in one command is a clap conflict
+/// error — the command exits non-zero and writes nothing.
+#[test]
+#[ignore]
+fn list_flag_and_its_negation_conflict() {
+    let name = unique("cfg-conflict");
+    rm_sandbox(&name);
+
+    let out = Command::new(dome_bin())
+        .args(["sandbox", "create", &name, "--port", "8080:80", "--no-port"])
+        .output()
+        .expect("failed to spawn dome");
+    assert!(
+        !out.status.success(),
+        "passing --port and --no-port together must error"
+    );
+    assert!(
+        !std::path::Path::new(&config_path(&name)).exists(),
+        "a rejected create must not write a sidecar"
+    );
+
+    rm_sandbox(&name);
+}
+
 /// Flags always win even while a VM is running (#45): a config flag passed to `run` on a
 /// running sandbox is persisted to the sidecar and the user is told it applies on the next
 /// boot (the live VM keeps its current config until stopped).
