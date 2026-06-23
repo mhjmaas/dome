@@ -113,6 +113,43 @@ fn config_edits_the_persisted_metadata() {
     rm_sandbox(&name);
 }
 
+/// A previously-enabled policy can be turned off with `--no-*`: a sandbox created with
+/// `--allow-net` writes `allow_net: true`, and `config --no-allow-net` flips the sidecar to
+/// `false` (so the next cold boot reproduces with networking disabled).
+#[test]
+#[ignore]
+fn no_flag_disables_a_previously_enabled_policy_in_the_sidecar() {
+    let name = unique("cfg-no-net");
+    rm_sandbox(&name);
+
+    Command::new(dome_bin())
+        .args(["sandbox", "create", &name, "--allow-net"])
+        .output()
+        .expect("failed to spawn dome");
+    let cfg = std::fs::read_to_string(config_path(&name)).expect("config sidecar must exist");
+    assert!(
+        cfg.contains("\"allow_net\": true"),
+        "create --allow-net must enable the policy; got: {cfg}"
+    );
+
+    let edited = Command::new(dome_bin())
+        .args(["sandbox", "config", &name, "--no-allow-net"])
+        .output()
+        .expect("failed to spawn dome");
+    assert!(
+        edited.status.success(),
+        "config --no-allow-net should succeed; stderr: {}",
+        String::from_utf8_lossy(&edited.stderr)
+    );
+    let cfg = std::fs::read_to_string(config_path(&name)).expect("config sidecar must exist");
+    assert!(
+        cfg.contains("\"allow_net\": false"),
+        "--no-allow-net must flip the sidecar to disabled; got: {cfg}"
+    );
+
+    rm_sandbox(&name);
+}
+
 /// A cold boot uses the persisted config (cpus/memory), not the attaching invocation's
 /// flags: a sandbox created with 2 cpus boots with 2 even when `run` passes `--cpus 1`.
 #[test]
