@@ -521,3 +521,80 @@ fn create_from_a_checkpoint_resolves_config_from_dome_json_and_flags() {
     rm_checkpoint(&cp);
     rm_sandbox(&derived);
 }
+
+/// `dome sandbox config --reload <name>` re-applies an edited dome.json to an existing sandbox
+/// (#44): it re-resolves the sidecar from the current dome.json (plus flags) and writes it.
+/// disk_size stays pinned (create-only — a dome.json disk_size edit must NOT change it). The
+/// change applies on the next cold boot; this is the only supported way to pick up dome.json
+/// edits without recreating the sandbox.
+#[test]
+#[ignore]
+fn reload_reapplies_the_edited_dome_json_to_the_sidecar() {
+    let name = unique("cfg-reload");
+    let cfg_file = format!(
+        "{}/dome-reload-{}.json",
+        std::env::temp_dir().display(),
+        name
+    );
+    rm_sandbox(&name);
+
+    // Create with cpus=2 from dome.json and a pinned disk size of 2048.
+    std::fs::write(&cfg_file, "{\"cpus\": 2}").expect("failed to write dome.json");
+    let created = Command::new(dome_bin())
+        .args([
+            "sandbox",
+            "create",
+            &name,
+            "--config",
+            &cfg_file,
+            "--disk-size",
+            "2048",
+        ])
+        .output()
+        .expect("failed to spawn dome");
+    assert!(
+        created.status.success(),
+        "create should succeed; stderr: {}",
+        String::from_utf8_lossy(&created.stderr)
+    );
+    let cfg = std::fs::read_to_string(config_path(&name)).expect("config sidecar must exist");
+    assert!(
+        cfg.contains("\"cpus\": 2") && cfg.contains("\"disk_size\": 2048"),
+        "the sidecar must capture the initial dome.json cpus and pinned disk; got: {cfg}"
+    );
+
+    // Edit dome.json: bump cpus, and set a disk_size that must be ignored (create-only).
+    std::fs::write(&cfg_file, "{\"cpus\": 6, \"disk_size\": 9999}")
+        .expect("failed to rewrite dome.json");
+
+    let reloaded = Command::new(dome_bin())
+        .args([
+            "sandbox", "config", &name, "--reload", "--config", &cfg_file,
+        ])
+        .output()
+        .expect("failed to spawn dome");
+    assert!(
+        reloaded.status.success(),
+        "config --reload should succeed; stderr: {}",
+        String::from_utf8_lossy(&reloaded.stderr)
+    );
+    let stderr = String::from_utf8_lossy(&reloaded.stderr);
+    assert!(
+        stderr.contains("reloaded") && stderr.contains("next cold boot"),
+        "reload must report it re-applied dome.json and applies on the next cold boot; \
+         stderr: {stderr}"
+    );
+
+    let cfg = std::fs::read_to_string(config_path(&name)).expect("config sidecar must exist");
+    assert!(
+        cfg.contains("\"cpus\": 6"),
+        "--reload must pick up the edited dome.json cpus=6; got: {cfg}"
+    );
+    assert!(
+        cfg.contains("\"disk_size\": 2048"),
+        "--reload must NOT change disk_size (create-only); it stays pinned at 2048; got: {cfg}"
+    );
+
+    let _ = std::fs::remove_file(&cfg_file);
+    rm_sandbox(&name);
+}

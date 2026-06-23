@@ -443,7 +443,11 @@ pub(crate) fn save_sandbox(name_arg: Option<String>, config_path: Option<&str>) 
 /// metadata (atomically) and reports that the change applies on the **next** cold boot, not
 /// to a running VM. The sandbox must already exist (created lazily by `shell`/`run` or
 /// explicitly by `create`). Disk size remains pinned by the index guardrail regardless.
-pub(crate) fn config_sandbox(name_arg: Option<String>, vm_args: &VmArgs) -> Result<()> {
+pub(crate) fn config_sandbox(
+    name_arg: Option<String>,
+    vm_args: &VmArgs,
+    reload: bool,
+) -> Result<()> {
     reject_direct_storage()?;
     let cfg = load_config(vm_args.config.as_deref())?;
     let cwd = std::env::current_dir()?;
@@ -473,6 +477,25 @@ pub(crate) fn config_sandbox(name_arg: Option<String>, vm_args: &VmArgs) -> Resu
     // config persistence has no sidecar yet; treat that as an empty config so editing works.
     let mut config = sandbox_config::load_or_heal(&data_dir, &name, vm_args.config.as_deref())?
         .unwrap_or_default();
+
+    // `--reload`: the explicit, first-class way to re-apply an edited dome.json to an existing
+    // sandbox. Re-resolve from the current sidecar (base) + the current dome.json + any flags,
+    // so dome.json edits take effect without recreating the sandbox. disk_size is create-only:
+    // the disk is physically pinned, so it stays exactly as the sidecar recorded it (a
+    // `--disk-size` flag is already rejected above).
+    if reload {
+        let pinned_disk_size = config.disk_size;
+        config = ResolvedConfig::resolve(&config, &cfg, vm_args)?;
+        config.disk_size = pinned_disk_size;
+        config.save(&data_dir, &name)?;
+        eprintln!(
+            "dome: reloaded config for sandbox '{}' from dome.json. It applies on the next \
+             cold boot; a running VM keeps its current config until stopped.",
+            name
+        );
+        print_sandbox_config(&name, &config);
+        return Ok(());
+    }
 
     // No boot-affecting flags ⇒ a read-only view; otherwise merge the edit.
     if !vm_flags_specified(vm_args) {
