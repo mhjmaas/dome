@@ -49,25 +49,72 @@ pub(crate) struct VmArgs {
     #[arg(long = "no-allow-host-writes")]
     pub no_allow_host_writes: bool,
 
-    /// Forward a host port to a guest port (HOST:GUEST, e.g. 8080:80)
-    #[arg(short = 'p', long = "port", value_name = "HOST:GUEST")]
+    /// Forward a host port to a guest port (HOST:GUEST, e.g. 8080:80). Replaces the current
+    /// port list when passed.
+    #[arg(
+        short = 'p',
+        long = "port",
+        value_name = "HOST:GUEST",
+        conflicts_with = "no_port"
+    )]
     pub port: Vec<String>,
 
-    /// Mount a host directory into the VM (HOST:GUEST[:ro|:rw], default ro)
-    #[arg(long = "mount", value_name = "HOST:GUEST[:ro|:rw]")]
+    /// Clear all port forwards (overrides dome.json / a previously-set sandbox)
+    #[arg(long = "no-port")]
+    pub no_port: bool,
+
+    /// Mount a host directory into the VM (HOST:GUEST[:ro|:rw], default ro). Replaces the
+    /// current mount list when passed.
+    #[arg(
+        long = "mount",
+        value_name = "HOST:GUEST[:ro|:rw]",
+        conflicts_with = "no_mount"
+    )]
     pub mount: Vec<String>,
 
-    /// Inject a secret via proxy (NAME=ENV_VAR@host1,host2)
-    #[arg(long = "secret", value_name = "NAME=ENV@HOSTS")]
+    /// Clear all mounts (overrides dome.json / a previously-set sandbox)
+    #[arg(long = "no-mount")]
+    pub no_mount: bool,
+
+    /// Inject a secret via proxy (NAME=ENV_VAR@host1,host2). Replaces the current secret list
+    /// when passed.
+    #[arg(
+        long = "secret",
+        value_name = "NAME=ENV@HOSTS",
+        conflicts_with = "no_secret"
+    )]
     pub secret: Vec<String>,
 
-    /// Restrict network to specific hosts (repeatable)
-    #[arg(long = "allow-host", value_name = "PATTERN")]
+    /// Clear all secrets (overrides dome.json / a previously-set sandbox)
+    #[arg(long = "no-secret")]
+    pub no_secret: bool,
+
+    /// Restrict network to specific hosts (repeatable). Replaces the current allow-list when
+    /// passed.
+    #[arg(
+        long = "allow-host",
+        value_name = "PATTERN",
+        conflicts_with = "no_allow_host"
+    )]
     pub allow_host: Vec<String>,
 
-    /// Expose a host port to the guest via host.dome.internal (HOST:GUEST or PORT)
-    #[arg(long = "expose-host", value_name = "HOST:GUEST", hide = true)]
+    /// Clear the network allow-list (overrides dome.json / a previously-set sandbox)
+    #[arg(long = "no-allow-host")]
+    pub no_allow_host: bool,
+
+    /// Expose a host port to the guest via host.dome.internal (HOST:GUEST or PORT). Replaces
+    /// the current expose-host list when passed.
+    #[arg(
+        long = "expose-host",
+        value_name = "HOST:GUEST",
+        hide = true,
+        conflicts_with = "no_expose_host"
+    )]
     pub expose_host: Vec<String>,
+
+    /// Clear all exposed host ports (overrides dome.json / a previously-set sandbox)
+    #[arg(long = "no-expose-host", hide = true)]
+    pub no_expose_host: bool,
 
     /// Path to config file (default: ./dome.json)
     #[arg(long)]
@@ -89,6 +136,47 @@ impl VmArgs {
     /// The host-writes policy the user requested as a tri-state, mirroring [`allow_net_flag`].
     pub(crate) fn allow_host_writes_flag(&self) -> Option<bool> {
         tri_state(self.allow_host_writes, self.no_allow_host_writes)
+    }
+
+    /// The port list the user requested as a tri-state: `Some(values)` to replace, `Some(empty)`
+    /// from `--no-port` to clear, `None` when neither is passed (inherit the lower layer).
+    pub(crate) fn port_flag(&self) -> Option<Vec<String>> {
+        list_flag(&self.port, self.no_port)
+    }
+
+    /// The mount list the user requested as a tri-state, mirroring [`port_flag`].
+    pub(crate) fn mount_flag(&self) -> Option<Vec<String>> {
+        list_flag(&self.mount, self.no_mount)
+    }
+
+    /// The secret list the user requested as a tri-state (raw `NAME=ENV@hosts` strings),
+    /// mirroring [`port_flag`].
+    pub(crate) fn secret_flag(&self) -> Option<Vec<String>> {
+        list_flag(&self.secret, self.no_secret)
+    }
+
+    /// The network allow-list the user requested as a tri-state, mirroring [`port_flag`].
+    pub(crate) fn allow_host_flag(&self) -> Option<Vec<String>> {
+        list_flag(&self.allow_host, self.no_allow_host)
+    }
+
+    /// The exposed-host list the user requested as a tri-state, mirroring [`port_flag`].
+    pub(crate) fn expose_host_flag(&self) -> Option<Vec<String>> {
+        list_flag(&self.expose_host, self.no_expose_host)
+    }
+}
+
+/// Collapse a repeatable list flag and its `--no-` clearing counterpart into a tri-state. A
+/// non-empty `values` replaces (`Some(values)`); `cleared` alone clears (`Some(empty)`);
+/// neither inherits (`None`). clap `conflicts_with` rejects passing both, so a non-empty
+/// `values` winning the tie is just defensive.
+fn list_flag(values: &[String], cleared: bool) -> Option<Vec<String>> {
+    if !values.is_empty() {
+        Some(values.to_vec())
+    } else if cleared {
+        Some(Vec::new())
+    } else {
+        None
     }
 }
 
@@ -374,5 +462,61 @@ mod tests {
 
         let err = parse_run(&["--allow-host-writes", "--no-allow-host-writes"]).unwrap_err();
         assert_eq!(err.kind(), clap::error::ErrorKind::ArgumentConflict);
+    }
+
+    #[test]
+    fn list_flags_resolve_to_a_tri_state() {
+        assert_eq!(
+            parse_run(&[]).unwrap().port_flag(),
+            None,
+            "neither → inherit"
+        );
+        assert_eq!(
+            parse_run(&["--port", "8080:80", "--port", "443:443"])
+                .unwrap()
+                .port_flag(),
+            Some(vec!["8080:80".to_string(), "443:443".to_string()]),
+            "values replace"
+        );
+        assert_eq!(
+            parse_run(&["--no-port"]).unwrap().port_flag(),
+            Some(Vec::new()),
+            "--no-port clears"
+        );
+        // Each list has a clearing counterpart.
+        assert_eq!(
+            parse_run(&["--no-mount"]).unwrap().mount_flag(),
+            Some(Vec::new())
+        );
+        assert_eq!(
+            parse_run(&["--no-secret"]).unwrap().secret_flag(),
+            Some(Vec::new())
+        );
+        assert_eq!(
+            parse_run(&["--no-allow-host"]).unwrap().allow_host_flag(),
+            Some(Vec::new())
+        );
+        assert_eq!(
+            parse_run(&["--no-expose-host"]).unwrap().expose_host_flag(),
+            Some(Vec::new())
+        );
+    }
+
+    #[test]
+    fn passing_a_list_flag_and_its_negation_is_an_error() {
+        for (set, clear) in [
+            ("--port", "--no-port"),
+            ("--mount", "--no-mount"),
+            ("--secret", "--no-secret"),
+            ("--allow-host", "--no-allow-host"),
+            ("--expose-host", "--no-expose-host"),
+        ] {
+            let err = parse_run(&[set, "x", clear]).unwrap_err();
+            assert_eq!(
+                err.kind(),
+                clap::error::ErrorKind::ArgumentConflict,
+                "{set} + {clear} must conflict"
+            );
+        }
     }
 }

@@ -132,10 +132,11 @@ impl ResolvedConfig {
     /// values (an empty default for `create`/`run`; the stored sidecar for a heal). Scalars
     /// take the highest set layer; tri-state booleans take the highest *set* layer
     /// (`--allow-net`/`--no-allow-net` and the host-writes pair override `dome.json`, which
-    /// overrides the base/default) so a policy can be turned off, not only on; lists are merged additively
-    /// (`base ++ dome.json ++ flags`, de-duplicated) so creating a sandbox folds `dome.json`'s
-    /// ports/mounts/secrets/allow-list into the sidecar. A malformed `--secret` fails here, so
-    /// the error surfaces at `create`/`reload` rather than on a future boot.
+    /// overrides the base/default) so a policy can be turned off, not only on; lists take the
+    /// highest *set* layer too (a non-empty `--port`/etc. replaces the lower layer, `--no-port`
+    /// clears it to empty, an omitted flag inherits `dome.json` then the base) — one consistent
+    /// rule with scalars and booleans. A malformed `--secret` fails here, so the error surfaces
+    /// at `create`/`reload` rather than on a future boot.
     pub(crate) fn resolve(
         base: &ResolvedConfig,
         dome: &DomeConfig,
@@ -157,50 +158,51 @@ impl ResolvedConfig {
             .or(dome.allow_host_writes)
             .unwrap_or(base.allow_host_writes);
 
-        // Lists: additive merge base ++ dome.json ++ flags (de-duplicated).
-        let mut ports = base.ports.clone();
-        extend_dedup(&mut ports, dome.ports.as_deref().unwrap_or(&[]));
-        extend_dedup(&mut ports, &flags.port);
+        // Lists: highest set layer replaces (flag > dome.json > base/default). A non-empty
+        // flag list replaces, `--no-<list>` clears to empty, an omitted flag inherits the
+        // next-lower layer that is set.
+        let ports = flags
+            .port_flag()
+            .or_else(|| dome.ports.clone())
+            .unwrap_or_else(|| base.ports.clone());
 
-        let mut mounts = base.mounts.clone();
-        extend_dedup(&mut mounts, dome.mounts.as_deref().unwrap_or(&[]));
-        extend_dedup(&mut mounts, &flags.mount);
+        let mounts = flags
+            .mount_flag()
+            .or_else(|| dome.mounts.clone())
+            .unwrap_or_else(|| base.mounts.clone());
 
-        let mut allow = base.proxy.allow.clone();
-        if let Some(net) = &dome.network {
-            if let Some(a) = &net.allow {
-                extend_dedup(&mut allow, a);
-            }
-        }
-        extend_dedup(&mut allow, &flags.allow_host);
+        // `--allow-host` and `dome.json` `network.allow` unify into one allow-list field.
+        let allow = flags
+            .allow_host_flag()
+            .or_else(|| dome.network.as_ref().and_then(|n| n.allow.clone()))
+            .unwrap_or_else(|| base.proxy.allow.clone());
 
-        let mut expose_host = base.proxy.expose_host.clone();
-        extend_dedup(&mut expose_host, dome.expose_host.as_deref().unwrap_or(&[]));
-        extend_dedup(&mut expose_host, &flags.expose_host);
+        let expose_host = flags
+            .expose_host_flag()
+            .or_else(|| dome.expose_host.clone())
+            .unwrap_or_else(|| base.proxy.expose_host.clone());
 
-        // Secrets: base, then dome.json, then flags; a later layer overrides by name. The
-        // value is never captured — only the {name, from, hosts} mapping.
-        let mut secrets = base.proxy.secrets.clone();
-        if let Some(dome_secrets) = &dome.secrets {
-            for (name, entry) in dome_secrets {
-                upsert_secret(
-                    &mut secrets,
-                    SecretSpec {
-                        name: name.clone(),
-                        from: entry.from.clone(),
-                        hosts: entry.hosts.clone(),
-                    },
-                );
-            }
-        }
-        for s in &flags.secret {
-            let (name, from, hosts) = crate::vm::parse_secret_flag(s).with_context(|| {
-                format!("invalid --secret: '{}' (expected NAME=ENV@host1,host2)", s)
-            })?;
-            upsert_secret(&mut secrets, SecretSpec { name, from, hosts });
-        }
-        // Deterministic order regardless of dome.json's HashMap iteration order.
-        secrets.sort_by(|a, b| a.name.cmp(&b.name));
+        // Secrets follow the same replace rule, but the layers carry different shapes: flag
+        // strings are parsed here (a malformed one fails), `dome.json` entries are already
+        // structured, and the base is the previously-resolved sidecar. The value is never
+        // captured — only the {name, from, hosts} mapping.
+        let secrets = if let Some(secret_flags) = flags.secret_flag() {
+            parse_secret_specs(&secret_flags)?
+        } else if let Some(dome_secrets) = &dome.secrets {
+            let mut secrets: Vec<SecretSpec> = dome_secrets
+                .iter()
+                .map(|(name, entry)| SecretSpec {
+                    name: name.clone(),
+                    from: entry.from.clone(),
+                    hosts: entry.hosts.clone(),
+                })
+                .collect();
+            // Deterministic order regardless of dome.json's HashMap iteration order.
+            secrets.sort_by(|a, b| a.name.cmp(&b.name));
+            secrets
+        } else {
+            base.proxy.secrets.clone()
+        };
 
         Ok(Self {
             version: SIDECAR_VERSION,
@@ -221,7 +223,8 @@ impl ResolvedConfig {
 
     /// Apply a `dome sandbox config` edit in place: a set scalar overrides, a tri-state bool
     /// flag turns the policy on (`--allow-net`) or off (`--no-allow-net`) while an omitted one
-    /// leaves it untouched, and a non-empty list replaces.
+    /// leaves it untouched, a non-empty list replaces, and `--no-<list>` clears it to empty
+    /// (an omitted list flag leaves it untouched).
     /// A malformed `--secret` errors so the edit fails rather than corrupting the sidecar.
     /// The edit takes effect on the next cold boot, never on a running VM.
     pub(crate) fn merge_update(&mut self, vm: &VmArgs) -> Result<()> {
@@ -240,28 +243,20 @@ impl ResolvedConfig {
         if let Some(v) = vm.allow_host_writes_flag() {
             self.allow_host_writes = v;
         }
-        if !vm.port.is_empty() {
-            self.ports = vm.port.clone();
+        if let Some(v) = vm.port_flag() {
+            self.ports = v;
         }
-        if !vm.mount.is_empty() {
-            self.mounts = vm.mount.clone();
+        if let Some(v) = vm.mount_flag() {
+            self.mounts = v;
         }
-        if !vm.allow_host.is_empty() {
-            self.proxy.allow = vm.allow_host.clone();
+        if let Some(v) = vm.allow_host_flag() {
+            self.proxy.allow = v;
         }
-        if !vm.expose_host.is_empty() {
-            self.proxy.expose_host = vm.expose_host.clone();
+        if let Some(v) = vm.expose_host_flag() {
+            self.proxy.expose_host = v;
         }
-        if !vm.secret.is_empty() {
-            let mut secrets = Vec::new();
-            for s in &vm.secret {
-                let (name, from, hosts) = crate::vm::parse_secret_flag(s).with_context(|| {
-                    format!("invalid --secret: '{}' (expected NAME=ENV@host1,host2)", s)
-                })?;
-                upsert_secret(&mut secrets, SecretSpec { name, from, hosts });
-            }
-            secrets.sort_by(|a, b| a.name.cmp(&b.name));
-            self.proxy.secrets = secrets;
+        if let Some(v) = vm.secret_flag() {
+            self.proxy.secrets = parse_secret_specs(&v)?;
         }
         Ok(())
     }
@@ -314,21 +309,41 @@ impl ResolvedConfig {
                 out.push(format!("{flag} (live: {live})"));
             }
         }
-        list_conflict(&mut out, "--port", &requested.port, &self.ports);
-        list_conflict(&mut out, "--mount", &requested.mount, &self.mounts);
+        list_conflict(
+            &mut out,
+            "--port",
+            "--no-port",
+            requested.port_flag(),
+            &self.ports,
+        );
+        list_conflict(
+            &mut out,
+            "--mount",
+            "--no-mount",
+            requested.mount_flag(),
+            &self.mounts,
+        );
         let live_secrets: Vec<String> =
             self.proxy.secrets.iter().map(SecretSpec::to_flag).collect();
-        list_conflict(&mut out, "--secret", &requested.secret, &live_secrets);
+        list_conflict(
+            &mut out,
+            "--secret",
+            "--no-secret",
+            requested.secret_flag(),
+            &live_secrets,
+        );
         list_conflict(
             &mut out,
             "--allow-host",
-            &requested.allow_host,
+            "--no-allow-host",
+            requested.allow_host_flag(),
             &self.proxy.allow,
         );
         list_conflict(
             &mut out,
             "--expose-host",
-            &requested.expose_host,
+            "--no-expose-host",
+            requested.expose_host_flag(),
             &self.proxy.expose_host,
         );
         out
@@ -483,24 +498,29 @@ pub(crate) fn load_or_heal(
     }
 }
 
-/// Append items from `extra` to `target`, skipping any already present so an additive merge
-/// across layers does not duplicate a forward/mount/host the user listed twice.
-fn extend_dedup(target: &mut Vec<String>, extra: &[String]) {
-    for s in extra {
-        if !target.iter().any(|existing| existing == s) {
-            target.push(s.clone());
-        }
-    }
-}
-
 /// Insert `spec` into `secrets`, replacing any existing entry with the same name (a later
-/// layer wins) while preserving the first-seen position.
+/// duplicate wins) while preserving the first-seen position.
 fn upsert_secret(secrets: &mut Vec<SecretSpec>, spec: SecretSpec) {
     if let Some(existing) = secrets.iter_mut().find(|s| s.name == spec.name) {
         *existing = spec;
     } else {
         secrets.push(spec);
     }
+}
+
+/// Parse `NAME=ENV@host1,host2` secret flag strings into structured specs, de-duplicating by
+/// name (a later occurrence wins) and sorting by name for a deterministic sidecar. A malformed
+/// entry errors so the edit/resolve fails rather than baking a bad config.
+fn parse_secret_specs(flags: &[String]) -> Result<Vec<SecretSpec>> {
+    let mut secrets = Vec::new();
+    for s in flags {
+        let (name, from, hosts) = crate::vm::parse_secret_flag(s).with_context(|| {
+            format!("invalid --secret: '{}' (expected NAME=ENV@host1,host2)", s)
+        })?;
+        upsert_secret(&mut secrets, SecretSpec { name, from, hosts });
+    }
+    secrets.sort_by(|a, b| a.name.cmp(&b.name));
+    Ok(secrets)
 }
 
 /// Atomically write `cfg` to `path` (temp + rename).
@@ -526,19 +546,30 @@ fn show_opt<T: std::fmt::Display>(v: Option<T>) -> String {
     }
 }
 
-/// Push a conflict line for a repeatable list flag when the user requested a non-empty list
-/// that differs from the live one.
-fn list_conflict(out: &mut Vec<String>, flag: &str, requested: &[String], live: &[String]) {
-    if !requested.is_empty() && requested != live {
-        let live_desc = if live.is_empty() {
-            "none".to_string()
-        } else {
-            live.join(", ")
-        };
-        out.push(format!(
-            "{flag} {} (live: {live_desc})",
-            requested.join(", ")
-        ));
+/// Push a conflict line for a repeatable list flag when the user requested a list (via the
+/// setter or its `--no-` clearing counterpart) that differs from the live one. `requested` is
+/// the flag tri-state: `None` means the user did not touch this list; `Some(empty)` is a
+/// `--no-<list>` clear; `Some(values)` is a replace.
+fn list_conflict(
+    out: &mut Vec<String>,
+    set_flag: &str,
+    clear_flag: &str,
+    requested: Option<Vec<String>>,
+    live: &[String],
+) {
+    let Some(req) = requested else { return };
+    if req == live {
+        return;
+    }
+    let live_desc = if live.is_empty() {
+        "none".to_string()
+    } else {
+        live.join(", ")
+    };
+    if req.is_empty() {
+        out.push(format!("{clear_flag} (live: {live_desc})"));
+    } else {
+        out.push(format!("{set_flag} {} (live: {live_desc})", req.join(", ")));
     }
 }
 
@@ -646,21 +677,69 @@ mod tests {
     }
 
     #[test]
-    fn resolve_lists_merge_additively_and_dedup() {
+    fn resolve_lists_replace_on_set() {
         let dome = DomeConfig {
             ports: Some(vec!["8080:80".into(), "443:443".into()]),
             ..Default::default()
         };
-        let flags = vm(|v| v.port = vec!["443:443".into(), "9000:9000".into()]);
+        // A non-empty flag list replaces dome.json's list entirely (not an additive merge).
+        let flags = vm(|v| v.port = vec!["9000:9000".into()]);
         let r = ResolvedConfig::resolve(&ResolvedConfig::default(), &dome, &flags).unwrap();
-        // dome.json ports first, then the flag's new port; the duplicate 443:443 appears once.
         assert_eq!(
             r.ports,
-            vec![
-                "8080:80".to_string(),
-                "443:443".to_string(),
-                "9000:9000".to_string()
-            ]
+            vec!["9000:9000".to_string()],
+            "flag replaces dome.json"
+        );
+
+        // An omitted flag inherits dome.json's list.
+        let r =
+            ResolvedConfig::resolve(&ResolvedConfig::default(), &dome, &VmArgs::default()).unwrap();
+        assert_eq!(
+            r.ports,
+            vec!["8080:80".to_string(), "443:443".to_string()],
+            "omitted flag inherits dome.json"
+        );
+    }
+
+    #[test]
+    fn resolve_no_list_flag_clears_a_lower_layer() {
+        // `--no-port` clears a dome.json list; `--no-allow-host` clears the unified allow-list.
+        let dome = DomeConfig {
+            ports: Some(vec!["8080:80".into()]),
+            network: Some(NetworkEntry {
+                allow: Some(vec!["api.openai.com".into()]),
+            }),
+            ..Default::default()
+        };
+        let flags = vm(|v| {
+            v.no_port = true;
+            v.no_allow_host = true;
+        });
+        let r = ResolvedConfig::resolve(&ResolvedConfig::default(), &dome, &flags).unwrap();
+        assert!(r.ports.is_empty(), "--no-port clears dome.json's ports");
+        assert!(
+            r.proxy.allow.is_empty(),
+            "--no-allow-host clears the unified allow-list"
+        );
+
+        // `--no-secret` clears dome.json's secrets.
+        let mut dome_secrets = HashMap::new();
+        dome_secrets.insert(
+            "openai".to_string(),
+            SecretEntry {
+                from: "OPENAI_API_KEY".into(),
+                hosts: vec!["api.openai.com".into()],
+            },
+        );
+        let dome = DomeConfig {
+            secrets: Some(dome_secrets),
+            ..Default::default()
+        };
+        let flags = vm(|v| v.no_secret = true);
+        let r = ResolvedConfig::resolve(&ResolvedConfig::default(), &dome, &flags).unwrap();
+        assert!(
+            r.proxy.secrets.is_empty(),
+            "--no-secret clears dome.json's secrets"
         );
     }
 
@@ -672,13 +751,20 @@ mod tests {
             }),
             ..Default::default()
         };
+        // `--allow-host` and `network.allow` feed one unified field; with replace semantics a
+        // passed `--allow-host` replaces `network.allow` rather than merging with it.
         let flags = vm(|v| v.allow_host = vec!["*.github.com".into()]);
         let r = ResolvedConfig::resolve(&ResolvedConfig::default(), &dome, &flags).unwrap();
         assert_eq!(
             r.proxy.allow,
-            vec!["api.openai.com".to_string(), "*.github.com".to_string()],
-            "network.allow and --allow-host feed one unified list"
+            vec!["*.github.com".to_string()],
+            "--allow-host replaces network.allow in the unified list"
         );
+
+        // With no flag, the unified list inherits dome.json's network.allow.
+        let r =
+            ResolvedConfig::resolve(&ResolvedConfig::default(), &dome, &VmArgs::default()).unwrap();
+        assert_eq!(r.proxy.allow, vec!["api.openai.com".to_string()]);
     }
 
     #[test]
@@ -729,11 +815,12 @@ mod tests {
     #[test]
     fn resolve_base_carries_previously_resolved_values() {
         // A heal re-resolves a base against dome.json; the base's values are inherited when
-        // no higher layer overrides, and lists fold together.
+        // no higher layer is set. A dome.json list (a higher set layer) replaces the base's.
         let base = ResolvedConfig {
             cpus: Some(2),
             allow_net: true,
             ports: vec!["1:1".into()],
+            mounts: vec!["/a:/a".into()],
             ..Default::default()
         };
         let dome = DomeConfig {
@@ -745,8 +832,13 @@ mod tests {
         assert!(r.allow_net, "base allow_net inherited");
         assert_eq!(
             r.ports,
-            vec!["1:1".to_string(), "2:2".to_string()],
-            "base ++ dome"
+            vec!["2:2".to_string()],
+            "a dome.json list replaces the base's"
+        );
+        assert_eq!(
+            r.mounts,
+            vec!["/a:/a".to_string()],
+            "a base list with no higher layer is inherited"
         );
     }
 
@@ -878,6 +970,41 @@ mod tests {
             cfg.allow_host_writes,
             "an omitted flag must not clear the policy"
         );
+    }
+
+    #[test]
+    fn merge_update_clears_lists_with_no_flag_and_leaves_omitted_lists() {
+        let mut cfg = ResolvedConfig {
+            ports: vec!["8080:80".into()],
+            mounts: vec!["/a:/a".into()],
+            ..Default::default()
+        };
+        cfg.proxy.secrets = vec![SecretSpec {
+            name: "openai".into(),
+            from: "OPENAI_API_KEY".into(),
+            hosts: vec!["api.openai.com".into()],
+        }];
+        // `--no-port` clears the ports; an omitted mount/secret flag is left untouched.
+        cfg.merge_update(&vm(|v| v.no_port = true)).unwrap();
+        assert!(
+            cfg.ports.is_empty(),
+            "--no-port clears the ports via config"
+        );
+        assert_eq!(
+            cfg.mounts,
+            vec!["/a:/a".to_string()],
+            "an omitted --mount must not clear the list"
+        );
+        assert_eq!(
+            cfg.proxy.secrets.len(),
+            1,
+            "an omitted --secret is untouched"
+        );
+
+        // A non-empty list still replaces.
+        cfg.merge_update(&vm(|v| v.mount = vec!["/b:/b".into()]))
+            .unwrap();
+        assert_eq!(cfg.mounts, vec!["/b:/b".to_string()], "--mount replaces");
     }
 
     #[test]

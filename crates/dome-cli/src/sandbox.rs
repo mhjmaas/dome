@@ -135,11 +135,11 @@ fn vm_flags_specified(vm_args: &VmArgs) -> bool {
         || vm_args.disk_size.is_some()
         || vm_args.allow_net_flag().is_some()
         || vm_args.allow_host_writes_flag().is_some()
-        || !vm_args.port.is_empty()
-        || !vm_args.mount.is_empty()
-        || !vm_args.secret.is_empty()
-        || !vm_args.allow_host.is_empty()
-        || !vm_args.expose_host.is_empty()
+        || vm_args.port_flag().is_some()
+        || vm_args.mount_flag().is_some()
+        || vm_args.secret_flag().is_some()
+        || vm_args.allow_host_flag().is_some()
+        || vm_args.expose_host_flag().is_some()
 }
 
 /// Report that a config update to an already-running sandbox has been persisted to the
