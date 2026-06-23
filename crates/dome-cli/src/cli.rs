@@ -207,6 +207,15 @@ pub(crate) enum SandboxCommands {
         from: Option<String>,
     },
 
+    /// View or edit a sandbox's persisted config (applied on the next cold boot)
+    Config {
+        /// Sandbox name (defaults to the `sandbox` field in dome.json, else a cwd slug)
+        name: Option<String>,
+
+        #[command(flatten)]
+        vm: VmArgs,
+    },
+
     /// Force a durable flush+save of a running sandbox's disk state to its index
     Save {
         /// Sandbox name (defaults to the `sandbox` field in dome.json, else a cwd slug)
