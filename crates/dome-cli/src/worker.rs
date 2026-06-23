@@ -196,6 +196,29 @@ pub(crate) fn write_boot_spec(data_dir: &str, name: &str, boot: &serde_json::Val
     Ok(())
 }
 
+/// domed-side: scan the workers dir for per-sandbox data-plane sockets (`{name}.sock`),
+/// returning each sandbox name and its socket path. Used on domed (re)start to discover
+/// workers that survived a domed crash/restart so they can be re-adopted into the
+/// registry (or their stale sockets reconciled). Best-effort: a missing or unreadable
+/// workers dir yields an empty list.
+pub(crate) fn scan_worker_sockets(data_dir: &str) -> Vec<(String, PathBuf)> {
+    let dir = workers_dir(data_dir);
+    let mut out = Vec::new();
+    let Ok(entries) = std::fs::read_dir(&dir) else {
+        return out;
+    };
+    for entry in entries.flatten() {
+        let path = entry.path();
+        if path.extension().and_then(|e| e.to_str()) != Some("sock") {
+            continue;
+        }
+        if let Some(name) = path.file_stem().and_then(|s| s.to_str()) {
+            out.push((name.to_string(), path.clone()));
+        }
+    }
+    out
+}
+
 /// domed-side: read the error a failed worker recorded, if any (cleared after reading).
 pub(crate) fn take_worker_error(data_dir: &str, name: &str) -> Option<String> {
     let path = err_path(data_dir, name);
