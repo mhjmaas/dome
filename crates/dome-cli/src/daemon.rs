@@ -375,6 +375,19 @@ impl Supervisor {
         })
     }
 
+    /// Force a durable flush+save of a running sandbox. domed forwards the request to the
+    /// sandbox's live worker (the only holder of the in-memory dirty buffer); the worker
+    /// flushes+saves and then notifies domed, which broadcasts `sandbox.saved`. An idle
+    /// sandbox has no unsaved state (its on-disk index already is the durable state), so
+    /// this errors rather than silently no-op'ing — there is nothing to flush without a
+    /// running worker.
+    fn save(&self, name: &str) -> Result<()> {
+        let (socket, _pid) = self.live_worker_socket(name).ok_or_else(|| {
+            anyhow::anyhow!("sandbox '{name}' is not running; nothing to save (it is already durable on disk)")
+        })?;
+        worker::save_via_worker(&socket)
+    }
+
     /// The data-plane socket of a live worker for `name`, if one is reachable. Drops a
     /// registry entry whose worker has died, and re-adopts a worker whose socket is live
     /// on disk but missing from the registry (e.g. after a domed restart).
@@ -530,6 +543,31 @@ fn handle_conn(sup: &Arc<Supervisor>, stream: UnixStream) {
                     let _ = write_line(&mut writer, &Response::err(req.id, format!("{e:#}")));
                 }
             },
+            Command::Save { name } => match sup.save(&name) {
+                // The worker emits the `sandbox.saved` event (via WorkerSaved) once it has
+                // actually flushed, so we just report success/failure here.
+                Ok(()) => {
+                    let _ = write_line(
+                        &mut writer,
+                        &Response::ok(req.id, serde_json::json!({ "saved": true })),
+                    );
+                }
+                Err(e) => {
+                    let _ = write_line(&mut writer, &Response::err(req.id, format!("{e:#}")));
+                }
+            },
+            Command::WorkerSaved { name } => {
+                // A worker reports that it flushed+saved (auto-flush, explicit, or stop).
+                // Rebroadcast to subscribers, then acknowledge the worker.
+                sup.broadcast(&Event {
+                    event: "sandbox.saved".to_string(),
+                    data: Some(serde_json::json!({ "name": name })),
+                });
+                let _ = write_line(
+                    &mut writer,
+                    &Response::ok(req.id, serde_json::json!({ "ok": true })),
+                );
+            }
         }
     }
 }
@@ -693,6 +731,40 @@ pub(crate) fn attach_via_daemon(
         },
     )?;
     decode_result(resp)
+}
+
+/// `dome sandbox save <name>` data path: route a save through domed (auto-spawning it).
+/// domed forwards it to the sandbox's worker, which performs the durable flush+save.
+pub(crate) fn save_via_daemon(data_dir: &str, name: &str) -> Result<()> {
+    let mut stream = ensure_daemon(data_dir)?;
+    let resp = request(
+        &mut stream,
+        Command::Save {
+            name: name.to_string(),
+        },
+    )?;
+    if !resp.ok {
+        bail!(
+            "domed error: {}",
+            resp.error.unwrap_or_else(|| "unknown error".to_string())
+        );
+    }
+    Ok(())
+}
+
+/// Worker → domed: report that a sandbox was saved, so domed broadcasts `sandbox.saved`
+/// to subscribers. Best-effort and non-fatal — a worker outlives domed, so a save still
+/// succeeds when no domed is up to notify (there are no subscribers then anyway). Connects
+/// only if a domed is already reachable; it never spawns one.
+pub(crate) fn notify_saved(data_dir: &str, name: &str) {
+    if let Some(mut stream) = try_connect(data_dir) {
+        let _ = request(
+            &mut stream,
+            Command::WorkerSaved {
+                name: name.to_string(),
+            },
+        );
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -940,6 +1012,49 @@ mod tests {
             line.clear();
         }
         assert!(saw_stopping, "subscriber must receive daemon.stopping");
+    }
+
+    #[test]
+    fn worker_saved_is_rebroadcast_to_subscribers_as_sandbox_saved() {
+        // A worker reports a completed save via WorkerSaved; domed must rebroadcast it to
+        // subscribers as a `sandbox.saved` event carrying the sandbox name. This is the
+        // path that surfaces auto-flush/explicit saves to UI subscribers.
+        let d = TestDaemon::start();
+
+        // Connection A subscribes and reads the ack.
+        let mut sub = d.connect();
+        write_line(&mut sub, &Request::new(Some(1), Command::Subscribe)).unwrap();
+        let mut sub_reader = BufReader::new(sub.try_clone().unwrap());
+        let mut ack = String::new();
+        sub_reader.read_line(&mut ack).unwrap();
+        assert!(serde_json::from_str::<Response>(ack.trim()).unwrap().ok);
+
+        // Connection B (standing in for the worker) reports a save.
+        let mut worker = d.connect();
+        let resp = request(
+            &mut worker,
+            Command::WorkerSaved {
+                name: "web".to_string(),
+            },
+        )
+        .unwrap();
+        assert!(resp.ok, "domed should acknowledge the worker's save report");
+
+        // The subscriber receives sandbox.saved with the sandbox name.
+        let mut saw = false;
+        let mut line = String::new();
+        while sub_reader.read_line(&mut line).unwrap_or(0) != 0 {
+            if let Ok(ev) = serde_json::from_str::<Event>(line.trim()) {
+                if ev.event == "sandbox.saved" {
+                    let name = ev.data.as_ref().and_then(|d| d["name"].as_str());
+                    assert_eq!(name, Some("web"), "event must carry the sandbox name");
+                    saw = true;
+                    break;
+                }
+            }
+            line.clear();
+        }
+        assert!(saw, "subscriber must receive sandbox.saved");
     }
 
     // --- Registry unit tests (one-worker-per-name + overlay) ---

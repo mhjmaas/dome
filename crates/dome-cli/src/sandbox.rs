@@ -316,6 +316,24 @@ pub(crate) fn remove_sandbox(name_arg: Option<String>, config_path: Option<&str>
     Ok(())
 }
 
+/// `dome sandbox save <name>`: force a durable flush+save of a running sandbox. Resolves
+/// the name the same way the rest of the command group does (explicit → `dome.json` → cwd
+/// slug), then routes through domed, which tells the sandbox's worker to flush its dirty
+/// chunks and atomically rewrite the index. Errors clearly if the sandbox is not running
+/// (an idle sandbox is already durable on disk — there is nothing buffered to flush).
+pub(crate) fn save_sandbox(name_arg: Option<String>, config_path: Option<&str>) -> Result<()> {
+    reject_direct_storage()?;
+    let cfg = load_config(config_path)?;
+    let cwd = std::env::current_dir()?;
+    let name = resolve_name(name_arg.as_deref(), &cfg, &cwd)?;
+    dome_vm::validate_checkpoint_name(&name).map_err(|e| anyhow::anyhow!(e))?;
+
+    let data_dir = dome_vm::default_data_dir();
+    crate::daemon::save_via_daemon(&data_dir, &name)?;
+    eprintln!("dome: sandbox '{}' saved.", name);
+    Ok(())
+}
+
 /// Unlink a sandbox's index (and any lock left behind by a crashed session). Errors
 /// clearly if the sandbox does not exist, and refuses to remove one that is currently
 /// open by a live session — deleting a running sandbox's index would just be recreated

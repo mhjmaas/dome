@@ -51,6 +51,14 @@ impl NbdHandle {
             .ok_or_else(|| anyhow::anyhow!("save_sandbox requires CAS backend"))?;
         backend.save_sandbox_index(index_path)
     }
+
+    /// The CAS backend behind this server, if any (flat-file mode has none). The worker
+    /// clones this `Arc` so a background thread can poll [`CasBackend::dirty_bytes`] and
+    /// run [`CasBackend::save_sandbox_index`] on the auto-flush interval — independently of
+    /// the main thread, which holds the (non-`Sync`) `NbdHandle` for the VM's lifetime.
+    pub fn cas_backend(&self) -> Option<Arc<CasBackend>> {
+        self.cas_backend.clone()
+    }
 }
 
 impl Drop for NbdHandle {
