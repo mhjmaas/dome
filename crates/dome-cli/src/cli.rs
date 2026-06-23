@@ -207,6 +207,16 @@ pub(crate) enum SandboxCommands {
         from: Option<String>,
     },
 
+    /// Force a durable flush+save of a running sandbox's disk state to its index
+    Save {
+        /// Sandbox name (defaults to the `sandbox` field in dome.json, else a cwd slug)
+        name: Option<String>,
+
+        /// Path to config file (default: ./dome.json)
+        #[arg(long)]
+        config: Option<String>,
+    },
+
     /// List persistent sandboxes (size, pinned base version, running/idle status)
     Ls,
 

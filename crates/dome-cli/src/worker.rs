@@ -47,6 +47,15 @@ use crate::vm;
 const ACCEPT_POLL: Duration = Duration::from_millis(50);
 /// How long a minted token stays valid before it is pruned unused.
 const TOKEN_TTL: Duration = Duration::from_secs(30);
+/// Auto-flush interval: if a sandbox has unsaved (dirty) writes, the worker flushes+saves
+/// at least this often, bounding the crash-loss window for a long-lived session.
+const FLUSH_INTERVAL: Duration = Duration::from_secs(60);
+/// Auto-flush dirty-byte cap: a save is forced as soon as the in-memory dirty buffer
+/// exceeds this, bounding worker memory under a write-heavy burst.
+const DIRTY_CAP: u64 = 256 * 1024 * 1024;
+/// How often the background flusher wakes to re-check the dirty buffer + interval. Small
+/// enough to react promptly to a dirty-cap breach, and to notice shutdown.
+const FLUSH_POLL: Duration = Duration::from_secs(1);
 
 // ---------------------------------------------------------------------------
 // Paths
@@ -183,6 +192,9 @@ enum WorkerRequest {
     /// the source of truth for this count: it owns the byte path, so it (not domed) sees
     /// every session start and end. Used to drive the `ATTACHED` column in `ls`.
     Count,
+    /// Force a durable flush+save of the sandbox right now (drives `dome sandbox save`).
+    /// The worker flushes its dirty chunks and atomically rewrites the index.
+    Save,
     /// Stop the worker: save the sandbox and shut the VM down.
     Stop,
 }
@@ -195,6 +207,13 @@ struct MintResponse {
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 struct CountResponse {
     attached: usize,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+struct SaveResponse {
+    ok: bool,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    error: Option<String>,
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
@@ -274,6 +293,16 @@ struct Worker {
     sandbox: Arc<dome_vm::Sandbox>,
     /// Proxy secret placeholders injected into every guest session.
     env: HashMap<String, String>,
+    /// CAS backend behind the VM's NBD server (None in flat-file mode). The source of the
+    /// dirty-byte count and the target of every flush+save. Shared with the NBD server and
+    /// the background flusher.
+    cas: Option<Arc<dome_store::CasBackend>>,
+    /// Where a save writes the flattened sandbox index: `{data_dir}/sandboxes/{name}.idx`.
+    index_path: String,
+    /// Serializes saves so the auto-flush thread, an explicit `save`, and the shutdown
+    /// save never run [`CasBackend::save_sandbox_index`] concurrently (its atomic temp
+    /// file is keyed only by pid, so two in-flight saves in one worker would collide).
+    save_lock: Mutex<()>,
     tokens: Mutex<TokenStore>,
     attached: AtomicUsize,
     shutdown: AtomicBool,
@@ -289,6 +318,37 @@ impl Worker {
             let _ = writeln!(f, "{} {}", now_unix(), msg);
         }
     }
+
+    /// Bytes currently buffered in the in-memory dirty map (0 in flat-file mode).
+    fn dirty_bytes(&self) -> u64 {
+        self.cas.as_ref().map(|c| c.dirty_bytes()).unwrap_or(0)
+    }
+
+    /// Force a durable flush+save: write+hash the dirty chunks and atomically rewrite the
+    /// sandbox index, so a later cold boot reflects the latest in-memory state. A no-op in
+    /// flat-file mode (no index to save). On success, notifies domed so it can broadcast a
+    /// `sandbox.saved` event to subscribers (best-effort: a save still succeeds if domed
+    /// is down — workers outlive domed).
+    fn save(&self) -> Result<()> {
+        let Some(ref cas) = self.cas else {
+            return Ok(());
+        };
+        // Hold the save lock across the whole flatten+atomic-write so two saves can't race.
+        let _guard = self.save_lock.lock().unwrap();
+        cas.save_sandbox_index(&self.index_path)
+            .with_context(|| format!("saving sandbox index {}", self.index_path))?;
+        self.log("sandbox saved");
+        crate::daemon::notify_saved(&self.data_dir, &self.name);
+        Ok(())
+    }
+}
+
+/// The auto-flush trigger: a save is due once there are dirty (unsaved) bytes AND either
+/// the flush interval has elapsed since the last save or the dirty buffer has exceeded the
+/// cap. With no dirty bytes there is nothing to lose, so the interval alone never forces a
+/// pointless save. Pure + side-effect-free so the policy is unit-testable without a VM.
+fn flush_is_due(dirty_bytes: u64, since_last_save: Duration, interval: Duration, cap: u64) -> bool {
+    dirty_bytes > 0 && (since_last_save >= interval || dirty_bytes >= cap)
 }
 
 // ---------------------------------------------------------------------------
@@ -355,12 +415,19 @@ fn boot_and_serve(name: &str, data_dir: &str) -> Result<()> {
     let nbd_handle = booted.nbd_handle;
     let env = booted.env;
     let sandbox = Arc::new(booted.sandbox);
+    // Clone the CAS backend for the worker (and its background flusher) so they can save
+    // independently of the main thread, which keeps the non-`Sync` NBD handle.
+    let cas = nbd_handle.as_ref().and_then(|h| h.cas_backend());
+    let index_path = format!("{}/sandboxes/{}.idx", data_dir, name);
     let worker = Arc::new(Worker {
         name: name.to_string(),
         data_dir: data_dir.to_string(),
         socket_path: worker_socket_path(data_dir, name),
         sandbox: Arc::clone(&sandbox),
         env,
+        cas,
+        index_path,
+        save_lock: Mutex::new(()),
         tokens: Mutex::new(TokenStore::new()),
         attached: AtomicUsize::new(0),
         shutdown: AtomicBool::new(false),
@@ -379,15 +446,19 @@ fn boot_and_serve(name: &str, data_dir: &str) -> Result<()> {
     install_signal_handlers();
     worker.log(&format!("worker up for '{name}' (pid {})", std::process::id()));
 
+    // Background auto-flush: bound worker memory + the crash-loss window by saving on an
+    // interval and when the dirty buffer exceeds the cap. Joined before the shutdown save.
+    let flusher = spawn_auto_flusher(Arc::clone(&worker));
+
     serve(&worker, listener);
+
+    // Stop the flusher before the final save so they can't run concurrently.
+    let _ = flusher.join();
 
     // --- Shutdown: save, then tear the VM down. ---
     worker.log("worker stopping: saving sandbox");
-    if let Some(ref nbd) = nbd_handle {
-        let index_path = format!("{}/sandboxes/{}.idx", data_dir, name);
-        if let Err(e) = nbd.save_sandbox(&index_path) {
-            worker.log(&format!("save failed: {e:#}"));
-        }
+    if let Err(e) = worker.save() {
+        worker.log(&format!("save failed: {e:#}"));
     }
     let _ = sandbox.stop();
     // Dropping the NBD handle flushes + shuts down the server before we remove the
@@ -408,6 +479,32 @@ fn read_boot_spec(data_dir: &str, name: &str) -> Result<BootSpec> {
     let boot: BootSpec = serde_json::from_slice(&bytes).context("parsing boot spec")?;
     let _ = std::fs::remove_file(&path);
     Ok(boot)
+}
+
+/// Spawn the background auto-flush thread. It wakes every [`FLUSH_POLL`] and, when a save
+/// is [`flush_is_due`], flushes+saves the sandbox — bounding both worker memory (the dirty
+/// buffer never grows past the cap before being drained) and the crash-loss window (unsaved
+/// writes are at most one interval old). It exits when shutdown is requested, so the
+/// caller can join it before the final shutdown save (no two saves ever overlap).
+fn spawn_auto_flusher(worker: Arc<Worker>) -> std::thread::JoinHandle<()> {
+    std::thread::spawn(move || {
+        let mut last_save = Instant::now();
+        loop {
+            if worker.shutdown.load(Ordering::SeqCst) || signal_shutdown_requested() {
+                break;
+            }
+            std::thread::sleep(FLUSH_POLL);
+            if worker.shutdown.load(Ordering::SeqCst) || signal_shutdown_requested() {
+                break;
+            }
+            if flush_is_due(worker.dirty_bytes(), last_save.elapsed(), FLUSH_INTERVAL, DIRTY_CAP) {
+                match worker.save() {
+                    Ok(()) => last_save = Instant::now(),
+                    Err(e) => worker.log(&format!("auto-flush save failed: {e:#}")),
+                }
+            }
+        }
+    })
 }
 
 /// Accept loop: serve worker requests until shutdown is requested (a `stop` request or a
@@ -457,6 +554,16 @@ fn handle_conn(worker: &Arc<Worker>, mut stream: UnixStream) {
         WorkerRequest::Count => {
             let attached = worker.attached.load(Ordering::SeqCst);
             let _ = write_line(&mut stream, &CountResponse { attached });
+        }
+        WorkerRequest::Save => {
+            let resp = match worker.save() {
+                Ok(()) => SaveResponse { ok: true, error: None },
+                Err(e) => {
+                    worker.log(&format!("explicit save failed: {e:#}"));
+                    SaveResponse { ok: false, error: Some(format!("{e:#}")) }
+                }
+            };
+            let _ = write_line(&mut stream, &resp);
         }
         WorkerRequest::Stop => {
             worker.shutdown.store(true, Ordering::SeqCst);
@@ -566,6 +673,22 @@ pub(crate) fn attached_count(socket_path: &Path) -> Result<usize> {
     write_line(&mut stream, &WorkerRequest::Count).context("requesting attached count from worker")?;
     let resp: CountResponse = read_line_json(&mut stream).context("reading worker attached count")?;
     Ok(resp.attached)
+}
+
+/// domed-side: tell a running worker to flush+save its sandbox now and wait for the save
+/// to complete. Backs `dome sandbox save <name>` (domed forwards the request here).
+pub(crate) fn save_via_worker(socket_path: &Path) -> Result<()> {
+    let mut stream = UnixStream::connect(socket_path)
+        .with_context(|| format!("connecting to worker socket {}", socket_path.display()))?;
+    write_line(&mut stream, &WorkerRequest::Save).context("requesting save from worker")?;
+    let resp: SaveResponse = read_line_json(&mut stream).context("reading worker save response")?;
+    if !resp.ok {
+        bail!(
+            "worker failed to save: {}",
+            resp.error.unwrap_or_else(|| "unknown error".to_string())
+        );
+    }
+    Ok(())
 }
 
 /// CLI-side: connect directly to the worker, authorize with the one-time token, and run
@@ -837,6 +960,41 @@ mod tests {
         let back: CountResponse =
             serde_json::from_str(&serde_json::to_string(&resp).unwrap()).unwrap();
         assert_eq!(back.attached, 3);
+    }
+
+    #[test]
+    fn a_save_request_and_response_roundtrip() {
+        let line = serde_json::to_string(&WorkerRequest::Save).unwrap();
+        assert!(line.contains("\"op\":\"save\""), "op tag must be flat: {line}");
+        let back: WorkerRequest = serde_json::from_str(&line).unwrap();
+        assert_eq!(back, WorkerRequest::Save);
+
+        let ok = serde_json::to_string(&SaveResponse { ok: true, error: None }).unwrap();
+        assert!(!ok.contains("error"), "ok save omits error: {ok}");
+        let bad = SaveResponse { ok: false, error: Some("disk full".to_string()) };
+        let back: SaveResponse =
+            serde_json::from_str(&serde_json::to_string(&bad).unwrap()).unwrap();
+        assert_eq!(back, bad);
+    }
+
+    #[test]
+    fn flush_is_due_only_with_dirty_bytes() {
+        let interval = Duration::from_secs(60);
+        let cap = 256 * 1024 * 1024;
+
+        // Nothing dirty → never due, no matter how long it has been.
+        assert!(!flush_is_due(0, Duration::from_secs(3600), interval, cap));
+
+        // Dirty + interval elapsed → due.
+        assert!(flush_is_due(4096, interval, interval, cap));
+        // Dirty but the interval has not elapsed and we are under the cap → not yet.
+        assert!(!flush_is_due(4096, Duration::from_secs(1), interval, cap));
+
+        // Dirty over the cap → due immediately, even early in the interval.
+        assert!(flush_is_due(cap, Duration::from_secs(0), interval, cap));
+        assert!(flush_is_due(cap + 1, Duration::from_secs(1), interval, cap));
+        // Just under the cap, early in the interval → not yet (bounded buffer still OK).
+        assert!(!flush_is_due(cap - 1, Duration::from_secs(1), interval, cap));
     }
 
     #[test]

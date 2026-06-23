@@ -68,6 +68,23 @@ pub enum Command {
         #[serde(default, skip_serializing_if = "Option::is_none")]
         boot: Option<serde_json::Value>,
     },
+    /// Force a durable flush+save of a running sandbox: domed tells the sandbox's worker
+    /// to write+hash its dirty chunks and atomically rewrite the index, so a subsequent
+    /// cold boot reflects the latest in-memory state. Errors if the sandbox is not running
+    /// (an idle sandbox's on-disk index is already its durable state). Backs
+    /// `dome sandbox save <name>`.
+    Save {
+        /// Sandbox name to save.
+        name: String,
+    },
+    /// Worker → domed notification that a save completed (auto-flush interval, dirty-cap
+    /// trigger, explicit save, or graceful stop). domed rebroadcasts it to subscribers as
+    /// a `sandbox.saved` [`Event`]. Internal to the dome binary — the worker is the only
+    /// sender; domed is not in the byte path, so it cannot observe a save otherwise.
+    WorkerSaved {
+        /// Sandbox that was saved.
+        name: String,
+    },
 }
 
 /// domed's reply to a [`Request`] — one JSON object per line. Distinguished from an
@@ -225,12 +242,36 @@ mod tests {
                 name: "api".to_string(),
                 boot: Some(serde_json::json!({ "cpus": 4 })),
             },
+            Command::Save {
+                name: "web".to_string(),
+            },
+            Command::WorkerSaved {
+                name: "web".to_string(),
+            },
         ] {
             let req = Request::new(None, cmd.clone());
             let back: Request = serde_json::from_str(&serde_json::to_string(&req).unwrap()).unwrap();
             assert_eq!(back.command, cmd);
             assert_eq!(back.protocol_version, PROTOCOL_VERSION);
         }
+    }
+
+    /// `save` flattens its `verb` tag and carries the sandbox name at the top level.
+    #[test]
+    fn save_command_roundtrips_with_a_flat_verb_and_name() {
+        let req = Request::new(
+            Some(5),
+            Command::Save {
+                name: "web".to_string(),
+            },
+        );
+        let line = serde_json::to_string(&req).unwrap();
+        assert!(
+            line.contains("\"verb\":\"save\"") && line.contains("\"name\":\"web\""),
+            "save must carry a flat verb tag and name: {line}"
+        );
+        let back: Request = serde_json::from_str(&line).unwrap();
+        assert_eq!(back, req);
     }
 
     /// `id` is omitted from the wire when absent and preserved when present.

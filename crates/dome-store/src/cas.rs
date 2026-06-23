@@ -441,6 +441,19 @@ impl CasBackend {
         Ok(data.len())
     }
 
+    /// Total bytes currently buffered in the in-memory dirty map (not yet flushed to the
+    /// chunk store). The worker's auto-flush policy reads this to bound memory: it
+    /// flushes+saves once this exceeds a cap, so a long write-heavy session cannot grow
+    /// the dirty buffer without bound.
+    pub fn dirty_bytes(&self) -> u64 {
+        self.dirty
+            .read()
+            .unwrap()
+            .values()
+            .map(|d| d.len() as u64)
+            .sum()
+    }
+
     pub fn flush(&self) -> std::io::Result<()> {
         let mut dirty = self.dirty.write().unwrap();
         let mut index = self.index.write().unwrap();
