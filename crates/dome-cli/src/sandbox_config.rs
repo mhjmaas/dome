@@ -130,8 +130,9 @@ impl ResolvedConfig {
     ///
     /// This is the single place the three inputs merge. `base` carries previously-resolved
     /// values (an empty default for `create`/`run`; the stored sidecar for a heal). Scalars
-    /// take the highest set layer; booleans are enabled by any layer (this slice keeps the
-    /// current on-only grammar — `--no-X` lands in a follow-up); lists are merged additively
+    /// take the highest set layer; tri-state booleans take the highest *set* layer
+    /// (`--allow-net`/`--no-allow-net` and the host-writes pair override `dome.json`, which
+    /// overrides the base/default) so a policy can be turned off, not only on; lists are merged additively
     /// (`base ++ dome.json ++ flags`, de-duplicated) so creating a sandbox folds `dome.json`'s
     /// ports/mounts/secrets/allow-list into the sidecar. A malformed `--secret` fails here, so
     /// the error surfaces at `create`/`reload` rather than on a future boot.
@@ -145,11 +146,16 @@ impl ResolvedConfig {
         let memory = flags.memory.or(dome.memory).or(base.memory);
         let disk_size = flags.disk_size.or(dome.disk_size).or(base.disk_size);
 
-        // Booleans (this slice: on-only, matching the current flag grammar).
-        let allow_net = flags.allow_net || dome.allow_net.unwrap_or(false) || base.allow_net;
-        let allow_host_writes = flags.allow_host_writes
-            || dome.allow_host_writes.unwrap_or(false)
-            || base.allow_host_writes;
+        // Tri-state booleans: highest set layer wins (flag > dome.json > base/default), so a
+        // policy can be disabled via `--no-X`, not only enabled. An omitted flag inherits.
+        let allow_net = flags
+            .allow_net_flag()
+            .or(dome.allow_net)
+            .unwrap_or(base.allow_net);
+        let allow_host_writes = flags
+            .allow_host_writes_flag()
+            .or(dome.allow_host_writes)
+            .unwrap_or(base.allow_host_writes);
 
         // Lists: additive merge base ++ dome.json ++ flags (de-duplicated).
         let mut ports = base.ports.clone();
@@ -213,8 +219,9 @@ impl ResolvedConfig {
         })
     }
 
-    /// Apply a `dome sandbox config` edit in place: a set scalar overrides, a bool flag turns
-    /// the policy on (this slice keeps the on-only grammar), and a non-empty list replaces.
+    /// Apply a `dome sandbox config` edit in place: a set scalar overrides, a tri-state bool
+    /// flag turns the policy on (`--allow-net`) or off (`--no-allow-net`) while an omitted one
+    /// leaves it untouched, and a non-empty list replaces.
     /// A malformed `--secret` errors so the edit fails rather than corrupting the sidecar.
     /// The edit takes effect on the next cold boot, never on a running VM.
     pub(crate) fn merge_update(&mut self, vm: &VmArgs) -> Result<()> {
@@ -227,11 +234,11 @@ impl ResolvedConfig {
         if vm.disk_size.is_some() {
             self.disk_size = vm.disk_size;
         }
-        if vm.allow_net {
-            self.allow_net = true;
+        if let Some(v) = vm.allow_net_flag() {
+            self.allow_net = v;
         }
-        if vm.allow_host_writes {
-            self.allow_host_writes = true;
+        if let Some(v) = vm.allow_host_writes_flag() {
+            self.allow_host_writes = v;
         }
         if !vm.port.is_empty() {
             self.ports = vm.port.clone();
@@ -283,11 +290,35 @@ impl ResolvedConfig {
                 ));
             }
         }
-        if requested.allow_net && !self.allow_net {
-            out.push("--allow-net (live: network disabled)".to_string());
+        if let Some(want) = requested.allow_net_flag() {
+            if want != self.allow_net {
+                let flag = if want {
+                    "--allow-net"
+                } else {
+                    "--no-allow-net"
+                };
+                let live = if self.allow_net {
+                    "network enabled"
+                } else {
+                    "network disabled"
+                };
+                out.push(format!("{flag} (live: {live})"));
+            }
         }
-        if requested.allow_host_writes && !self.allow_host_writes {
-            out.push("--allow-host-writes (live: host writes disabled)".to_string());
+        if let Some(want) = requested.allow_host_writes_flag() {
+            if want != self.allow_host_writes {
+                let flag = if want {
+                    "--allow-host-writes"
+                } else {
+                    "--no-allow-host-writes"
+                };
+                let live = if self.allow_host_writes {
+                    "host writes enabled"
+                } else {
+                    "host writes disabled"
+                };
+                out.push(format!("{flag} (live: {live})"));
+            }
         }
         list_conflict(&mut out, "--port", &requested.port, &self.ports);
         list_conflict(&mut out, "--mount", &requested.mount, &self.mounts);
@@ -549,20 +580,75 @@ mod tests {
     }
 
     #[test]
-    fn resolve_booleans_enabled_by_any_layer() {
+    fn resolve_booleans_take_highest_set_layer() {
+        // dome.json enables; an omitted flag inherits it.
         let dome = DomeConfig {
             allow_net: Some(true),
             ..Default::default()
         };
         let r =
             ResolvedConfig::resolve(&ResolvedConfig::default(), &dome, &VmArgs::default()).unwrap();
-        assert!(r.allow_net, "dome.json enables");
+        assert!(r.allow_net, "dome.json enables, flag omitted inherits");
         assert!(!r.allow_host_writes);
 
+        // A flag enables on its own.
         let flags = vm(|v| v.allow_host_writes = true);
         let r = ResolvedConfig::resolve(&ResolvedConfig::default(), &DomeConfig::default(), &flags)
             .unwrap();
         assert!(r.allow_host_writes, "flag enables");
+    }
+
+    #[test]
+    fn resolve_no_flag_disables_a_lower_layer() {
+        // `--no-allow-net` overrides a dome.json that enabled it.
+        let dome = DomeConfig {
+            allow_net: Some(true),
+            ..Default::default()
+        };
+        let flags = vm(|v| v.no_allow_net = true);
+        let r = ResolvedConfig::resolve(&ResolvedConfig::default(), &dome, &flags).unwrap();
+        assert!(!r.allow_net, "--no-allow-net overrides dome.json");
+
+        // `--no-allow-host-writes` overrides a base sidecar that had it enabled.
+        let base = ResolvedConfig {
+            allow_host_writes: true,
+            ..Default::default()
+        };
+        let flags = vm(|v| v.no_allow_host_writes = true);
+        let r = ResolvedConfig::resolve(&base, &DomeConfig::default(), &flags).unwrap();
+        assert!(
+            !r.allow_host_writes,
+            "--no-X turns off a previously-enabled sandbox"
+        );
+    }
+
+    #[test]
+    fn resolve_omitted_flag_inherits_base() {
+        // With no flag and no dome.json opinion, the base/sidecar value carries through.
+        let base = ResolvedConfig {
+            allow_net: true,
+            ..Default::default()
+        };
+        let r = ResolvedConfig::resolve(&base, &DomeConfig::default(), &VmArgs::default()).unwrap();
+        assert!(
+            r.allow_net,
+            "omitted flag + silent dome.json inherits the base"
+        );
+    }
+
+    #[test]
+    fn vm_args_tri_state_flag_helpers() {
+        assert_eq!(
+            VmArgs::default().allow_net_flag(),
+            None,
+            "neither flag → inherit"
+        );
+        assert_eq!(vm(|v| v.allow_net = true).allow_net_flag(), Some(true));
+        assert_eq!(vm(|v| v.no_allow_net = true).allow_net_flag(), Some(false));
+        assert_eq!(
+            vm(|v| v.no_allow_host_writes = true).allow_host_writes_flag(),
+            Some(false)
+        );
     }
 
     #[test]
@@ -782,6 +868,22 @@ mod tests {
             vec!["8080:80".to_string(), "443:443".to_string()]
         );
         assert!(cfg.allow_net);
+    }
+
+    #[test]
+    fn merge_update_can_disable_a_previously_enabled_bool() {
+        let mut cfg = ResolvedConfig {
+            allow_net: true,
+            allow_host_writes: true,
+            ..Default::default()
+        };
+        // `--no-allow-net` turns it off; an omitted host-writes flag is left untouched.
+        cfg.merge_update(&vm(|v| v.no_allow_net = true)).unwrap();
+        assert!(!cfg.allow_net, "--no-allow-net disables via config");
+        assert!(
+            cfg.allow_host_writes,
+            "an omitted flag must not clear the policy"
+        );
     }
 
     #[test]

@@ -34,12 +34,20 @@ pub(crate) struct VmArgs {
     pub initrd: Option<String>,
 
     /// Allow network access
-    #[arg(long)]
+    #[arg(long = "allow-net", conflicts_with = "no_allow_net")]
     pub allow_net: bool,
 
+    /// Disable network access (overrides dome.json / a previously-enabled sandbox)
+    #[arg(long = "no-allow-net")]
+    pub no_allow_net: bool,
+
     /// Allow mounts to write to host filesystem (required for :rw mounts)
-    #[arg(long)]
+    #[arg(long = "allow-host-writes", conflicts_with = "no_allow_host_writes")]
     pub allow_host_writes: bool,
+
+    /// Disable host-filesystem writes (overrides dome.json / a previously-enabled sandbox)
+    #[arg(long = "no-allow-host-writes")]
+    pub no_allow_host_writes: bool,
 
     /// Forward a host port to a guest port (HOST:GUEST, e.g. 8080:80)
     #[arg(short = 'p', long = "port", value_name = "HOST:GUEST")]
@@ -68,6 +76,30 @@ pub(crate) struct VmArgs {
     /// Show verbose output (kernel boot, init messages)
     #[arg(short = 'v', long)]
     pub verbose: bool,
+}
+
+impl VmArgs {
+    /// The network policy the user requested as a tri-state: `Some(true)` from `--allow-net`,
+    /// `Some(false)` from `--no-allow-net`, `None` when neither is passed (inherit the lower
+    /// layer). clap rejects passing both, so at most one of the pair is ever set.
+    pub(crate) fn allow_net_flag(&self) -> Option<bool> {
+        tri_state(self.allow_net, self.no_allow_net)
+    }
+
+    /// The host-writes policy the user requested as a tri-state, mirroring [`allow_net_flag`].
+    pub(crate) fn allow_host_writes_flag(&self) -> Option<bool> {
+        tri_state(self.allow_host_writes, self.no_allow_host_writes)
+    }
+}
+
+/// Collapse a paired on/off flag into a tri-state. `(on, off)` are mutually exclusive at the
+/// CLI layer (clap `conflicts_with`), so `on` winning the tie is just defensive.
+fn tri_state(on: bool, off: bool) -> Option<bool> {
+    match (on, off) {
+        (true, _) => Some(true),
+        (_, true) => Some(false),
+        _ => None,
+    }
 }
 
 #[derive(Parser)]
@@ -299,4 +331,48 @@ pub(crate) enum CheckpointCommands {
         /// Checkpoint name
         name: String,
     },
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// Parse a `dome run` invocation, returning the flattened `VmArgs`.
+    fn parse_run(args: &[&str]) -> Result<VmArgs, clap::Error> {
+        let mut full = vec!["dome", "run"];
+        full.extend_from_slice(args);
+        let cli = Cli::try_parse_from(full)?;
+        match cli.command {
+            Commands::Run { vm, .. } => Ok(vm),
+            _ => unreachable!("parsed a non-run command"),
+        }
+    }
+
+    #[test]
+    fn paired_net_flags_resolve_to_a_tri_state() {
+        assert_eq!(parse_run(&[]).unwrap().allow_net_flag(), None);
+        assert_eq!(
+            parse_run(&["--allow-net"]).unwrap().allow_net_flag(),
+            Some(true)
+        );
+        assert_eq!(
+            parse_run(&["--no-allow-net"]).unwrap().allow_net_flag(),
+            Some(false)
+        );
+        assert_eq!(
+            parse_run(&["--no-allow-host-writes"])
+                .unwrap()
+                .allow_host_writes_flag(),
+            Some(false)
+        );
+    }
+
+    #[test]
+    fn passing_a_flag_and_its_negation_is_an_error() {
+        let err = parse_run(&["--allow-net", "--no-allow-net"]).unwrap_err();
+        assert_eq!(err.kind(), clap::error::ErrorKind::ArgumentConflict);
+
+        let err = parse_run(&["--allow-host-writes", "--no-allow-host-writes"]).unwrap_err();
+        assert_eq!(err.kind(), clap::error::ErrorKind::ArgumentConflict);
+    }
 }

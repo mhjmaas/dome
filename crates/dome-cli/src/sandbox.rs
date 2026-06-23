@@ -78,8 +78,8 @@ fn vm_flags_specified(vm_args: &VmArgs, from: Option<&str>) -> bool {
         || vm_args.cpus.is_some()
         || vm_args.memory.is_some()
         || vm_args.disk_size.is_some()
-        || vm_args.allow_net
-        || vm_args.allow_host_writes
+        || vm_args.allow_net_flag().is_some()
+        || vm_args.allow_host_writes_flag().is_some()
         || !vm_args.port.is_empty()
         || !vm_args.mount.is_empty()
         || !vm_args.secret.is_empty()
