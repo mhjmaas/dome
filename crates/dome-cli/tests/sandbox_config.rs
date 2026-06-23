@@ -457,6 +457,77 @@ fn create_from_a_sandbox_resolves_config_from_dome_json_and_flags_not_the_seed()
     rm_sandbox(&derived);
 }
 
+/// Lazily creating a sandbox via `run --from <seed>` (no explicit `create`) goes through the
+/// worker's first-boot path. That path must apply the same disk_size honesty as `create --from`:
+/// the new sandbox's disk is the clone, so its sidecar must record the cloned disk's real size,
+/// not the dome.json/flags value (the #46 invariant — a sidecar's disk_size always equals the
+/// pinned disk). Regression test for the worker lazy-first-boot `--from` path. Boots a real VM.
+#[test]
+#[ignore]
+fn run_from_lazily_creates_with_a_truthful_cloned_disk_size() {
+    let seed = unique("lazy-from-seed");
+    let derived = unique("lazy-from-derived");
+    let cfg_file = empty_config(&derived);
+    rm_sandbox(&seed);
+    rm_sandbox(&derived);
+
+    // Seed carries a distinctive config and a non-default disk size.
+    let created = Command::new(dome_bin())
+        .args([
+            "sandbox",
+            "create",
+            &seed,
+            "--config",
+            &cfg_file,
+            "--cpus",
+            "8",
+            "--allow-net",
+            "--disk-size",
+            "2048",
+        ])
+        .output()
+        .expect("failed to spawn dome");
+    assert!(
+        created.status.success(),
+        "seed create should succeed; stderr: {}",
+        String::from_utf8_lossy(&created.stderr)
+    );
+
+    // Lazily create `derived` via `run --from` (boots a worker; no explicit create). The disk
+    // is cloned from the seed; the config is resolved from the (empty) dome.json + no flags.
+    let run = Command::new(dome_bin())
+        .args([
+            "sandbox", "run", &derived, "--from", &seed, "--config", &cfg_file, "--", "true",
+        ])
+        .output()
+        .expect("failed to spawn dome");
+    assert!(
+        run.status.success(),
+        "run --from should lazily create and boot; stderr: {}",
+        String::from_utf8_lossy(&run.stderr)
+    );
+    stop_worker(&derived);
+
+    let cfg = std::fs::read_to_string(config_path(&derived)).expect("config sidecar must exist");
+    assert!(
+        cfg.contains("\"disk_size\": 2048"),
+        "the lazily-created sandbox's sidecar must record the cloned disk size (2048), not the \
+         default; got: {cfg}"
+    );
+    assert!(
+        cfg.contains("\"cpus\": null"),
+        "the seed's cpus=8 must NOT be inherited (no flag, empty dome.json → null); got: {cfg}"
+    );
+    assert!(
+        cfg.contains("\"allow_net\": false"),
+        "the seed's allow_net=true must NOT be inherited; got: {cfg}"
+    );
+
+    let _ = std::fs::remove_file(&cfg_file);
+    rm_sandbox(&seed);
+    rm_sandbox(&derived);
+}
+
 /// `create --from` a checkpoint resolves config identically to seeding from a sandbox (#43):
 /// solely from dome.json + flags, with no dependence on the seed (a checkpoint has no config
 /// sidecar at all). Boots a real VM to mint the checkpoint.

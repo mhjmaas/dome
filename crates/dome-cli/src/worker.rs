@@ -571,30 +571,54 @@ fn boot_and_serve(name: &str, data_dir: &str) -> Result<()> {
     // boot) resolves `dome.json` + this invocation's flags and persists the result, so the
     // next boot is reproducible. The resolved config is also recorded as the live config so
     // the CLI can name the live value when warning that flags to a running sandbox are kept.
-    let resolved =
+    let (mut resolved, lazy_first_boot) =
         match sandbox_config::load_or_heal(data_dir, name, boot.vm_args.config.as_deref())? {
-            Some(cfg) => cfg,
+            Some(cfg) => (cfg, false),
             None => {
                 let dome = load_config(boot.vm_args.config.as_deref())?;
                 let cfg =
                     ResolvedConfig::resolve(&ResolvedConfig::default(), &dome, &boot.vm_args)?;
-                if let Err(e) = cfg.save(data_dir, name) {
-                    append_log(
-                        data_dir,
-                        name,
-                        &format!("warning: could not persist sandbox config: {e:#}"),
-                    );
-                }
-                cfg
+                // A lazy first boot is itself a creation, so persist the resolved sidecar — but
+                // only AFTER the CAS source is prepared below, so a `--from` clone's real
+                // (pinned) disk size can be stamped in first (see the `lazy_first_boot` block).
+                (cfg, true)
             }
         };
-    resolved.save_live(data_dir, name);
 
     // Resolve (creating/seeding/pinning) the CAS source, then prepare and boot the VM. The
     // CAS source resolution still needs the session/env flags (kernel/rootfs/disk-size) the
     // attaching invocation carried; the VM shape itself comes from the resolved sidecar.
     let source =
         sandbox::prepare_sandbox_source(name, data_dir, &boot.vm_args, boot.from.as_deref())?;
+
+    if lazy_first_boot {
+        // disk_size follows the disk, not dome.json/flags: a `--from` clone's disk is fixed by
+        // the seed, so stamp the materialized index's real size into the sidecar so it stays
+        // truthful (the #46 invariant: a sidecar's disk_size always equals the pinned disk,
+        // so a cold boot never has to ignore-and-warn a mismatched value). This mirrors
+        // `create_sandbox`'s `--from` handling for the lazy `shell`/`run --from` create path.
+        // A fresh, non-seeded first boot has no index yet — its disk is created at the resolved
+        // size during boot — so the resolved value is already correct and left untouched.
+        if std::path::Path::new(&source.index_path).exists() {
+            match dome_store::ChunkIndex::load(&source.index_path) {
+                Ok(idx) => resolved.disk_size = Some(idx.disk_size() / (1024 * 1024)),
+                Err(e) => append_log(
+                    data_dir,
+                    name,
+                    &format!("warning: could not read sandbox disk size to pin sidecar: {e:#}"),
+                ),
+            }
+        }
+        if let Err(e) = resolved.save(data_dir, name) {
+            append_log(
+                data_dir,
+                name,
+                &format!("warning: could not persist sandbox config: {e:#}"),
+            );
+        }
+    }
+    resolved.save_live(data_dir, name);
+
     let prepared = vm::prepare_vm(&resolved, &boot.vm_args, None, Some(&source))?;
     let instance_dir = prepared.instance_dir.clone();
 
