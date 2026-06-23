@@ -231,9 +231,9 @@ impl ResolvedConfig {
         if vm.memory.is_some() {
             self.memory = vm.memory;
         }
-        if vm.disk_size.is_some() {
-            self.disk_size = vm.disk_size;
-        }
+        // disk_size is intentionally NOT applied here: it is create-only (the disk is
+        // physically pinned), so the sidecar's value is never mutated after creation. The
+        // CLI hard-errors on `--disk-size` for an existing sandbox before reaching this point.
         if let Some(v) = vm.allow_net_flag() {
             self.allow_net = v;
         }
@@ -282,14 +282,8 @@ impl ResolvedConfig {
                 out.push(format!("--memory {m} (live: {})", show_opt(self.memory)));
             }
         }
-        if let Some(d) = requested.disk_size {
-            if Some(d) != self.disk_size {
-                out.push(format!(
-                    "--disk-size {d} (live: {})",
-                    show_opt(self.disk_size)
-                ));
-            }
-        }
+        // disk_size is create-only and hard-errors on an existing sandbox, so it can never be
+        // a pending next-boot change — it is intentionally not reported here.
         if let Some(want) = requested.allow_net_flag() {
             if want != self.allow_net {
                 let flag = if want {
