@@ -28,7 +28,7 @@ use std::os::fd::AsRawFd;
 use std::os::unix::fs::PermissionsExt;
 use std::os::unix::net::{UnixListener, UnixStream};
 use std::path::{Path, PathBuf};
-use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
@@ -94,6 +94,45 @@ fn err_path(data_dir: &str, name: &str) -> PathBuf {
 /// A worker's on-disk log: `{workers}/{name}.log`.
 fn log_path(data_dir: &str, name: &str) -> PathBuf {
     workers_dir(data_dir).join(format!("{name}.log"))
+}
+
+/// Where domed records that a worker died unexpectedly (a crash): `{workers}/{name}.failed`.
+/// Its presence (with no live worker) is what surfaces a sandbox as `failed` in `ls`, and
+/// it holds the worker's last log lines so the crash is diagnosable after the fact. Cleared
+/// when the sandbox is next cold-booted (a fresh boot supersedes the failure).
+pub(crate) fn failed_marker_path(data_dir: &str, name: &str) -> PathBuf {
+    workers_dir(data_dir).join(format!("{name}.failed"))
+}
+
+/// domed-side: record an unexpected worker exit (a crash), stashing the last log lines so
+/// they remain retrievable after the worker process is gone. Best-effort.
+pub(crate) fn write_failed_marker(data_dir: &str, name: &str, log_tail: &str) {
+    let dir = workers_dir(data_dir);
+    let _ = std::fs::create_dir_all(&dir);
+    let _ = std::fs::write(failed_marker_path(data_dir, name), log_tail);
+}
+
+/// domed-side: whether a sandbox is in the failed (crashed) state — a marker exists from a
+/// prior unexpected worker exit and has not yet been superseded by a fresh boot.
+pub(crate) fn is_failed(data_dir: &str, name: &str) -> bool {
+    failed_marker_path(data_dir, name).exists()
+}
+
+/// domed-side: clear a sandbox's failed marker (a fresh cold boot supersedes the crash).
+pub(crate) fn clear_failed_marker(data_dir: &str, name: &str) {
+    let _ = std::fs::remove_file(failed_marker_path(data_dir, name));
+}
+
+/// domed-side: read the last `n` lines of a worker's log (best-effort; empty if no log).
+/// Used to surface what a crashed worker last did, both in the `sandbox.crashed` event and
+/// in the persisted failed marker.
+pub(crate) fn read_last_log_lines(data_dir: &str, name: &str, n: usize) -> String {
+    let Ok(contents) = std::fs::read_to_string(log_path(data_dir, name)) else {
+        return String::new();
+    };
+    let lines: Vec<&str> = contents.lines().collect();
+    let start = lines.len().saturating_sub(n);
+    lines[start..].join("\n")
 }
 
 // ---------------------------------------------------------------------------
@@ -195,8 +234,16 @@ enum WorkerRequest {
     /// Force a durable flush+save of the sandbox right now (drives `dome sandbox save`).
     /// The worker flushes its dirty chunks and atomically rewrites the index.
     Save,
-    /// Stop the worker: save the sandbox and shut the VM down.
-    Stop,
+    /// Stop the worker: save the sandbox and shut the VM down. The worker is the sole
+    /// decider of the attached-terminal guard (it owns the count): unless `force` is set, a
+    /// stop is REFUSED while terminals are attached. The check-and-commit is atomic with
+    /// `attach` (both go through [`SessionState`]), so once a stop commits no new session
+    /// can start — there is no check-then-act window.
+    Stop {
+        /// Detach attached terminals and stop anyway (default: refuse if any are attached).
+        #[serde(default)]
+        force: bool,
+    },
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
@@ -214,6 +261,16 @@ struct SaveResponse {
     ok: bool,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     error: Option<String>,
+}
+
+/// The worker's verdict on a [`WorkerRequest::Stop`]. `ok` means the worker committed to
+/// stopping (or was already stopping); otherwise `attached` carries the live count that
+/// caused the refusal, so domed can name it to the user.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+struct StopResponse {
+    ok: bool,
+    #[serde(default)]
+    attached: usize,
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
@@ -304,8 +361,61 @@ struct Worker {
     /// file is keyed only by pid, so two in-flight saves in one worker would collide).
     save_lock: Mutex<()>,
     tokens: Mutex<TokenStore>,
-    attached: AtomicUsize,
+    /// The attached-session count + a `stopping` flag, behind one lock. The lock makes the
+    /// stop guard atomic with session start: `attach` checks `stopping` and bumps the count
+    /// under it, and `stop` reads the count and commits `stopping` under it, so a stop and a
+    /// new attach can never interleave to slip a session past a committed stop.
+    sessions: Mutex<SessionState>,
     shutdown: AtomicBool,
+}
+
+/// The worker's session lifecycle state (see [`Worker::sessions`]). The attached-terminal
+/// guard lives here, under one lock, so the check + commit are atomic with session start —
+/// there is no check-then-act window between counting and stopping.
+struct SessionState {
+    /// Number of terminals currently spliced to the guest.
+    attached: usize,
+    /// Set once a stop has committed: no new session may start, so the worker drains to a
+    /// quiescent state and shuts down.
+    stopping: bool,
+}
+
+impl SessionState {
+    fn new() -> Self {
+        Self {
+            attached: 0,
+            stopping: false,
+        }
+    }
+
+    /// Try to start a session. Returns false if a stop has committed (the caller refuses
+    /// the attach), else bumps the count and returns true.
+    fn begin(&mut self) -> bool {
+        if self.stopping {
+            return false;
+        }
+        self.attached += 1;
+        true
+    }
+
+    /// End a session started by [`SessionState::begin`].
+    fn end(&mut self) {
+        self.attached = self.attached.saturating_sub(1);
+    }
+
+    /// Decide a stop. `Ok(())` (committing `stopping`) when idle, forced, or already
+    /// stopping; `Err(attached)` (leaving the worker running) when terminals are attached
+    /// and `force` is not set.
+    fn commit_stop(&mut self, force: bool) -> std::result::Result<(), usize> {
+        if self.stopping {
+            return Ok(());
+        }
+        if !force && self.attached > 0 {
+            return Err(self.attached);
+        }
+        self.stopping = true;
+        Ok(())
+    }
 }
 
 impl Worker {
@@ -322,6 +432,30 @@ impl Worker {
     /// Bytes currently buffered in the in-memory dirty map (0 in flat-file mode).
     fn dirty_bytes(&self) -> u64 {
         self.cas.as_ref().map(|c| c.dirty_bytes()).unwrap_or(0)
+    }
+
+    /// Number of terminals currently attached (drives the `ATTACHED` column in `ls`).
+    fn attached_count(&self) -> usize {
+        self.sessions.lock().unwrap().attached
+    }
+
+    /// Try to start a session (see [`SessionState::begin`]): false if the worker is
+    /// stopping, so a late attach is refused cleanly rather than racing the teardown.
+    fn begin_session(&self) -> bool {
+        self.sessions.lock().unwrap().begin()
+    }
+
+    /// End a session started by [`Worker::begin_session`].
+    fn end_session(&self) {
+        self.sessions.lock().unwrap().end();
+    }
+
+    /// Decide + commit a stop (see [`SessionState::commit_stop`]). `Err(attached)` when
+    /// terminals are attached and `force` is not set; `Ok(())` (with `stopping` committed)
+    /// otherwise. Atomic with [`Worker::begin_session`] — once this returns `Ok`, no new
+    /// session can start.
+    fn commit_stop(&self, force: bool) -> std::result::Result<(), usize> {
+        self.sessions.lock().unwrap().commit_stop(force)
     }
 
     /// Force a durable flush+save: write+hash the dirty chunks and atomically rewrite the
@@ -429,7 +563,7 @@ fn boot_and_serve(name: &str, data_dir: &str) -> Result<()> {
         index_path,
         save_lock: Mutex::new(()),
         tokens: Mutex::new(TokenStore::new()),
-        attached: AtomicUsize::new(0),
+        sessions: Mutex::new(SessionState::new()),
         shutdown: AtomicBool::new(false),
     });
 
@@ -552,7 +686,7 @@ fn handle_conn(worker: &Arc<Worker>, mut stream: UnixStream) {
             let _ = write_line(&mut stream, &MintResponse { token });
         }
         WorkerRequest::Count => {
-            let attached = worker.attached.load(Ordering::SeqCst);
+            let attached = worker.attached_count();
             let _ = write_line(&mut stream, &CountResponse { attached });
         }
         WorkerRequest::Save => {
@@ -565,9 +699,20 @@ fn handle_conn(worker: &Arc<Worker>, mut stream: UnixStream) {
             };
             let _ = write_line(&mut stream, &resp);
         }
-        WorkerRequest::Stop => {
-            worker.shutdown.store(true, Ordering::SeqCst);
-            let _ = write_line(&mut stream, &AttachAck { ok: true, error: None });
+        WorkerRequest::Stop { force } => {
+            // The worker is the sole decider of the attached guard, atomically with attach.
+            match worker.commit_stop(force) {
+                Ok(()) => {
+                    worker.shutdown.store(true, Ordering::SeqCst);
+                    let _ = write_line(&mut stream, &StopResponse { ok: true, attached: 0 });
+                }
+                Err(attached) => {
+                    worker.log(&format!(
+                        "stop refused: {attached} attached terminal(s) (use --force)"
+                    ));
+                    let _ = write_line(&mut stream, &StopResponse { ok: false, attached });
+                }
+            }
         }
         WorkerRequest::Attach {
             token,
@@ -595,6 +740,15 @@ fn handle_attach(
         return;
     }
 
+    // Claim a session slot. This is atomic with a stop's commit, so a session can never
+    // start once a stop has committed — closing the check-then-act window the old
+    // count-then-stop had. Reserve BEFORE opening the guest session (and before the count is
+    // observable), so a concurrent non-forced stop sees this attach.
+    if !worker.begin_session() {
+        let _ = write_line(&mut stream, &AttachAck { ok: false, error: Some("sandbox is stopping".to_string()) });
+        return;
+    }
+
     // Open the guest session (mounts + ExecRequest sent on the vsock side here, so the
     // client's relay only deals with terminal frames).
     let guest = if tty {
@@ -606,6 +760,7 @@ fn handle_attach(
         Ok(g) => g,
         Err(e) => {
             worker.log(&format!("attach: opening session failed: {e:#}"));
+            worker.end_session();
             let _ = write_line(&mut stream, &AttachAck { ok: false, error: Some(format!("{e:#}")) });
             return;
         }
@@ -615,13 +770,13 @@ fn handle_attach(
     // enters raw mode. The ack read is unbuffered on the client side, so no guest output
     // is lost between the ack and the relay starting.
     if write_line(&mut stream, &AttachAck { ok: true, error: None }).is_err() {
+        worker.end_session();
         return;
     }
 
-    worker.attached.fetch_add(1, Ordering::SeqCst);
     worker.log("session attached");
     splice(stream, guest);
-    worker.attached.fetch_sub(1, Ordering::SeqCst);
+    worker.end_session();
     worker.log("session detached (VM stays running)");
 }
 
@@ -689,6 +844,40 @@ pub(crate) fn save_via_worker(socket_path: &Path) -> Result<()> {
         );
     }
     Ok(())
+}
+
+/// The result of a [`stop_via_worker`] request — the worker's verdict on the attached
+/// guard. The worker (not domed) decides: it owns the count and commits the stop atomically
+/// with session start.
+pub(crate) enum StopOutcome {
+    /// The worker committed to stopping and is draining (save + VM teardown).
+    Stopped,
+    /// The stop was refused because terminals are attached and `force` was not set; carries
+    /// the live attached count so domed can name it to the user.
+    Refused { attached: usize },
+}
+
+/// domed-side: ask a running worker to stop — flush+save its sandbox and tear the VM down.
+/// The worker is the sole decider of the attached-terminal guard (it owns the count and
+/// commits the stop atomically with session start), so domed forwards `force` and relays
+/// the verdict: on [`StopOutcome::Stopped`] the worker drains (breaks its accept loop,
+/// joins the flusher, saves, stops the VM — which closes in-flight guest sessions so
+/// attached clients detach — and removes its socket), and the caller polls for the socket
+/// to disappear to confirm durability; on [`StopOutcome::Refused`] the worker keeps
+/// running. Backs `dome sandbox stop [--force]`.
+pub(crate) fn stop_via_worker(socket_path: &Path, force: bool) -> Result<StopOutcome> {
+    let mut stream = UnixStream::connect(socket_path)
+        .with_context(|| format!("connecting to worker socket {}", socket_path.display()))?;
+    write_line(&mut stream, &WorkerRequest::Stop { force })
+        .context("requesting stop from worker")?;
+    let resp: StopResponse = read_line_json(&mut stream).context("reading worker stop response")?;
+    if resp.ok {
+        Ok(StopOutcome::Stopped)
+    } else {
+        Ok(StopOutcome::Refused {
+            attached: resp.attached,
+        })
+    }
 }
 
 /// CLI-side: connect directly to the worker, authorize with the one-time token, and run
@@ -879,7 +1068,8 @@ mod tests {
         for req in [
             WorkerRequest::Mint,
             WorkerRequest::Count,
-            WorkerRequest::Stop,
+            WorkerRequest::Stop { force: false },
+            WorkerRequest::Stop { force: true },
             WorkerRequest::Attach {
                 token: "t".to_string(),
                 tty: false,
@@ -995,6 +1185,82 @@ mod tests {
         assert!(flush_is_due(cap + 1, Duration::from_secs(1), interval, cap));
         // Just under the cap, early in the interval → not yet (bounded buffer still OK).
         assert!(!flush_is_due(cap - 1, Duration::from_secs(1), interval, cap));
+    }
+
+    #[test]
+    fn a_stop_request_roundtrips_with_a_flat_op_tag_and_defaulted_force() {
+        let line = serde_json::to_string(&WorkerRequest::Stop { force: true }).unwrap();
+        assert!(line.contains("\"op\":\"stop\""), "op tag must be flat: {line}");
+        let back: WorkerRequest = serde_json::from_str(&line).unwrap();
+        assert_eq!(back, WorkerRequest::Stop { force: true });
+        // A stop line omitting `force` defaults to false.
+        let back: WorkerRequest = serde_json::from_str(r#"{"op":"stop"}"#).unwrap();
+        assert_eq!(back, WorkerRequest::Stop { force: false });
+    }
+
+    #[test]
+    fn a_stop_response_carries_the_count_only_on_refusal() {
+        let refused = StopResponse { ok: false, attached: 3 };
+        let back: StopResponse =
+            serde_json::from_str(&serde_json::to_string(&refused).unwrap()).unwrap();
+        assert_eq!(back, refused);
+        // An accepted stop round-trips with a zero count.
+        let ok: StopResponse =
+            serde_json::from_str(&serde_json::to_string(&StopResponse { ok: true, attached: 0 }).unwrap())
+                .unwrap();
+        assert!(ok.ok);
+    }
+
+    #[test]
+    fn the_stop_guard_is_atomic_with_session_start() {
+        let mut s = SessionState::new();
+
+        // Idle → a stop commits immediately, and then blocks any new session.
+        let mut idle = SessionState::new();
+        assert_eq!(idle.commit_stop(false), Ok(()));
+        assert!(!idle.begin(), "no session may start once a stop has committed");
+
+        // Attached + not forced → refused, naming the count, and the worker stays runnable.
+        assert!(s.begin() && s.begin(), "two sessions start");
+        assert_eq!(s.commit_stop(false), Err(2), "refusal carries the live count");
+        assert!(s.begin(), "a refused stop leaves the worker accepting sessions");
+
+        // Forced → commits regardless of the attached count; commit is idempotent.
+        assert_eq!(s.commit_stop(true), Ok(()));
+        assert_eq!(s.commit_stop(false), Ok(()), "commit_stop is idempotent");
+        assert!(!s.begin(), "no new session after a forced stop commits");
+
+        // end() never underflows.
+        let mut z = SessionState::new();
+        z.end();
+        assert_eq!(z.attached, 0);
+    }
+
+    #[test]
+    fn failed_marker_and_last_log_lines_roundtrip() {
+        // A crash marker records the worker's last log lines, is observable via is_failed,
+        // surfaces them via read_last_log_lines, and is cleared by a fresh boot.
+        let tmp = tempfile::tempdir().unwrap();
+        let data_dir = tmp.path().to_str().unwrap();
+        assert!(!is_failed(data_dir, "web"), "no marker initially");
+
+        write_failed_marker(data_dir, "web", "line A\nline B");
+        assert!(is_failed(data_dir, "web"), "marker present after a crash");
+
+        clear_failed_marker(data_dir, "web");
+        assert!(!is_failed(data_dir, "web"), "marker cleared on a fresh boot");
+
+        // read_last_log_lines returns the tail of the worker log (and empty when absent).
+        assert_eq!(read_last_log_lines(data_dir, "web", 5), "");
+        let dir = workers_dir(data_dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(dir.join("web.log"), "l1\nl2\nl3\nl4\n").unwrap();
+        assert_eq!(read_last_log_lines(data_dir, "web", 2), "l3\nl4");
+        assert_eq!(
+            read_last_log_lines(data_dir, "web", 99),
+            "l1\nl2\nl3\nl4",
+            "asking for more lines than exist returns them all"
+        );
     }
 
     #[test]

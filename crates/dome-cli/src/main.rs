@@ -166,6 +166,13 @@ fn main() -> Result<()> {
             SandboxCommands::Save { name, config } => {
                 sandbox::save_sandbox(name, config.as_deref())?;
             }
+            SandboxCommands::Stop {
+                name,
+                force,
+                config,
+            } => {
+                sandbox::stop_sandbox(name, force, config.as_deref())?;
+            }
             SandboxCommands::Ls => sandbox::list_sandboxes()?,
             SandboxCommands::Rm { name, config } => {
                 sandbox::remove_sandbox(name, config.as_deref())?;
