@@ -150,11 +150,62 @@ fn no_flag_disables_a_previously_enabled_policy_in_the_sidecar() {
     rm_sandbox(&name);
 }
 
-/// A cold boot uses the persisted config (cpus/memory), not the attaching invocation's
-/// flags: a sandbox created with 2 cpus boots with 2 even when `run` passes `--cpus 1`.
+/// Flags always win even while a VM is running (#45): a config flag passed to `run` on a
+/// running sandbox is persisted to the sidecar and the user is told it applies on the next
+/// boot (the live VM keeps its current config until stopped).
 #[test]
 #[ignore]
-fn cold_boot_uses_persisted_config_not_invocation_flags() {
+fn flag_on_a_running_sandbox_persists_and_reports_next_boot() {
+    let name = unique("cfg-running");
+    rm_sandbox(&name);
+
+    // Create with a distinctive cpu count, then keep a session (and thus the VM) alive.
+    let created = Command::new(dome_bin())
+        .args(["sandbox", "create", &name, "--cpus", "2"])
+        .output()
+        .expect("failed to spawn dome");
+    assert!(created.status.success());
+
+    let mut owner = Command::new(dome_bin())
+        .args(["sandbox", "run", &name, "--", "sh", "-c", "sleep 25"])
+        .spawn()
+        .expect("failed to spawn owner session");
+    std::thread::sleep(std::time::Duration::from_secs(8));
+
+    // Change --cpus while the VM is running: it must persist and report a next-boot change.
+    let out = Command::new(dome_bin())
+        .args(["sandbox", "run", &name, "--cpus", "1", "--", "true"])
+        .output()
+        .expect("failed to spawn dome");
+    assert!(
+        out.status.success(),
+        "run on a running sandbox should attach and succeed; stderr: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert!(
+        stderr.contains("next cold boot") && stderr.contains("--cpus 1"),
+        "a flag while running must report it applies on the next boot, naming the change; \
+         stderr: {stderr}"
+    );
+
+    // The sidecar is updated immediately even though the running VM keeps cpus=2 until stopped.
+    let cfg = std::fs::read_to_string(config_path(&name)).expect("config sidecar must exist");
+    assert!(
+        cfg.contains("\"cpus\": 1"),
+        "a flag while running must update the sidecar to cpus=1; got: {cfg}"
+    );
+
+    let _ = owner.wait();
+    rm_sandbox(&name);
+}
+
+/// Flags always win on an existing sandbox (#45): a config flag passed to `run` resolves
+/// into and updates the sidecar before the cold boot, so a sandbox created with 2 cpus boots
+/// with 1 when `run` passes `--cpus 1`, and the sidecar is updated to match.
+#[test]
+#[ignore]
+fn cold_boot_applies_invocation_flags_and_updates_sidecar() {
     let name = unique("cfg-coldboot");
     rm_sandbox(&name);
 
@@ -166,8 +217,8 @@ fn cold_boot_uses_persisted_config_not_invocation_flags() {
     assert!(created.status.success());
     assert!(Path::new(&sandbox_index(&name)).exists());
 
-    // Cold-boot via `run`, deliberately passing a different --cpus that must be ignored.
-    // The guest reports its online CPU count; it should reflect the persisted 2, not 1.
+    // Cold-boot via `run`, passing a different --cpus that must win and update the sidecar.
+    // The guest reports its online CPU count; it should reflect the requested 1, not 2.
     let out = Command::new(dome_bin())
         .args([
             "sandbox", "run", &name, "--cpus", "1", "--", "sh", "-c", "nproc",
@@ -176,8 +227,15 @@ fn cold_boot_uses_persisted_config_not_invocation_flags() {
         .expect("failed to spawn dome");
     let stdout = String::from_utf8_lossy(&out.stdout);
     assert!(
-        stdout.trim().contains('2'),
-        "cold boot must use the persisted cpus=2, not the invocation --cpus 1; nproc: {stdout}"
+        stdout.trim().contains('1'),
+        "flags win on an existing sandbox: cold boot must use the requested cpus=1; nproc: {stdout}"
+    );
+
+    // The flag also resolved into the sidecar, so it is now the persisted truth.
+    let cfg = std::fs::read_to_string(config_path(&name)).expect("config sidecar must exist");
+    assert!(
+        cfg.contains("\"cpus\": 1"),
+        "a flag passed to run must update the sidecar to cpus=1; got: {cfg}"
     );
 
     rm_sandbox(&name);

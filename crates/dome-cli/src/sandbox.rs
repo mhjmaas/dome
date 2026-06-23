@@ -58,24 +58,59 @@ pub(crate) fn run_sandbox(
     // The boot spec is consumed by the worker only on a cold boot; it captures exactly
     // what this invocation would have booted (resolved name, seed, cwd, and VM flags).
     let boot = worker::BootSpec::new(&name, from, &cwd, vm_args)?;
+
+    // Flags always win: any config flag passed to an *existing* sandbox resolves into and
+    // updates its sidecar before we attach, so a cold boot reproduces from the new values.
+    // A brand-new sandbox (no index yet) has its sidecar written by the worker's first-boot
+    // resolve instead, so we only update an already-existing one here. `--from` is a
+    // creation-only seed, never a config edit, so it does not by itself trigger an update.
+    let index_path = format!("{}/sandboxes/{}.idx", data_dir, name);
+    let updated_existing = if Path::new(&index_path).exists() && vm_flags_specified(vm_args) {
+        // Load (healing a legacy unversioned sidecar in place); merge the flags in and
+        // persist. A sandbox with NO sidecar yet (legacy, pre-persistence) returns None:
+        // don't pre-empt it with a dome.json-less sidecar that would drop ports/secrets —
+        // the worker's first-boot resolve folds in dome.json + these flags instead.
+        match sandbox_config::load_or_heal(&data_dir, &name, vm_args.config.as_deref())? {
+            Some(mut config) => {
+                config.merge_update(vm_args)?;
+                config.save(&data_dir, &name)?;
+                true
+            }
+            None => false,
+        }
+    } else {
+        false
+    };
+
     let attach = crate::daemon::attach_via_daemon(&data_dir, &name, boot.to_value()?)?;
 
-    // Config flags only take effect on a cold boot; warn (don't silently mislead) when
-    // they were passed but the VM was already running and kept its original config. When
-    // the live config is readable, name the specific conflicting live values; otherwise
-    // fall back to a generic notice.
-    if !attach.cold_booted && vm_flags_specified(vm_args, from) {
-        warn_ignored_flags(&data_dir, &name, vm_args, from);
+    // A running VM keeps its current config until stopped: the update is already persisted
+    // to the sidecar and takes effect on the next cold boot. Name the values that differ
+    // from the live config so the user sees exactly what changed and what is still in force.
+    if updated_existing && !attach.cold_booted {
+        report_next_boot_changes(&data_dir, &name, vm_args);
+    }
+
+    // `--from` only ever seeds a brand-new sandbox; it can never re-seed one that is already
+    // running. Say so rather than silently dropping it (config flags, unlike `--from`, were
+    // persisted above and reported by `report_next_boot_changes`).
+    if from.is_some() && !attach.cold_booted {
+        eprintln!(
+            "dome: sandbox '{}' is already running — --from is ignored (it only seeds a \
+             brand-new sandbox; the live VM was not re-seeded).",
+            name
+        );
     }
 
     worker::attach_and_relay(&attach, &command, tty)
 }
 
-/// Whether the user passed any boot-affecting flag, used to decide if attaching to an
-/// already-running VM should warn that those flags are being ignored.
-fn vm_flags_specified(vm_args: &VmArgs, from: Option<&str>) -> bool {
-    from.is_some()
-        || vm_args.cpus.is_some()
+/// Whether the user passed any config-affecting flag. Used to decide whether to resolve the
+/// flags into an existing sandbox's sidecar (and, when the VM is already running, to report
+/// that the change applies on the next boot). `--from` is excluded — it is a creation-only
+/// seed, not a config edit.
+fn vm_flags_specified(vm_args: &VmArgs) -> bool {
+    vm_args.cpus.is_some()
         || vm_args.memory.is_some()
         || vm_args.disk_size.is_some()
         || vm_args.allow_net_flag().is_some()
@@ -87,34 +122,22 @@ fn vm_flags_specified(vm_args: &VmArgs, from: Option<&str>) -> bool {
         || !vm_args.expose_host.is_empty()
 }
 
-/// Warn that boot flags passed to an already-running sandbox are ignored. When the worker's
-/// live config is readable, name the specific conflicting live values (e.g. `--cpus 8 (live:
-/// 2)`) so the user sees exactly what was kept; otherwise emit a generic notice. `--from` is
-/// always a creation-time-only seed, so it is called out separately when present.
-fn warn_ignored_flags(data_dir: &str, name: &str, vm_args: &VmArgs, from: Option<&str>) {
+/// Report that a config update to an already-running sandbox has been persisted to the
+/// sidecar and applies on the next cold boot (the running VM keeps its current config until
+/// stopped). When the worker's live config is readable, name the values that differ (e.g.
+/// `--cpus 8 (live: 2)`) so the user sees exactly what changed and what is still in force.
+fn report_next_boot_changes(data_dir: &str, name: &str, vm_args: &VmArgs) {
     let conflicts = ResolvedConfig::load_live(data_dir, name)
         .map(|live| live.conflicts(vm_args))
         .unwrap_or_default();
 
-    if conflicts.is_empty() && from.is_none() {
-        eprintln!(
-            "dome: sandbox '{}' is already running — its existing config is kept; the \
-             flags passed here are ignored. Stop it first to boot with new settings.",
-            name
-        );
-        return;
-    }
-
     eprintln!(
-        "dome: sandbox '{}' is already running — these flags are ignored (its live config \
-         is kept; stop it first, or use `dome sandbox config {}`, to change it):",
-        name, name
+        "dome: sandbox '{}' is running — its config was updated and applies on the next cold \
+         boot; the running VM keeps its current config until stopped.",
+        name
     );
     for line in &conflicts {
         eprintln!("  {line}");
-    }
-    if from.is_some() {
-        eprintln!("  --from (only seeds a brand-new sandbox; never re-seeds a running one)");
     }
 }
 
@@ -400,7 +423,7 @@ pub(crate) fn config_sandbox(name_arg: Option<String>, vm_args: &VmArgs) -> Resu
         .unwrap_or_default();
 
     // No boot-affecting flags ⇒ a read-only view; otherwise merge the edit.
-    if !vm_flags_specified(vm_args, None) {
+    if !vm_flags_specified(vm_args) {
         print_sandbox_config(&name, &config);
         return Ok(());
     }
