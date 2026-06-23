@@ -149,7 +149,7 @@ Secrets can also be set in `dome.json` (see [Config file](#config-file)).
 
 ### Config file
 
-Dome loads `dome.json` from the current directory (or `--config PATH`). All fields are optional; CLI flags take precedence.
+Dome loads `dome.json` from the current directory (or `--config PATH`). All fields are optional.
 
 ```json
 {
@@ -173,6 +173,43 @@ Dome loads `dome.json` from the current directory (or `--config PATH`). All fiel
 ```
 
 The `network.allow` list restricts which hosts the guest can reach. Omit it to allow all hosts.
+
+#### One resolution rule
+
+Every config field follows the same rule:
+
+- **`--X` sets** the value (a scalar/boolean sets it; a list flag like `--port` **replaces** the lower layer — it is not additive).
+- **`--no-X` clears or disables** it (`--no-allow-net`, `--no-allow-host-writes`, `--no-port`, `--no-mount`, `--no-secret`, `--no-allow-host`, `--no-expose-host`).
+- **Omit the flag to inherit** the lower layer.
+- **`dome.json` only fills the fields you didn't set on the command line** — it never overrides a flag, and for a persistent sandbox that fill-in happens **once, at creation**.
+
+So the precedence is always **flag > `dome.json` > built-in default**, with the highest *set* layer winning.
+
+#### Ephemeral runs vs. persistent sandboxes
+
+- **`dome run` is ephemeral.** It resolves config from `dome.json` + flags on every invocation, boots a fresh disk clone, and discards everything on exit. There is no persisted config to drift from.
+- **`dome sandbox …` is persistent.** A sandbox resolves its config **once, at creation**, and stores it in a sidecar that is the single source of truth for every subsequent boot. After creation, **editing `dome.json` and restarting does *not* change an existing sandbox** — the sidecar is authoritative. To change a persistent sandbox's config:
+  - Pass flags to `dome sandbox run`/`shell`/`config` — **flags always win** and update the sidecar (applied on the next cold boot; a running VM keeps its current config until stopped).
+  - Run `dome sandbox config --reload <name>` to re-apply the current `dome.json` (plus any flags) to the sandbox. This is the only supported way to pick up `dome.json` edits without recreating.
+
+```sh
+# Disable a previously-enabled policy on an existing sandbox
+dome sandbox config myenv --no-allow-net
+
+# Replace the port list (not additive); clear it entirely
+dome sandbox config myenv --port 9090:80
+dome sandbox config myenv --no-port
+
+# Re-apply an edited dome.json to an existing sandbox
+dome sandbox config --reload myenv
+
+# View the full effective resolved config (resources, secrets by name, allow-list, exposed ports)
+dome sandbox config myenv
+```
+
+#### `disk_size` is create-only
+
+`--disk-size` (and the `dome.json` `disk_size` field) is honored **only when a sandbox is created**. Passing `--disk-size` to an existing sandbox — via `run`, `shell`, or `config` — is a hard error, and `--reload` ignores any `disk_size` in `dome.json` (the disk stays pinned). To change a sandbox's disk size, recreate it: `dome sandbox rm <name>` then `dome sandbox create <name> --disk-size <MB>`.
 
 ## SDK
 

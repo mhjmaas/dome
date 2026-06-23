@@ -176,7 +176,7 @@ Place `dome.json` in the project root to avoid repeating flags:
 }
 ```
 
-CLI flags override config values. When `secrets` are configured, the guest receives placeholder tokens and the proxy substitutes real values on HTTPS requests to allowed hosts. See [references/config.md](references/config.md) for all fields.
+One rule resolves every field: `--X` sets it, `--no-X` clears/disables it, omit to inherit — so flags win, then `dome.json`, then the default. For an ephemeral `dome run` this is re-resolved every invocation. A persistent `dome sandbox` resolves config **once at creation** and stores it; editing `dome.json` afterwards does not affect an existing sandbox — pass flags (they always win) or run `dome sandbox config --reload <name>` to re-apply it. When `secrets` are configured, the guest receives placeholder tokens and the proxy substitutes real values on HTTPS requests to allowed hosts. See [references/config.md](references/config.md) for all fields.
 
 ## Important Constraints
 
