@@ -409,6 +409,19 @@ pub(crate) fn config_sandbox(name_arg: Option<String>, vm_args: &VmArgs) -> Resu
          running VM keeps its current config until stopped.",
         name
     );
+    // Disk size is pinned to the materialized index at creation: the cold-boot guardrail
+    // (`vm::prepare_vm`) always re-pins an existing sandbox to its index's chunk count and
+    // prints an "ignoring --disk-size" notice. So unlike the other fields, a `--disk-size`
+    // edit here never takes effect — say so explicitly rather than letting the generic
+    // "applies on the next cold boot" line above contradict that notice.
+    if vm_args.disk_size.is_some() {
+        eprintln!(
+            "dome: note — disk size is fixed when a sandbox is created and cannot be changed \
+             by `config`; this value is ignored on cold boot. Recreate the sandbox \
+             (`dome sandbox rm {}` then `create`) to change its disk size.",
+            name
+        );
+    }
     print_sandbox_config(&name, &config);
     Ok(())
 }
@@ -430,7 +443,10 @@ fn print_sandbox_config(name: &str, c: &SandboxConfig) {
         c.cpus.map(|n| n.to_string()).unwrap_or_else(|| "default".into())
     );
     eprintln!("  memory (MB):      {}", scalar(c.memory));
-    eprintln!("  disk_size (MB):   {}", scalar(c.disk_size));
+    eprintln!(
+        "  disk_size (MB):   {} (pinned at creation)",
+        scalar(c.disk_size)
+    );
     eprintln!("  allow_net:        {}", c.allow_net);
     eprintln!("  allow_host_writes:{}", c.allow_host_writes);
     eprintln!("  ports:            {}", list(&c.ports));
@@ -473,21 +489,30 @@ pub(crate) fn delete_sandbox_index(data_dir: &str, name: &str) -> Result<()> {
     if !Path::new(&index_path).exists() {
         bail!("sandbox '{}' not found", name);
     }
-    if lock::is_held_live(&lock_path) {
-        bail!(
+
+    // Take the persistence lock for the whole removal rather than merely *checking*
+    // liveness — a bare `is_held_live` check-then-act leaves a window in which a
+    // concurrent `shell`/`run` cold-boots a worker (taking the lock) between the check
+    // and the unlink, so `rm` deletes the index out from under a live worker that then
+    // recreates it on its next save — silently losing the `rm`. Acquiring the lock makes
+    // the guard atomic: `Fork` means a live worker already owns it (refuse), and holding
+    // `Owner` for the unlink means no worker can boot mid-delete. This mirrors how
+    // `create_sandbox` guards its own index write. Reclaiming a stale lock from a crashed
+    // owner is part of `acquire`, so it subsumes the old explicit stale-lock cleanup; the
+    // guard's drop removes the lock file on every exit path.
+    let _guard = match lock::acquire(&lock_path)? {
+        Lock::Owner(g) => g,
+        Lock::Fork => bail!(
             "sandbox '{}' is running. Stop it first with `dome sandbox stop {}`, \
              then run `dome sandbox rm {}`.",
             name,
             name,
             name
-        );
-    }
+        ),
+    };
 
     std::fs::remove_file(&index_path)
         .with_context(|| format!("failed to remove sandbox index '{}'", index_path))?;
-    // A lock can linger only if a previous owner crashed; clear it so a future sandbox
-    // reusing the name is not wedged. Best-effort: a missing lock is the normal case.
-    let _ = std::fs::remove_file(&lock_path);
     // Drop any crash marker too, so a sandbox later reusing this name does not inherit a
     // stale `failed` state in `ls` before its first cold boot. Best-effort.
     worker::clear_failed_marker(data_dir, name);
@@ -1224,6 +1249,13 @@ mod tests {
         assert!(
             !worker::is_failed(data_dir, "web"),
             "rm should clear any stale crash marker"
+        );
+        // rm now takes the persistence lock for the unlink (closing the check-then-act
+        // window a bare liveness check left open); its guard must release on the way out,
+        // leaving no lock behind to wedge a future sandbox reusing the name.
+        assert!(
+            !Path::new(&format!("{}/web.lock", sb_dir)).exists(),
+            "a clean rm must not leave its persistence lock behind"
         );
     }
 
