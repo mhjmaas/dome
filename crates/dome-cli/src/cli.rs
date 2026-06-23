@@ -217,6 +217,21 @@ pub(crate) enum SandboxCommands {
         config: Option<String>,
     },
 
+    /// Stop a running sandbox (flush+save, then shut its VM down)
+    Stop {
+        /// Sandbox name (defaults to the `sandbox` field in dome.json, else a cwd slug)
+        name: Option<String>,
+
+        /// Detach any attached terminals and stop anyway (otherwise stop refuses while
+        /// terminals are attached)
+        #[arg(long)]
+        force: bool,
+
+        /// Path to config file (default: ./dome.json)
+        #[arg(long)]
+        config: Option<String>,
+    },
+
     /// List persistent sandboxes (size, pinned base version, running/idle status)
     Ls,
 

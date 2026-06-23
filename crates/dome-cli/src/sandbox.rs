@@ -334,6 +334,27 @@ pub(crate) fn save_sandbox(name_arg: Option<String>, config_path: Option<&str>) 
     Ok(())
 }
 
+/// `dome sandbox stop [--force] <name>`: stop a running sandbox — flush+save and shut its
+/// VM down. Resolves the name the same way the rest of the command group does, then routes
+/// through domed, which refuses (naming the count) when terminals are still attached unless
+/// `--force` is given. Errors clearly if the sandbox is not running.
+pub(crate) fn stop_sandbox(
+    name_arg: Option<String>,
+    force: bool,
+    config_path: Option<&str>,
+) -> Result<()> {
+    reject_direct_storage()?;
+    let cfg = load_config(config_path)?;
+    let cwd = std::env::current_dir()?;
+    let name = resolve_name(name_arg.as_deref(), &cfg, &cwd)?;
+    dome_vm::validate_checkpoint_name(&name).map_err(|e| anyhow::anyhow!(e))?;
+
+    let data_dir = dome_vm::default_data_dir();
+    crate::daemon::stop_via_daemon(&data_dir, &name, force)?;
+    eprintln!("dome: sandbox '{}' stopped.", name);
+    Ok(())
+}
+
 /// Unlink a sandbox's index (and any lock left behind by a crashed session). Errors
 /// clearly if the sandbox does not exist, and refuses to remove one that is currently
 /// open by a live session — deleting a running sandbox's index would just be recreated
@@ -348,8 +369,9 @@ pub(crate) fn delete_sandbox_index(data_dir: &str, name: &str) -> Result<()> {
     }
     if lock::is_held_live(&lock_path) {
         bail!(
-            "sandbox '{}' is currently in use by another session. \
-             Close it first, then run `dome sandbox rm {}`.",
+            "sandbox '{}' is running. Stop it first with `dome sandbox stop {}`, \
+             then run `dome sandbox rm {}`.",
+            name,
             name,
             name
         );
@@ -360,6 +382,9 @@ pub(crate) fn delete_sandbox_index(data_dir: &str, name: &str) -> Result<()> {
     // A lock can linger only if a previous owner crashed; clear it so a future sandbox
     // reusing the name is not wedged. Best-effort: a missing lock is the normal case.
     let _ = std::fs::remove_file(&lock_path);
+    // Drop any crash marker too, so a sandbox later reusing this name does not inherit a
+    // stale `failed` state in `ls` before its first cold boot. Best-effort.
+    worker::clear_failed_marker(data_dir, name);
     Ok(())
 }
 
@@ -1079,8 +1104,17 @@ mod tests {
         let idx = format!("{}/web.idx", sb_dir);
         dome_store::ChunkIndex::new(64 * 1024).save(&idx).unwrap();
 
+        // A leftover crash marker from a prior failed run of this name must not survive rm,
+        // or a sandbox later reusing the name would wrongly read as `failed` before its
+        // first cold boot.
+        worker::write_failed_marker(data_dir, "web", "crashed earlier");
+
         delete_sandbox_index(data_dir, "web").unwrap();
         assert!(!Path::new(&idx).exists(), "rm should unlink the index");
+        assert!(
+            !worker::is_failed(data_dir, "web"),
+            "rm should clear any stale crash marker"
+        );
     }
 
     #[test]
@@ -1117,9 +1151,10 @@ mod tests {
         .unwrap();
 
         let err = delete_sandbox_index(data_dir, "web").unwrap_err();
+        let msg = err.to_string();
         assert!(
-            err.to_string().contains("in use"),
-            "error should explain the sandbox is in use; got: {}",
+            msg.contains("running") && msg.contains("stop"),
+            "error should explain the sandbox is running and to stop it first; got: {}",
             err
         );
         assert!(

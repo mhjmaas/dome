@@ -83,6 +83,19 @@ pub(crate) struct WorkerHandle {
     pub socket_path: PathBuf,
 }
 
+/// Whether a worker identified by `pid`/`socket` is still alive. Prefer the OS pid
+/// (`kill(pid, 0)`) when we have it (a real launched worker); otherwise fall back to
+/// whether its data-plane socket still accepts a connection (a re-adopted worker, or the
+/// test fake whose liveness is its socket). This is the signal the crash reaper uses to
+/// spot an unexpected exit; it is free-standing so the reaper can probe a snapshot of a
+/// worker's identity without holding the registry lock across the (blocking) probe.
+fn worker_is_alive(pid: Option<u32>, socket: &Path) -> bool {
+    match pid {
+        Some(pid) => pid_alive(pid),
+        None => UnixStream::connect(socket).is_ok(),
+    }
+}
+
 /// The single seam between domed and the VM backend. domed cold-boots and manages
 /// workers exclusively through this trait, so the control plane stays testable against a
 /// fake while the real hypervisor-backed launcher ([`VmWorkerLauncher`]) is dropped in
@@ -199,6 +212,10 @@ impl WorkerLauncher for FakeLauncher {
 /// worker owns that count and domed queries it on demand (see [`worker::attached_count`]).
 struct WorkerEntry {
     handle: WorkerHandle,
+    /// Set when domed has asked this worker to stop, so the crash reaper treats its
+    /// subsequent disappearance as an expected shutdown (a clean `sandbox.stopped`) rather
+    /// than an unexpected exit (`sandbox.crashed`).
+    stopping: bool,
 }
 
 /// domed's in-memory registry of live workers, keyed by sandbox name. Enforces
@@ -221,8 +238,13 @@ impl Registry {
         if self.workers.contains_key(&handle.name) {
             bail!("a worker is already running for sandbox '{}'", handle.name);
         }
-        self.workers
-            .insert(handle.name.clone(), WorkerEntry { handle });
+        self.workers.insert(
+            handle.name.clone(),
+            WorkerEntry {
+                handle,
+                stopping: false,
+            },
+        );
         Ok(())
     }
 
@@ -256,6 +278,39 @@ impl Registry {
             .iter()
             .map(|(name, entry)| (name.clone(), entry.handle.socket_path.clone()))
             .collect()
+    }
+
+    /// Snapshot each worker's identity (name, pid, socket, whether a stop is in progress)
+    /// so the crash reaper can probe liveness without holding the lock across the probe.
+    fn reaper_snapshot(&self) -> Vec<(String, Option<u32>, PathBuf, bool)> {
+        self.workers
+            .iter()
+            .map(|(name, e)| {
+                (
+                    name.clone(),
+                    e.handle.pid,
+                    e.handle.socket_path.clone(),
+                    e.stopping,
+                )
+            })
+            .collect()
+    }
+
+    /// Mark a worker as stopping so the reaper attributes its exit to a clean stop (a no-op
+    /// if no worker is tracked for `name`).
+    fn mark_stopping(&mut self, name: &str) {
+        if let Some(entry) = self.workers.get_mut(name) {
+            entry.stopping = true;
+        }
+    }
+
+    /// Undo [`Registry::mark_stopping`] — used when a worker refuses a stop (terminals still
+    /// attached), so a later unexpected exit is still surfaced as a crash, not swallowed as
+    /// an expected stop.
+    fn unmark_stopping(&mut self, name: &str) {
+        if let Some(entry) = self.workers.get_mut(name) {
+            entry.stopping = false;
+        }
     }
 }
 
@@ -322,6 +377,13 @@ impl Supervisor {
             }
         }
         self.registry.lock().unwrap().overlay(&mut infos, &counts);
+        // A sandbox with no live worker but a crash marker reads as `failed` (the overlay
+        // only ever promotes a row to `running`, so it never clobbers this).
+        for info in infos.iter_mut() {
+            if info.state != "running" && worker::is_failed(&self.data_dir, &info.name) {
+                info.state = "failed".to_string();
+            }
+        }
         Ok(infos)
     }
 
@@ -360,6 +422,9 @@ impl Supervisor {
         })?;
         self.log(&format!("cold-booting worker for '{name}'"));
         let handle = self.launcher.launch(name, &boot, &self.data_dir)?;
+        // A fresh boot supersedes any prior crash: clear the failed marker so the sandbox
+        // no longer reads as `failed`.
+        worker::clear_failed_marker(&self.data_dir, name);
         let socket = handle.socket_path.clone();
         let pid = handle.pid.unwrap_or(0);
         // Register it (ignore a duplicate from a concurrent attach that raced us).
@@ -386,6 +451,59 @@ impl Supervisor {
             anyhow::anyhow!("sandbox '{name}' is not running; nothing to save (it is already durable on disk)")
         })?;
         worker::save_via_worker(&socket)
+    }
+
+    /// Stop a running sandbox: flush+save and shut its VM down. Refuses (naming the
+    /// attached-terminal count) when terminals are still attached unless `force` is set —
+    /// the worker is the source of truth for that count, so domed queries it first. With
+    /// `force`, the worker tears the VM down anyway, which closes the in-flight guest
+    /// sessions so attached clients detach. Errors if the sandbox is not running (there is
+    /// no live worker to stop — an idle sandbox is already down). On success domed removes
+    /// the worker from its registry and broadcasts `sandbox.stopped`.
+    fn stop(&self, name: &str, force: bool) -> Result<()> {
+        let (socket, _pid) = self.live_worker_socket(name).ok_or_else(|| {
+            anyhow::anyhow!("sandbox '{name}' is not running")
+        })?;
+
+        // Mark the worker stopping FIRST so the reaper attributes its exit to this clean
+        // stop (not a crash) for the whole stop window. The worker is the sole decider of
+        // the attached-terminal guard — it owns the count and commits the stop atomically
+        // with session start — so domed just forwards `force` and relays the verdict.
+        self.registry.lock().unwrap().mark_stopping(name);
+        self.log(&format!("stopping worker for '{name}' (force={force})"));
+        match worker::stop_via_worker(&socket, force)? {
+            worker::StopOutcome::Refused { attached } => {
+                // The worker is still running; undo the stopping mark so a later
+                // unexpected exit is still surfaced as a crash.
+                self.registry.lock().unwrap().unmark_stopping(name);
+                bail!(
+                    "sandbox '{name}' has {attached} attached terminal(s); \
+                     detach them first or stop with --force"
+                );
+            }
+            worker::StopOutcome::Stopped => {}
+        }
+
+        // Wait for the worker to drain (save + VM teardown removes its socket), so the stop
+        // is durable by the time the command returns.
+        let deadline = Instant::now() + WORKER_BOOT_TIMEOUT;
+        while Instant::now() < deadline {
+            // The worker removes its socket only after the save + VM teardown completes, so
+            // an unreachable socket means the stop is durable.
+            if UnixStream::connect(&socket).is_err() {
+                break;
+            }
+            std::thread::sleep(POLL_INTERVAL);
+        }
+
+        self.registry.lock().unwrap().remove(name);
+        // A clean stop supersedes any prior crash state.
+        worker::clear_failed_marker(&self.data_dir, name);
+        self.broadcast(&Event {
+            event: "sandbox.stopped".to_string(),
+            data: Some(serde_json::json!({ "name": name })),
+        });
+        Ok(())
     }
 
     /// The data-plane socket of a live worker for `name`, if one is reachable. Drops a
@@ -421,6 +539,58 @@ impl Supervisor {
         let mut subs = self.subscribers.lock().unwrap();
         subs.retain_mut(|stream| write_line(stream, event).is_ok());
     }
+
+    /// Crash supervision: find any tracked worker that has exited, and classify it. A
+    /// worker marked `stopping` exited because domed asked it to (a clean stop — already
+    /// surfaced by [`Supervisor::stop`]); any other exit is unexpected, so domed marks the
+    /// sandbox `failed`, stashes the worker's last log lines, and emits `sandbox.crashed`.
+    /// domed never auto-restarts — a subsequent `shell` cold-boots from the last save.
+    fn reap_dead_workers(&self) {
+        let snapshot = self.registry.lock().unwrap().reaper_snapshot();
+        for (name, pid, socket, stopping) in snapshot {
+            if worker_is_alive(pid, &socket) {
+                continue;
+            }
+            // Forget the dead worker. If it was already removed (e.g. by a concurrent
+            // stop() or live_worker_socket probe), there is nothing left to report.
+            if self.registry.lock().unwrap().remove(&name).is_none() {
+                continue;
+            }
+            if stopping {
+                continue; // expected exit; stop() owns the sandbox.stopped event
+            }
+            let tail = worker::read_last_log_lines(&self.data_dir, &name, 20);
+            worker::write_failed_marker(&self.data_dir, &name, &tail);
+            self.log(&format!(
+                "worker for '{name}' exited unexpectedly; marked failed (no auto-restart)"
+            ));
+            self.broadcast(&Event {
+                event: "sandbox.crashed".to_string(),
+                data: Some(serde_json::json!({ "name": name, "log": tail })),
+            });
+        }
+    }
+}
+
+/// Crash-reaper poll cadence: how often domed scans its registry for workers that have
+/// exited unexpectedly. Brisk enough to surface a crash promptly without busy-spinning.
+const REAPER_POLL: Duration = Duration::from_millis(500);
+
+/// Spawn the background crash reaper. It polls [`Supervisor::reap_dead_workers`] every
+/// [`REAPER_POLL`] until shutdown, so an unexpectedly-exited worker is surfaced as a
+/// `sandbox.crashed` event even when no client is actively touching the sandbox.
+fn spawn_reaper(sup: &Arc<Supervisor>) -> std::thread::JoinHandle<()> {
+    let sup = Arc::clone(sup);
+    std::thread::spawn(move || loop {
+        if sup.shutdown.load(Ordering::SeqCst) {
+            break;
+        }
+        std::thread::sleep(REAPER_POLL);
+        if sup.shutdown.load(Ordering::SeqCst) {
+            break;
+        }
+        sup.reap_dead_workers();
+    })
 }
 
 /// Run the supervisor accept loop on `listener` until a `shutdown` is requested. The
@@ -556,6 +726,17 @@ fn handle_conn(sup: &Arc<Supervisor>, stream: UnixStream) {
                     let _ = write_line(&mut writer, &Response::err(req.id, format!("{e:#}")));
                 }
             },
+            Command::Stop { name, force } => match sup.stop(&name, force) {
+                Ok(()) => {
+                    let _ = write_line(
+                        &mut writer,
+                        &Response::ok(req.id, serde_json::json!({ "stopped": true })),
+                    );
+                }
+                Err(e) => {
+                    let _ = write_line(&mut writer, &Response::err(req.id, format!("{e:#}")));
+                }
+            },
             Command::WorkerSaved { name } => {
                 // A worker reports that it flushed+saved (auto-flush, explicit, or stop).
                 // Rebroadcast to subscribers, then acknowledge the worker.
@@ -620,7 +801,9 @@ pub(crate) fn run_supervisor(data_dir: &str) -> Result<()> {
         .context("setting control socket non-blocking")?;
 
     let sup = Arc::new(Supervisor::new(data_dir.to_string(), Box::new(VmWorkerLauncher)));
+    let reaper = spawn_reaper(&sup);
     serve(&sup, listener);
+    let _ = reaper.join();
 
     let _ = std::fs::remove_file(&sock);
     drop(guard); // releases the singleton lock
@@ -752,6 +935,27 @@ pub(crate) fn save_via_daemon(data_dir: &str, name: &str) -> Result<()> {
     Ok(())
 }
 
+/// `dome sandbox stop [--force] <name>` data path: route a stop through domed (auto-
+/// spawning it). domed enforces the attached-terminal guard, then tells the worker to
+/// flush+save and shut the VM down.
+pub(crate) fn stop_via_daemon(data_dir: &str, name: &str, force: bool) -> Result<()> {
+    let mut stream = ensure_daemon(data_dir)?;
+    let resp = request(
+        &mut stream,
+        Command::Stop {
+            name: name.to_string(),
+            force,
+        },
+    )?;
+    if !resp.ok {
+        bail!(
+            "domed error: {}",
+            resp.error.unwrap_or_else(|| "unknown error".to_string())
+        );
+    }
+    Ok(())
+}
+
 /// Worker → domed: report that a sandbox was saved, so domed broadcasts `sandbox.saved`
 /// to subscribers. Best-effort and non-fatal — a worker outlives domed, so a save still
 /// succeeds when no domed is up to notify (there are no subscribers then anyway). Connects
@@ -848,6 +1052,7 @@ mod tests {
     struct TestDaemon {
         data_dir: tempfile::TempDir,
         handle: Option<std::thread::JoinHandle<()>>,
+        reaper: Option<std::thread::JoinHandle<()>>,
     }
 
     impl TestDaemon {
@@ -862,10 +1067,12 @@ mod tests {
                 data_dir.path().to_str().unwrap().to_string(),
                 Box::new(FakeLauncher),
             ));
+            let reaper = spawn_reaper(&sup);
             let handle = std::thread::spawn(move || serve(&sup, listener));
             Self {
                 data_dir,
                 handle: Some(handle),
+                reaper: Some(reaper),
             }
         }
 
@@ -887,6 +1094,9 @@ mod tests {
             }
             if let Some(h) = self.handle.take() {
                 let _ = h.join();
+            }
+            if let Some(r) = self.reaper.take() {
+                let _ = r.join();
             }
         }
     }
@@ -1148,6 +1358,348 @@ mod tests {
         reg.overlay(&mut infos, &HashMap::new());
         assert_eq!(infos[0].state, "running", "the VM is still up after all detaches");
         assert_eq!(infos[0].attached, 0, "no terminals attached → count 0");
+    }
+
+    // --- Lifecycle guards + crash supervision (#27) ---
+
+    use std::sync::atomic::AtomicUsize;
+
+    /// A minimal stand-in for a worker process: it listens on the worker data-plane socket
+    /// and answers the worker wire protocol (`mint`/`count`/`stop`) with raw JSON, so
+    /// domed's stop guard and attach/mint paths can be exercised without a hypervisor. Its
+    /// liveness is the socket itself; `stop`/`crash`/drop take it down (so a probing
+    /// `worker_is_alive(None, socket)` then fails, as it would for a real exited worker).
+    struct FakeWorker {
+        alive: Arc<AtomicBool>,
+        handle: Option<std::thread::JoinHandle<()>>,
+    }
+
+    impl FakeWorker {
+        fn start(socket: PathBuf, attached: usize) -> Self {
+            if let Some(p) = socket.parent() {
+                std::fs::create_dir_all(p).unwrap();
+            }
+            let _ = std::fs::remove_file(&socket);
+            let listener = UnixListener::bind(&socket).unwrap();
+            listener.set_nonblocking(true).unwrap();
+            let alive = Arc::new(AtomicBool::new(true));
+            let attached = Arc::new(AtomicUsize::new(attached));
+            let al = Arc::clone(&alive);
+            let at = Arc::clone(&attached);
+            let sock = socket.clone();
+            let handle = std::thread::spawn(move || {
+                while al.load(Ordering::SeqCst) {
+                    match listener.accept() {
+                        Ok((mut s, _)) => {
+                            let _ = s.set_nonblocking(false);
+                            // Read one newline-terminated request line (unbuffered).
+                            let mut buf = Vec::new();
+                            let mut byte = [0u8; 1];
+                            while let Ok(n) = s.read(&mut byte) {
+                                if n == 0 || byte[0] == b'\n' {
+                                    break;
+                                }
+                                buf.push(byte[0]);
+                            }
+                            let line = String::from_utf8_lossy(&buf);
+                            let v: serde_json::Value =
+                                serde_json::from_str(line.trim()).unwrap_or(serde_json::json!({}));
+                            let resp = match v["op"].as_str().unwrap_or("") {
+                                "mint" => serde_json::json!({ "token": "faketoken" }),
+                                "count" => serde_json::json!({ "attached": at.load(Ordering::SeqCst) }),
+                                "stop" => {
+                                    // The worker is the sole decider of the attached guard:
+                                    // refuse (naming the count) unless forced or idle.
+                                    let force = v["force"].as_bool().unwrap_or(false);
+                                    let attached = at.load(Ordering::SeqCst);
+                                    if !force && attached > 0 {
+                                        serde_json::json!({ "ok": false, "attached": attached })
+                                    } else {
+                                        al.store(false, Ordering::SeqCst);
+                                        serde_json::json!({ "ok": true, "attached": 0 })
+                                    }
+                                }
+                                _ => serde_json::json!({ "ok": false, "error": "unsupported" }),
+                            };
+                            let mut out = serde_json::to_string(&resp).unwrap();
+                            out.push('\n');
+                            let _ = s.write_all(out.as_bytes());
+                            let _ = s.flush();
+                        }
+                        Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => {
+                            std::thread::sleep(Duration::from_millis(5));
+                        }
+                        Err(_) => break,
+                    }
+                }
+                let _ = std::fs::remove_file(&sock);
+            });
+            Self {
+                alive,
+                handle: Some(handle),
+            }
+        }
+
+    }
+
+    impl Drop for FakeWorker {
+        fn drop(&mut self) {
+            self.alive.store(false, Ordering::SeqCst);
+            if let Some(h) = self.handle.take() {
+                let _ = h.join();
+            }
+        }
+    }
+
+    /// A launcher that boots a [`FakeWorker`] (listening on the real worker socket path)
+    /// instead of a hypervisor, so cold-boot/attach succeeds end-to-end in tests.
+    struct FakeWorkerLauncher {
+        attached: usize,
+        started: Mutex<Vec<FakeWorker>>,
+    }
+
+    impl WorkerLauncher for FakeWorkerLauncher {
+        fn launch(
+            &self,
+            name: &str,
+            _boot: &serde_json::Value,
+            data_dir: &str,
+        ) -> Result<WorkerHandle> {
+            let socket = worker::worker_socket_path(data_dir, name);
+            let fw = FakeWorker::start(socket.clone(), self.attached);
+            self.started.lock().unwrap().push(fw);
+            Ok(WorkerHandle {
+                name: name.to_string(),
+                pid: None,
+                started: Instant::now(),
+                socket_path: socket,
+            })
+        }
+    }
+
+    /// Subscribe to a supervisor's event stream via an in-process socket pair, returning the
+    /// read half. Pushing the write half registers it as a subscriber, so a subsequent
+    /// `broadcast` is readable here.
+    fn subscribe(sup: &Supervisor) -> UnixStream {
+        let (rx, tx) = UnixStream::pair().unwrap();
+        sup.subscribers.lock().unwrap().push(tx);
+        rx
+    }
+
+    /// Collect every event a subscriber received. Drops the supervisor's write halves first
+    /// so the read side sees EOF and never blocks (events broadcast before the call are
+    /// already buffered in the socket, so they are still read out).
+    fn drain_events(sup: &Supervisor, rx: UnixStream) -> Vec<Event> {
+        sup.subscribers.lock().unwrap().clear();
+        let mut reader = BufReader::new(rx);
+        let mut line = String::new();
+        let mut events = Vec::new();
+        while reader.read_line(&mut line).unwrap_or(0) != 0 {
+            if let Ok(ev) = serde_json::from_str::<Event>(line.trim()) {
+                events.push(ev);
+            }
+            line.clear();
+        }
+        events
+    }
+
+    #[test]
+    fn an_unexpected_worker_exit_marks_failed_emits_crashed_and_does_not_restart() {
+        let d = tmp_data_dir();
+        let dd = d.path().to_str().unwrap();
+        let sup = Arc::new(Supervisor::new(dd.to_string(), Box::new(FakeLauncher)));
+
+        // Pre-seed a worker log so the crash report can surface its last lines.
+        let logs = worker::workers_dir(dd);
+        std::fs::create_dir_all(&logs).unwrap();
+        std::fs::write(logs.join("web.log"), "boot ok\nlast gasp before dying\n").unwrap();
+
+        // Register a live worker, then crash it (stop listening) so the reaper sees an
+        // unexpected exit it was never told about.
+        let socket = worker::worker_socket_path(dd, "web");
+        let fw = FakeWorker::start(socket.clone(), 0);
+        sup.registry
+            .lock()
+            .unwrap()
+            .insert(WorkerHandle {
+                name: "web".to_string(),
+                pid: None,
+                started: Instant::now(),
+                socket_path: socket.clone(),
+            })
+            .unwrap();
+        // While alive, the reaper leaves it be.
+        sup.reap_dead_workers();
+        assert_eq!(sup.registry.lock().unwrap().len(), 1, "a live worker is not reaped");
+
+        drop(fw); // crash: the listener stops and the socket goes away
+        while UnixStream::connect(&socket).is_ok() {
+            std::thread::sleep(Duration::from_millis(5));
+        }
+
+        let rx = subscribe(&sup);
+        sup.reap_dead_workers();
+
+        // sandbox.crashed is emitted, carrying the name and the worker's last log lines.
+        let events = drain_events(&sup, rx);
+        let ev = events
+            .iter()
+            .find(|e| e.event == "sandbox.crashed")
+            .expect("must emit sandbox.crashed");
+        let data = ev.data.clone().unwrap();
+        assert_eq!(data["name"], "web");
+        assert!(
+            data["log"].as_str().unwrap().contains("last gasp"),
+            "crash event must surface the last log lines: {data}"
+        );
+        // The sandbox is marked failed (retrievable after the worker is gone)…
+        assert!(worker::is_failed(dd, "web"), "a crashed sandbox is marked failed");
+        // …the dead worker is forgotten (no auto-restart)…
+        assert_eq!(sup.registry.lock().unwrap().len(), 0, "no auto-restart");
+        // …and reaping again does not re-emit (idempotent once removed).
+        let rx2 = subscribe(&sup);
+        sup.reap_dead_workers();
+        assert!(
+            !drain_events(&sup, rx2)
+                .iter()
+                .any(|e| e.event == "sandbox.crashed"),
+            "an already-reaped crash must not re-fire"
+        );
+    }
+
+    #[test]
+    fn a_worker_asked_to_stop_is_not_reported_as_a_crash() {
+        let d = tmp_data_dir();
+        let dd = d.path().to_str().unwrap();
+        let sup = Arc::new(Supervisor::new(dd.to_string(), Box::new(FakeLauncher)));
+
+        let handle = WorkerHandle {
+            name: "web".to_string(),
+            pid: None,
+            started: Instant::now(),
+            socket_path: worker::worker_socket_path(dd, "web"),
+        };
+        sup.registry.lock().unwrap().insert(handle).unwrap();
+        // Mark it stopping (as Supervisor::stop would) before it disappears.
+        sup.registry.lock().unwrap().mark_stopping("web");
+
+        let rx = subscribe(&sup);
+        sup.reap_dead_workers();
+
+        assert!(
+            !drain_events(&sup, rx)
+                .iter()
+                .any(|e| e.event == "sandbox.crashed"),
+            "an expected stop must not be reported as a crash"
+        );
+        assert!(!worker::is_failed(dd, "web"), "a clean stop is not a failure");
+        assert_eq!(sup.registry.lock().unwrap().len(), 0, "the entry is still removed");
+    }
+
+    #[test]
+    fn stop_refuses_attached_terminals_unless_forced_and_emits_stopped() {
+        let d = tmp_data_dir();
+        let dd = d.path().to_str().unwrap();
+        // 2 terminals attached; the fake worker reports the count over its socket.
+        let sup = Arc::new(Supervisor::new(dd.to_string(), Box::new(FakeLauncher)));
+        let socket = worker::worker_socket_path(dd, "web");
+        let _fw = FakeWorker::start(socket.clone(), 2);
+        sup.registry
+            .lock()
+            .unwrap()
+            .insert(WorkerHandle {
+                name: "web".to_string(),
+                pid: None,
+                started: Instant::now(),
+                socket_path: socket.clone(),
+            })
+            .unwrap();
+
+        // Non-force stop is refused and names the attached count.
+        let err = sup.stop("web", false).unwrap_err();
+        assert!(
+            err.to_string().contains("2 attached"),
+            "refusal must name the attached count: {err}"
+        );
+        assert_eq!(
+            sup.registry.lock().unwrap().len(),
+            1,
+            "a refused stop leaves the worker running"
+        );
+
+        // Force stop detaches + tears down, and broadcasts sandbox.stopped.
+        let rx = subscribe(&sup);
+        sup.stop("web", true).unwrap();
+        let events = drain_events(&sup, rx);
+        let ev = events
+            .iter()
+            .find(|e| e.event == "sandbox.stopped")
+            .expect("force stop must emit sandbox.stopped");
+        assert_eq!(ev.data.clone().unwrap()["name"], "web");
+        assert_eq!(sup.registry.lock().unwrap().len(), 0, "the worker is gone after stop");
+        assert!(
+            UnixStream::connect(&socket).is_err(),
+            "the worker socket is torn down on stop"
+        );
+    }
+
+    #[test]
+    fn stop_with_no_attached_terminals_succeeds_without_force() {
+        let d = tmp_data_dir();
+        let dd = d.path().to_str().unwrap();
+        let sup = Arc::new(Supervisor::new(dd.to_string(), Box::new(FakeLauncher)));
+        let socket = worker::worker_socket_path(dd, "web");
+        let _fw = FakeWorker::start(socket.clone(), 0); // no terminals attached
+        sup.registry
+            .lock()
+            .unwrap()
+            .insert(WorkerHandle {
+                name: "web".to_string(),
+                pid: None,
+                started: Instant::now(),
+                socket_path: socket,
+            })
+            .unwrap();
+
+        sup.stop("web", false).unwrap();
+        assert_eq!(sup.registry.lock().unwrap().len(), 0);
+    }
+
+    #[test]
+    fn stopping_a_sandbox_that_is_not_running_errors_clearly() {
+        let d = tmp_data_dir();
+        let dd = d.path().to_str().unwrap();
+        let sup = Arc::new(Supervisor::new(dd.to_string(), Box::new(FakeLauncher)));
+        let err = sup.stop("ghost", false).unwrap_err();
+        assert!(
+            err.to_string().contains("not running"),
+            "stopping an idle sandbox must say it is not running: {err}"
+        );
+    }
+
+    #[test]
+    fn list_surfaces_a_failed_sandbox_and_a_cold_boot_clears_it() {
+        let d = tmp_data_dir();
+        let dd = d.path().to_str().unwrap();
+        write_sandbox_idx(dd, "web", 1);
+        worker::write_failed_marker(dd, "web", "crashed here");
+
+        // With a crash marker and no live worker, the sandbox lists as `failed`.
+        let sup = Arc::new(Supervisor::new(dd.to_string(), Box::new(FakeWorkerLauncher {
+            attached: 0,
+            started: Mutex::new(Vec::new()),
+        })));
+        let infos = sup.list().unwrap();
+        let row = infos.iter().find(|r| r.name == "web").unwrap();
+        assert_eq!(row.state, "failed", "a crash marker with no worker reads as failed");
+
+        // Re-attaching cold-boots a fresh worker, which supersedes the failure.
+        let boot = serde_json::json!({ "name": "web", "cwd": "/x", "vm_args": {} });
+        sup.attach("web", Some(boot)).unwrap();
+        assert!(!worker::is_failed(dd, "web"), "a cold boot clears the failed marker");
+        let infos = sup.list().unwrap();
+        let row = infos.iter().find(|r| r.name == "web").unwrap();
+        assert_eq!(row.state, "running", "after a cold boot the sandbox is running again");
     }
 
     #[test]

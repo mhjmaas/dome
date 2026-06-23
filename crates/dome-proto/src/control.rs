@@ -77,6 +77,18 @@ pub enum Command {
         /// Sandbox name to save.
         name: String,
     },
+    /// Stop a running sandbox: flush+save and shut its VM down. Refuses (naming the count)
+    /// when terminals are still attached, unless `force` is set — `force` detaches the
+    /// attached terminals gracefully, saves, then stops. Errors if the sandbox is not
+    /// running. On success domed emits a `sandbox.stopped` [`Event`]. Backs
+    /// `dome sandbox stop [--force] <name>`.
+    Stop {
+        /// Sandbox name to stop.
+        name: String,
+        /// Detach attached terminals and stop anyway (default: refuse if any are attached).
+        #[serde(default)]
+        force: bool,
+    },
     /// Worker → domed notification that a save completed (auto-flush interval, dirty-cap
     /// trigger, explicit save, or graceful stop). domed rebroadcasts it to subscribers as
     /// a `sandbox.saved` [`Event`]. Internal to the dome binary — the worker is the only
@@ -245,6 +257,14 @@ mod tests {
             Command::Save {
                 name: "web".to_string(),
             },
+            Command::Stop {
+                name: "web".to_string(),
+                force: false,
+            },
+            Command::Stop {
+                name: "web".to_string(),
+                force: true,
+            },
             Command::WorkerSaved {
                 name: "web".to_string(),
             },
@@ -272,6 +292,37 @@ mod tests {
         );
         let back: Request = serde_json::from_str(&line).unwrap();
         assert_eq!(back, req);
+    }
+
+    /// `stop` flattens its `verb` tag and carries the sandbox name; `force` defaults to
+    /// false on the wire when absent (so an older `--force`-less client still parses).
+    #[test]
+    fn stop_command_roundtrips_with_a_flat_verb_and_defaulted_force() {
+        let req = Request::new(
+            Some(9),
+            Command::Stop {
+                name: "web".to_string(),
+                force: false,
+            },
+        );
+        let line = serde_json::to_string(&req).unwrap();
+        assert!(
+            line.contains("\"verb\":\"stop\"") && line.contains("\"name\":\"web\""),
+            "stop must carry a flat verb tag and name: {line}"
+        );
+        let back: Request = serde_json::from_str(&line).unwrap();
+        assert_eq!(back, req);
+
+        // A request omitting `force` entirely must still parse, defaulting to false.
+        let without_force: Request =
+            serde_json::from_str(r#"{"protocol_version":1,"verb":"stop","name":"web"}"#).unwrap();
+        assert_eq!(
+            without_force.command,
+            Command::Stop {
+                name: "web".to_string(),
+                force: false,
+            }
+        );
     }
 
     /// `id` is omitted from the wire when absent and preserved when present.
