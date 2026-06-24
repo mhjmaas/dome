@@ -35,36 +35,39 @@ fn sandbox_run(name: &str, guest_cmd: &str) -> std::process::Output {
         .expect("failed to spawn dome — is DOME_BIN correct?")
 }
 
-/// The `ATTACHED` count `ls` reports for `name` (None if the sandbox is not listed).
-fn ls_attached(name: &str) -> Option<usize> {
+/// The whitespace-split columns of the `ls` row for `name`, if listed. Column indices are
+/// NOT fixed: the SIZE field is rendered as `<n> <unit> (cas)` (three whitespace tokens) and
+/// CREATED as `57m ago` (two), so the STATE/ATTACHED columns can't be read by a constant
+/// offset — locate STATE by its known value instead.
+fn ls_cols(name: &str) -> Option<Vec<String>> {
     let out = Command::new(dome_bin())
         .args(["sandbox", "ls"])
         .output()
         .expect("failed to spawn dome");
     let text = String::from_utf8_lossy(&out.stdout);
-    for line in text.lines() {
-        let cols: Vec<&str> = line.split_whitespace().collect();
-        // Columns: NAME SIZE BASE STATE ATTACHED CREATED
-        if cols.first() == Some(&name) && cols.len() >= 5 {
-            return cols[4].parse::<usize>().ok();
-        }
-    }
-    None
+    text.lines()
+        .map(|l| {
+            l.split_whitespace()
+                .map(str::to_string)
+                .collect::<Vec<_>>()
+        })
+        .find(|cols| cols.first().map(String::as_str) == Some(name))
 }
 
+/// The `STATE` `ls` reports for `name` (the one token from the known state set).
 fn ls_state(name: &str) -> Option<String> {
-    let out = Command::new(dome_bin())
-        .args(["sandbox", "ls"])
-        .output()
-        .expect("failed to spawn dome");
-    let text = String::from_utf8_lossy(&out.stdout);
-    for line in text.lines() {
-        let cols: Vec<&str> = line.split_whitespace().collect();
-        if cols.first() == Some(&name) && cols.len() >= 4 {
-            return Some(cols[3].to_string());
-        }
-    }
-    None
+    let cols = ls_cols(name)?;
+    cols.into_iter()
+        .find(|c| matches!(c.as_str(), "running" | "idle" | "failed"))
+}
+
+/// The `ATTACHED` count `ls` reports for `name`: the integer column immediately after STATE.
+fn ls_attached(name: &str) -> Option<usize> {
+    let cols = ls_cols(name)?;
+    let state_idx = cols
+        .iter()
+        .position(|c| matches!(c.as_str(), "running" | "idle" | "failed"))?;
+    cols.get(state_idx + 1)?.parse::<usize>().ok()
 }
 
 /// Stop the per-sandbox worker (no user-facing `sandbox stop` until #27): SIGTERM it so

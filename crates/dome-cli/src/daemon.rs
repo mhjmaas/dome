@@ -199,6 +199,22 @@ fn pid_alive(pid: u32) -> bool {
     unsafe { libc::kill(pid as i32, 0) == 0 }
 }
 
+/// Reap any worker children that have exited, so they don't linger as zombies. Every worker
+/// domed launches is its direct child (`setsid` gives it a new session but not a new parent),
+/// and until we `wait` on it an exited worker stays a zombie — for which `kill(pid, 0)` still
+/// succeeds, so [`worker_is_alive`] would report it alive forever and the reaper would never
+/// drop it from the registry. Re-adopted workers (pid `None`) are not our children, so this
+/// leaves them untouched. Non-blocking: reaps every already-exited child and returns.
+fn reap_zombie_children() {
+    loop {
+        let mut status = 0;
+        // >0: reaped one, keep going. 0: children exist but none exited. <0: no children.
+        if unsafe { libc::waitpid(-1, &mut status, libc::WNOHANG) } <= 0 {
+            break;
+        }
+    }
+}
+
 /// A hypervisor-free launcher used in tests. It boots no VM; it only records the worker
 /// and writes a per-sandbox log line, and reports a socket path under the workers dir.
 #[cfg(test)]
@@ -601,6 +617,9 @@ impl Supervisor {
     /// sandbox `failed`, stashes the worker's last log lines, and emits `sandbox.crashed`.
     /// domed never auto-restarts — a subsequent `shell` cold-boots from the last save.
     fn reap_dead_workers(&self) {
+        // Clear any zombie worker children first, so the liveness probe below sees an exited
+        // worker as gone (a zombie would otherwise read as alive via `kill(pid, 0)`).
+        reap_zombie_children();
         let snapshot = self.registry.lock().unwrap().reaper_snapshot();
         for (name, pid, socket, stopping) in snapshot {
             if worker_is_alive(pid, &socket) {

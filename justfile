@@ -67,7 +67,11 @@ test-vm filter="": build-guest build-cli
     cargo test -p dome-cli --tests --no-run
     cp -f {{ binary }} {{ binary }}-signed
     codesign --entitlements dome.entitlements --force -s - {{ binary }}-signed
-    DOME_BIN={{ justfile_directory() }}/{{ binary }}-signed cargo test -p dome-cli --tests --no-fail-fast -- --ignored {{ filter }}
+    # Run serially (`--test-threads=1`): every real-VM test shares one global domed +
+    # data dir under ~/.local/share/dome, so libtest's default parallelism would race the
+    # daemon and make the global `workers: N` assertions flaky. cargo already runs the test
+    # binaries one at a time, so this serializes the whole suite end to end.
+    DOME_BIN={{ justfile_directory() }}/{{ binary }}-signed cargo test -p dome-cli --tests --no-fail-fast -- --ignored --test-threads=1 {{ filter }}
 
 # Install the binary to ~/.local/bin with codesign
 install: build-guest

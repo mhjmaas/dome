@@ -95,13 +95,17 @@ fn main() -> Result<()> {
 
             // Auto-mount the project root into the runtime guest at the standard path so the
             // developer sees their project. RUNTIME only — the provision build above is
-            // hermetic (unmounted). Skipped when there is no `dome.json` (no project to mount).
+            // hermetic (unmounted). Skipped when there is no `dome.json` (no project to mount),
+            // or when the project root is outside CWD (e.g. an explicit out-of-tree `--config`):
+            // the convenience mount must never push a boot past the host-within-cwd guard.
             if let Some(root) = config::project_root(vm.config.as_deref()) {
-                resolved.mounts = vm::with_project_root_mount(
-                    &resolved.mounts,
-                    &root,
-                    resolved.allow_host_writes,
-                );
+                if vm::path_within_cwd(&root) {
+                    resolved.mounts = vm::with_project_root_mount(
+                        &resolved.mounts,
+                        &root,
+                        resolved.allow_host_writes,
+                    );
+                }
             }
 
             let prepared = vm::prepare_vm(

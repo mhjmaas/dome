@@ -505,6 +505,17 @@ impl Worker {
         let Some(ref cas) = self.cas else {
             return Ok(());
         };
+        // Flush the GUEST page cache to the block device before snapshotting. A guest write
+        // (e.g. `echo > file`) lingers in the guest's own cache until it syncs; the host-side
+        // CAS only ever sees blocks that have actually reached the virtio device. Without
+        // this, an explicit `save` (or an auto-flush) taken mid-session can miss the latest
+        // writes, so a later cold boot from the saved index would not reflect them — breaking
+        // #26's "after a save, a fresh cold-boot reflects the saved state". Best-effort: if
+        // the guest is unreachable we still persist whatever blocks already arrived.
+        let (mut out, mut err) = (std::io::sink(), std::io::sink());
+        if let Err(e) = self.sandbox.exec(&["sync"], &mut out, &mut err) {
+            self.log(&format!("guest sync before save failed (continuing): {e}"));
+        }
         // Hold the save lock across the whole flatten+atomic-write so two saves can't race.
         let _guard = self.save_lock.lock().unwrap();
         cas.save_sandbox_index(&self.index_path)
@@ -638,9 +649,13 @@ fn boot_and_serve(name: &str, data_dir: &str) -> Result<()> {
     // build rode a hermetic, unmounted VM. Not persisted to the sidecar (kept out of the saved
     // mounts above) so the mount tracks the `dome.json` the developer is launching from rather
     // than baking the create-time host path.
+    // Skipped when the project root is outside CWD (e.g. an explicit out-of-tree `--config`):
+    // the convenience mount must never push the boot past the host-within-cwd guard.
     if let Some(root) = crate::config::project_root(boot.vm_args.config.as_deref()) {
-        resolved.mounts =
-            vm::with_project_root_mount(&resolved.mounts, &root, resolved.allow_host_writes);
+        if vm::path_within_cwd(&root) {
+            resolved.mounts =
+                vm::with_project_root_mount(&resolved.mounts, &root, resolved.allow_host_writes);
+        }
     }
 
     let prepared = vm::prepare_vm(&resolved, &boot.vm_args, None, None, Some(&source))?;
@@ -687,6 +702,17 @@ fn boot_and_serve(name: &str, data_dir: &str) -> Result<()> {
         "worker up for '{name}' (pid {})",
         std::process::id()
     ));
+
+    // Lazily materialize the sandbox index on first cold boot. A brand-new sandbox has a
+    // config sidecar but no `.idx` until something is saved, so without this it would not be
+    // durable, resumable, or visible to `ls` until the first auto-flush/explicit save. Saving
+    // an initial index here makes the sandbox real from the moment it first runs. Only on the
+    // cold-boot path (no index yet); a resume already has one. Best-effort.
+    if worker.cas.is_some() && !std::path::Path::new(&worker.index_path).exists() {
+        if let Err(e) = worker.save() {
+            worker.log(&format!("initial index save failed (continuing): {e:#}"));
+        }
+    }
 
     // Background auto-flush: bound worker memory + the crash-loss window by saving on an
     // interval and when the dirty buffer exceeds the cap. Joined before the shutdown save.

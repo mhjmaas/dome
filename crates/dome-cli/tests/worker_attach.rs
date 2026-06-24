@@ -159,20 +159,22 @@ fn domed_restart_readopts_the_running_worker() {
         "domed should be down after `daemon stop`; status:\n{status}"
     );
 
-    // A fresh `daemon status` auto-spawns a new domed, which re-adopts the live worker.
-    let status = daemon_status();
-    assert!(
-        status.contains("workers: 1"),
-        "the restarted domed must re-adopt the surviving worker; status:\n{status}"
-    );
-
-    // The re-attached session reaches the SAME VM (tmpfs marker survived), proving the VM
-    // was re-adopted, not cold-booted afresh.
+    // A fresh session auto-spawns a new domed (`daemon status` is a passive probe and does
+    // NOT resurrect it — only session/ls/save paths go through ensure_daemon). The new domed
+    // re-adopts the surviving worker rather than cold-booting a new one: the session reaches
+    // the SAME VM, proven by the tmpfs marker that lives only as long as this original VM.
     let s2 = sandbox_run(&name, "cat /run/dome-live");
     assert!(
         String::from_utf8_lossy(&s2.stdout).contains("readopt-marker-"),
         "re-adopted worker must still be the same live VM; stdout: {}",
         String::from_utf8_lossy(&s2.stdout)
+    );
+
+    // domed is back up and reports the single re-adopted worker (not two — no cold boot).
+    let status = daemon_status();
+    assert!(
+        status.contains("workers: 1"),
+        "the restarted domed must re-adopt the surviving worker; status:\n{status}"
     );
 
     cleanup(&name);
