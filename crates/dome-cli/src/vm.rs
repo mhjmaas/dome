@@ -31,7 +31,7 @@ use dome_vm::{MountConfig, PortMapping, Sandbox};
 
 use crate::assets;
 use crate::cli::VmArgs;
-use crate::sandbox_config::ResolvedConfig;
+use crate::sandbox_config::{ProvisionSpec, ProxyResolved, ResolvedConfig};
 
 /// A persistent sandbox's storage binding: where its CAS index lives and the
 /// immutable, version-pinned base image its never-written chunks resolve through.
@@ -84,6 +84,7 @@ pub(crate) fn prepare_vm(
     cfg: &ResolvedConfig,
     env: &VmArgs,
     from: Option<&str>,
+    provision_seed: Option<&str>,
     sandbox: Option<&SandboxSource>,
 ) -> Result<PreparedVm> {
     let cpus = cfg.cpus.unwrap_or(2);
@@ -193,13 +194,25 @@ pub(crate) fn prepare_vm(
                 }
             }
             None => {
-                if !std::path::Path::new(&rootfs_path).exists() {
-                    bail!(
-                        "Rootfs not found at {}. Run `dome init` to download.",
-                        rootfs_path
-                    );
+                if let Some(seed) = provision_seed {
+                    // A provisioned layer is a CAS index (an absolute path under
+                    // `provision/`), not a name resolved under `checkpoints/`. Ride it
+                    // directly like a checkpoint seed: reads resolve through it and its
+                    // pinned base; an ephemeral run never writes back to the shared layer.
+                    if !std::path::Path::new(seed).exists() {
+                        bail!("provisioned layer not found: {}", seed);
+                    }
+                    cas_index = Some(seed.to_string());
+                    seed.to_string()
+                } else {
+                    if !std::path::Path::new(&rootfs_path).exists() {
+                        bail!(
+                            "Rootfs not found at {}. Run `dome init` to download.",
+                            rootfs_path
+                        );
+                    }
+                    rootfs_path
                 }
-                rootfs_path
             }
         }
     };
@@ -452,6 +465,96 @@ pub(crate) fn run_command(prepared: &PreparedVm, command: &[String]) -> Result<R
         exit_code,
         nbd_handle,
     })
+}
+
+/// Run a project's provisioning steps in a one-shot build VM and save the resulting disk
+/// state as the provisioned layer index at `out_index`.
+///
+/// The build boots from the bare base (project dir NOT mounted), with networking on and
+/// narrowed by `spec.allow` (empty = all allowed). Steps run as **root**, **sequentially**,
+/// **stop-on-first-failure**, each via its own `sh -c` so `cd`/`export` don't cross steps. A
+/// banner and live per-step output make the cold run visible. On success the layer is saved to
+/// `out_index`; on any step failure nothing is saved and the error propagates (failing the
+/// create) — richer failure UX (debug disk) is a later slice. Lives here, not in
+/// [`crate::provision`], so it can drive the private [`BootedVm`] teardown the same way
+/// [`run_command`] does.
+pub(crate) fn build_provision_layer(
+    spec: &ProvisionSpec,
+    disk_size_mb: u64,
+    env: &VmArgs,
+    out_index: &str,
+) -> Result<()> {
+    // Build-VM shape: default cpus/memory, the requested disk size, networking on and
+    // narrowed by the provision-time allow-list. No mounts — the project dir is never exposed
+    // to the build.
+    let cfg = ResolvedConfig {
+        disk_size: Some(disk_size_mb),
+        allow_net: true,
+        proxy: ProxyResolved {
+            allow: spec.allow.clone(),
+            ..Default::default()
+        },
+        ..Default::default()
+    };
+
+    let prepared = prepare_vm(&cfg, env, None, None, None)?;
+    let booted = boot_vm(&prepared)?;
+
+    eprintln!("dome: ── provisioning toolchain (cold build) ──");
+    let mut failure: Option<anyhow::Error> = None;
+    for step in &spec.steps {
+        eprintln!("dome:   → {}", step);
+        let cmd = vec!["sh".to_string(), "-c".to_string(), step.clone()];
+        match booted.sandbox.exec_with_env(
+            &cmd,
+            &booted.env,
+            &mut std::io::stdout(),
+            &mut std::io::stderr(),
+        ) {
+            Ok(0) => {}
+            Ok(code) => {
+                failure = Some(anyhow::anyhow!(
+                    "provision step failed (exit {}): {}",
+                    code,
+                    step
+                ));
+                break;
+            }
+            Err(e) => {
+                failure = Some(e.context(format!("running provision step: {}", step)));
+                break;
+            }
+        }
+    }
+
+    // Tear down the support services and stop the VM (mirroring `run_command`), then — only on
+    // success — save the resulting disk state as the layer index. Saving via the temp path the
+    // caller chose lets it publish the layer atomically.
+    let BootedVm {
+        sandbox,
+        proxy_handle,
+        fwd_handle,
+        nbd_handle,
+        ..
+    } = booted;
+    drop(proxy_handle);
+    drop(fwd_handle);
+    let _ = sandbox.stop();
+
+    let result = match failure {
+        Some(e) => Err(e),
+        None => match &nbd_handle {
+            Some(h) => h
+                .save_checkpoint(out_index)
+                .context("saving provisioned layer"),
+            None => Err(anyhow::anyhow!(
+                "provisioning requires CAS storage; DOME_STORAGE=direct is not supported"
+            )),
+        },
+    };
+    drop(nbd_handle);
+    let _ = std::fs::remove_dir_all(&prepared.instance_dir);
+    result
 }
 
 /// Pure string validation — no filesystem access. Separated from `parse_mount_spec`

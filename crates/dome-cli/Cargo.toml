@@ -17,6 +17,7 @@ dome-proto = { path = "../dome-proto" }
 dome-proxy = { path = "../dome-proxy" }
 dome-store = { path = "../dome-store" }
 blake3 = "1"
+sha2 = "0.10"
 clap = { version = "4", features = ["derive", "env"] }
 anyhow = "1"
 libc = "0.2"

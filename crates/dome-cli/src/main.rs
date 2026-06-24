@@ -5,6 +5,7 @@ mod config;
 mod daemon;
 mod gc;
 mod lock;
+mod provision;
 mod retention;
 mod sandbox;
 mod sandbox_config;
@@ -58,7 +59,29 @@ fn main() -> Result<()> {
                 &cfg,
                 &vm,
             )?;
-            let prepared = vm::prepare_vm(&resolved, &vm, from.as_deref(), None)?;
+
+            // Declarative provisioning: when the project declares a `provision` block and no
+            // explicit `--from` was given, resolve (building once if uncached) the cached
+            // toolchain layer and seed this ephemeral run from it. `--from` composition with a
+            // provisioned layer is a later slice, so an explicit seed wins here.
+            let provision_seed = match (from.as_deref(), &resolved.provision) {
+                (None, Some(spec)) => provision::ensure_layer(
+                    &default_data_dir(),
+                    assets::CURRENT_VERSION,
+                    spec,
+                    resolved.disk_size.unwrap_or(4096),
+                    &vm,
+                    &provision::VmStepRunner,
+                )?,
+                _ => None,
+            };
+            let prepared = vm::prepare_vm(
+                &resolved,
+                &vm,
+                from.as_deref(),
+                provision_seed.as_deref(),
+                None,
+            )?;
 
             let result = if stdio {
                 let r = stdio::run_stdio(&prepared);
