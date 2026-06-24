@@ -64,9 +64,32 @@ pub(crate) fn run_sandbox(
         reject_disk_size_on_existing(&name)?;
     }
 
+    // Declarative provisioning: when the project declares a `provision` block and this is a
+    // brand-new sandbox with no explicit `--from`, resolve (building once if uncached) the
+    // cached toolchain layer here in the front-end — so the cold-build banner and live step
+    // output are visible to the user — and hand the worker the layer to seed the new sandbox
+    // index from. `--from` composition with a provisioned layer is a later slice, so an
+    // explicit seed wins. The per-hash lock inside `ensure_layer` dedups concurrent builds.
+    let provision_seed = if from.is_none() && !Path::new(&index_path).exists() {
+        let resolved = ResolvedConfig::resolve(&ResolvedConfig::default(), &cfg, vm_args)?;
+        match &resolved.provision {
+            Some(spec) => crate::provision::ensure_layer(
+                &data_dir,
+                assets::CURRENT_VERSION,
+                spec,
+                resolved.disk_size.unwrap_or(4096),
+                vm_args,
+                &crate::provision::VmStepRunner,
+            )?,
+            None => None,
+        }
+    } else {
+        None
+    };
+
     // The boot spec is consumed by the worker only on a cold boot; it captures exactly
     // what this invocation would have booted (resolved name, seed, cwd, and VM flags).
-    let boot = worker::BootSpec::new(&name, from, &cwd, vm_args)?;
+    let boot = worker::BootSpec::new(&name, from, provision_seed.as_deref(), &cwd, vm_args)?;
 
     // Flags always win: any config flag passed to an *existing* sandbox resolves into and
     // updates its sidecar before we attach, so a cold boot reproduces from the new values.
@@ -174,13 +197,24 @@ pub(crate) fn prepare_sandbox_source(
     data_dir: &str,
     vm_args: &VmArgs,
     from: Option<&str>,
+    provision_seed: Option<&str>,
 ) -> Result<SandboxSource> {
     dome_vm::validate_checkpoint_name(name).map_err(|e| anyhow::anyhow!(e))?;
     let index_path = format!("{}/sandboxes/{}.idx", data_dir, name);
 
     let existed = Path::new(&index_path).exists();
     match gate_from(from, existed, true) {
-        FromGate::NoSeed => {}
+        FromGate::NoSeed => {
+            // No explicit `--from`. A brand-new sandbox with a provisioned layer is seeded
+            // from that cached toolchain layer (built by the CLI front-end) rather than the
+            // bare base, so it boots with the toolchain present. An existing sandbox is left
+            // pinned to whatever it already rides.
+            if !existed {
+                if let Some(layer_idx) = provision_seed {
+                    seed_sandbox_index(layer_idx, &index_path)?;
+                }
+            }
+        }
         FromGate::Seed(seed_name) => {
             let seed_idx = resolve_seed_index(seed_name, data_dir)?;
             seed_sandbox_index(&seed_idx, &index_path)?;
@@ -263,11 +297,34 @@ pub(crate) fn create_sandbox(
             Some(mb)
         }
         None => {
-            let base_path = ensure_current_base(&data_dir, vm_args)?;
             let disk_size_mb = vm_args.disk_size.or(cfg.disk_size).unwrap_or(4096);
-            materialize_from_base(&index_path, &base_path, disk_size_mb)?;
-            eprintln!("dome: created sandbox '{}'", name);
-            None
+            // Declarative provisioning: when the project declares a `provision` block, seed
+            // the new sandbox from the cached toolchain layer (built once, in the foreground
+            // where the banner is visible) rather than the bare base. The seeded disk's real
+            // size is stamped onto the sidecar below, the same as a `--from` clone.
+            let resolved = ResolvedConfig::resolve(&ResolvedConfig::default(), &cfg, vm_args)?;
+            let layer = match &resolved.provision {
+                Some(spec) => crate::provision::ensure_layer(
+                    &data_dir,
+                    assets::CURRENT_VERSION,
+                    spec,
+                    disk_size_mb,
+                    vm_args,
+                    &crate::provision::VmStepRunner,
+                )?,
+                None => None,
+            };
+            if let Some(layer_idx) = layer {
+                seed_sandbox_index(&layer_idx, &index_path)?;
+                let mb = dome_store::ChunkIndex::load(&index_path)?.disk_size() / (1024 * 1024);
+                eprintln!("dome: created sandbox '{}' (provisioned)", name);
+                Some(mb)
+            } else {
+                let base_path = ensure_current_base(&data_dir, vm_args)?;
+                materialize_from_base(&index_path, &base_path, disk_size_mb)?;
+                eprintln!("dome: created sandbox '{}'", name);
+                None
+            }
         }
     };
 

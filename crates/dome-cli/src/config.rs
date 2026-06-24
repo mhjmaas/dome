@@ -15,6 +15,9 @@ pub(crate) struct DomeConfig {
     pub command: Option<Vec<String>>,
     pub secrets: Option<HashMap<String, SecretEntry>>,
     pub network: Option<NetworkEntry>,
+    /// Declarative toolchain provisioning: steps run once in a build VM and cached as a
+    /// hidden, hash-keyed checkpoint layer that later sandbox/`run` creations seed from.
+    pub provision: Option<ProvisionEntry>,
     /// Host ports to expose to the guest (e.g. "3000:8080" or "5432").
     pub expose_host: Option<Vec<String>>,
     /// Persistent sandbox name for this project. Used by `dome sandbox` when no
@@ -41,6 +44,21 @@ pub(crate) struct SecretEntry {
 #[derive(Debug, Clone, Default, Deserialize)]
 pub(crate) struct NetworkEntry {
     /// Allowed domain patterns. Empty or absent = allow all.
+    pub allow: Option<Vec<String>>,
+}
+
+/// Declarative toolchain provisioning. The `steps` run once (as root, sequentially,
+/// stop-on-first-failure) inside a build VM whose result is snapshotted as a hidden
+/// checkpoint keyed by a hash of the spec; later sandbox/`run` creations seed from that
+/// cached layer. `allow` is the *provision-time* network allow-list, separate from the
+/// runtime `network.allow` (empty/unset = all allowed). Installs the toolchain only
+/// (node, pnpm, gcc, python3) — project-dependency installs belong in the live sandbox.
+#[derive(Debug, Clone, Default, Deserialize)]
+pub(crate) struct ProvisionEntry {
+    /// Ordered shell commands run as root inside the build VM, each via `sh -c`.
+    #[serde(default)]
+    pub steps: Vec<String>,
+    /// Provision-time network allow-list. Empty/absent = all allowed.
     pub allow: Option<Vec<String>>,
 }
 

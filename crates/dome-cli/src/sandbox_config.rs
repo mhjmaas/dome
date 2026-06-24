@@ -90,6 +90,17 @@ impl ProxyResolved {
     }
 }
 
+/// A resolved provisioning spec: the ordered toolchain steps and the provision-time
+/// network allow-list, both fully resolved from `dome.json`. Persisted in the sidecar so a
+/// reload/heal carries it forward; the cache key for the provisioned layer is derived from
+/// it (see [`crate::provision::cache_key`]).
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(default)]
+pub(crate) struct ProvisionSpec {
+    pub steps: Vec<String>,
+    pub allow: Vec<String>,
+}
+
 /// The single structured, versioned resolved config: both the sidecar schema and the input
 /// to VM preparation. Holds parsed, validated VM-shape values resolved once from
 /// `defaults <- dome.json <- flags`. Scalars stay `Option` (an unset scalar means "use the
@@ -107,6 +118,10 @@ pub(crate) struct ResolvedConfig {
     pub ports: Vec<String>,
     pub mounts: Vec<String>,
     pub proxy: ProxyResolved,
+    /// Declarative toolchain provisioning, resolved from `dome.json`. `None` when the
+    /// project declares no `provision` block (the common case — boot from the bare base).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub provision: Option<ProvisionSpec>,
 }
 
 impl Default for ResolvedConfig {
@@ -121,6 +136,7 @@ impl Default for ResolvedConfig {
             ports: Vec::new(),
             mounts: Vec::new(),
             proxy: ProxyResolved::default(),
+            provision: None,
         }
     }
 }
@@ -204,6 +220,19 @@ impl ResolvedConfig {
             base.proxy.secrets.clone()
         };
 
+        // Provisioning has no flag layer in this slice: it is resolved straight from
+        // `dome.json` (a declared `provision` block wins), falling back to the base/sidecar
+        // so a heal/reload carries a previously-resolved spec forward. A block with no
+        // steps resolves to `None` — there is nothing to provision.
+        let provision = match &dome.provision {
+            Some(p) if !p.steps.is_empty() => Some(ProvisionSpec {
+                steps: p.steps.clone(),
+                allow: p.allow.clone().unwrap_or_default(),
+            }),
+            Some(_) => None,
+            None => base.provision.clone(),
+        };
+
         Ok(Self {
             version: SIDECAR_VERSION,
             cpus,
@@ -218,6 +247,7 @@ impl ResolvedConfig {
                 allow,
                 expose_host,
             },
+            provision,
         })
     }
 
@@ -576,7 +606,7 @@ fn list_conflict(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::config::{NetworkEntry, SecretEntry};
+    use crate::config::{NetworkEntry, ProvisionEntry, SecretEntry};
     use std::collections::HashMap;
 
     fn vm(mut f: impl FnMut(&mut VmArgs)) -> VmArgs {
@@ -839,6 +869,56 @@ mod tests {
             r.mounts,
             vec!["/a:/a".to_string()],
             "a base list with no higher layer is inherited"
+        );
+    }
+
+    #[test]
+    fn resolve_provision_from_dome_json_and_empty_steps_is_none() {
+        // A declared provision block with steps + allow resolves into the sidecar.
+        let dome = DomeConfig {
+            provision: Some(ProvisionEntry {
+                steps: vec![
+                    "apt-get update && apt-get install -y nodejs".into(),
+                    "curl -fsSL https://get.pnpm.io/install.sh | sh -".into(),
+                ],
+                allow: Some(vec!["deb.debian.org".into(), "get.pnpm.io".into()]),
+            }),
+            ..Default::default()
+        };
+        let r =
+            ResolvedConfig::resolve(&ResolvedConfig::default(), &dome, &VmArgs::default()).unwrap();
+        let p = r.provision.expect("a declared provision block resolves");
+        assert_eq!(p.steps.len(), 2);
+        assert_eq!(
+            p.allow,
+            vec!["deb.debian.org".to_string(), "get.pnpm.io".into()]
+        );
+
+        // A block with no steps is nothing to provision → None.
+        let dome = DomeConfig {
+            provision: Some(ProvisionEntry {
+                steps: vec![],
+                allow: Some(vec!["x".into()]),
+            }),
+            ..Default::default()
+        };
+        let r =
+            ResolvedConfig::resolve(&ResolvedConfig::default(), &dome, &VmArgs::default()).unwrap();
+        assert!(r.provision.is_none(), "empty steps resolve to no provision");
+
+        // With no dome.json opinion, a base-carried spec is inherited (heal/reload path).
+        let base = ResolvedConfig {
+            provision: Some(ProvisionSpec {
+                steps: vec!["echo hi".into()],
+                allow: vec![],
+            }),
+            ..Default::default()
+        };
+        let r = ResolvedConfig::resolve(&base, &DomeConfig::default(), &VmArgs::default()).unwrap();
+        assert_eq!(
+            r.provision.unwrap().steps,
+            vec!["echo hi".to_string()],
+            "an omitted dome.json provision inherits the base spec"
         );
     }
 

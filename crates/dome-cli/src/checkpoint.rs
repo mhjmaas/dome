@@ -35,7 +35,7 @@ pub(crate) fn create(
 
     // A checkpoint run is ephemeral in spirit: resolve `dome.json` + flags once, persist nothing.
     let resolved = ResolvedConfig::resolve(&ResolvedConfig::default(), &cfg, vm_args)?;
-    let prepared = vm::prepare_vm(&resolved, vm_args, from, None)?;
+    let prepared = vm::prepare_vm(&resolved, vm_args, from, None, None)?;
     run_session(&prepared, &command, &SaveTarget::Checkpoint { name })
 }
 

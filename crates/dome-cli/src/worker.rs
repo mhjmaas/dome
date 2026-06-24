@@ -150,6 +150,12 @@ pub(crate) struct BootSpec {
     pub name: String,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub from: Option<String>,
+    /// Path to a cached provisioned layer index to seed a brand-new sandbox from (resolved
+    /// and built by the CLI front-end so the cold-build banner is visible to the user). The
+    /// worker seeds the new sandbox index from it on a lazy first boot; ignored once the
+    /// sandbox exists. Absent when the project declares no `provision` block.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub provision_seed: Option<String>,
     pub cwd: String,
     pub vm_args: VmArgs,
 }
@@ -159,12 +165,14 @@ impl BootSpec {
     pub(crate) fn new(
         name: &str,
         from: Option<&str>,
+        provision_seed: Option<&str>,
         cwd: &Path,
         vm_args: &VmArgs,
     ) -> Result<Self> {
         Ok(Self {
             name: name.to_string(),
             from: from.map(|s| s.to_string()),
+            provision_seed: provision_seed.map(|s| s.to_string()),
             cwd: cwd.to_string_lossy().to_string(),
             // VmArgs is cheap, plain data; serialize via its serde derives by cloning
             // through JSON so we don't have to thread a borrow through the wire types.
@@ -588,8 +596,13 @@ fn boot_and_serve(name: &str, data_dir: &str) -> Result<()> {
     // Resolve (creating/seeding/pinning) the CAS source, then prepare and boot the VM. The
     // CAS source resolution still needs the session/env flags (kernel/rootfs/disk-size) the
     // attaching invocation carried; the VM shape itself comes from the resolved sidecar.
-    let source =
-        sandbox::prepare_sandbox_source(name, data_dir, &boot.vm_args, boot.from.as_deref())?;
+    let source = sandbox::prepare_sandbox_source(
+        name,
+        data_dir,
+        &boot.vm_args,
+        boot.from.as_deref(),
+        boot.provision_seed.as_deref(),
+    )?;
 
     if lazy_first_boot {
         // disk_size follows the disk, not dome.json/flags: a `--from` clone's disk is fixed by
@@ -619,7 +632,7 @@ fn boot_and_serve(name: &str, data_dir: &str) -> Result<()> {
     }
     resolved.save_live(data_dir, name);
 
-    let prepared = vm::prepare_vm(&resolved, &boot.vm_args, None, Some(&source))?;
+    let prepared = vm::prepare_vm(&resolved, &boot.vm_args, None, None, Some(&source))?;
     let instance_dir = prepared.instance_dir.clone();
 
     let booted = vm::boot_vm(&prepared)?;
@@ -1254,7 +1267,8 @@ mod tests {
             mount: vec!["./src:/work".to_string()],
             ..Default::default()
         };
-        let spec = BootSpec::new("web", Some("base"), Path::new("/home/dev/proj"), &vm).unwrap();
+        let spec =
+            BootSpec::new("web", Some("base"), None, Path::new("/home/dev/proj"), &vm).unwrap();
         let value = spec.to_value().unwrap();
         let back: BootSpec = serde_json::from_value(value).unwrap();
         assert_eq!(back.name, "web");
