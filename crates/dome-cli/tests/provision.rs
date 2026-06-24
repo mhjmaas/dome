@@ -67,7 +67,9 @@ fn layer_paths() -> std::collections::HashSet<std::path::PathBuf> {
 }
 
 /// The single layer published between `before` and now (panics if not exactly one appeared).
-fn newly_published_layer(before: &std::collections::HashSet<std::path::PathBuf>) -> std::path::PathBuf {
+fn newly_published_layer(
+    before: &std::collections::HashSet<std::path::PathBuf>,
+) -> std::path::PathBuf {
     let after = layer_paths();
     let mut new_layers = after.difference(before);
     let layer = new_layers

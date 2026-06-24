@@ -154,6 +154,12 @@ if [ -n "${DOME_SANDBOX:-}" ]; then
 else
     PS1="[sandbox] \w \$ "
 fi
+# Directory auto-activation subdir landing: when the host dropped in from a subdirectory of
+# the project, the worker sets DOME_LAND_CWD to the mapped guest path. cd there so the shell
+# lands where the developer was, falling back to the default dir if it is not mounted.
+if [ -n "${DOME_LAND_CWD:-}" ] && [ -d "${DOME_LAND_CWD}" ]; then
+    cd "${DOME_LAND_CWD}"
+fi
 DOMEPROFILE
 
             rm -rf /mnt/rootfs/usr/share/doc/* /mnt/rootfs/usr/share/man/* /mnt/rootfs/usr/share/info/*
@@ -218,6 +224,12 @@ if [ -n "${DOME_SANDBOX:-}" ]; then
     PS1="[sandbox:${DOME_SANDBOX}] \w \$ "
 else
     PS1="[sandbox] \w \$ "
+fi
+# Directory auto-activation subdir landing: when the host dropped in from a subdirectory of
+# the project, the worker sets DOME_LAND_CWD to the mapped guest path. cd there so the shell
+# lands where the developer was, falling back to the default dir if it is not mounted.
+if [ -n "${DOME_LAND_CWD:-}" ] && [ -d "${DOME_LAND_CWD}" ]; then
+    cd "${DOME_LAND_CWD}"
 fi
 DOMEPROFILE
 

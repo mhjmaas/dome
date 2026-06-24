@@ -32,6 +32,7 @@ pub(crate) fn run_sandbox(
     command: Vec<String>,
     from: Option<&str>,
     rebuild: bool,
+    land_cwd: Option<&str>,
 ) -> Result<i32> {
     reject_direct_storage()?;
 
@@ -124,6 +125,7 @@ pub(crate) fn run_sandbox(
         effective_from,
         provision_seed.as_deref(),
         &cwd,
+        land_cwd,
         vm_args,
     )?;
 
