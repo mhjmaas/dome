@@ -39,6 +39,27 @@ fn daemon_status() -> String {
     String::from_utf8_lossy(&out.stdout).into_owned()
 }
 
+/// The number of live workers domed reports, or 0 when it is down. Used for RELATIVE checks:
+/// the full `just test-vm` suite leaves other sandboxes' persistent VMs running (a `sandbox
+/// run` keeps its worker alive by design), so an absolute `workers: 0`/`workers: 1` assertion
+/// is only valid in isolation. Asserting on the delta this test causes is robust either way.
+fn worker_count() -> usize {
+    daemon_status()
+        .lines()
+        .find_map(|l| l.trim().strip_prefix("workers:"))
+        .and_then(|n| n.trim().parse().ok())
+        .unwrap_or(0)
+}
+
+/// Whether this sandbox's worker process is still alive (independent of domed's bookkeeping).
+fn worker_process_alive(name: &str) -> bool {
+    Command::new("pgrep")
+        .args(["-f", &format!("__worker {}", name)])
+        .output()
+        .map(|o| o.status.success() && !o.stdout.is_empty())
+        .unwrap_or(false)
+}
+
 /// Stop the per-sandbox worker (no user-facing `sandbox stop` until #27): send it
 /// SIGTERM, which it handles by saving and shutting the VM down cleanly. Best-effort.
 fn stop_worker(name: &str) {
@@ -170,11 +191,18 @@ fn domed_restart_readopts_the_running_worker() {
         String::from_utf8_lossy(&s2.stdout)
     );
 
-    // domed is back up and reports the single re-adopted worker (not two — no cold boot).
-    let status = daemon_status();
+    // domed is back up and tracks the re-adopted worker. The tmpfs marker above already proves
+    // it is the SAME VM (not a cold boot); here we just confirm domed re-adopted at least one
+    // worker. (An absolute count would be wrong under the full suite, which leaves other
+    // sandboxes' VMs running.)
     assert!(
-        status.contains("workers: 1"),
-        "the restarted domed must re-adopt the surviving worker; status:\n{status}"
+        worker_process_alive(&name),
+        "the surviving worker process must still be running after the domed restart"
+    );
+    assert!(
+        worker_count() >= 1,
+        "the restarted domed must re-adopt the surviving worker; status:\n{}",
+        daemon_status()
     );
 
     cleanup(&name);
@@ -190,12 +218,20 @@ fn stopping_the_worker_releases_the_vm() {
     let run = sandbox_run(&name, "true");
     assert!(run.status.success());
 
+    let before = worker_count();
     stop_worker(&name);
 
-    let status = daemon_status();
+    // This sandbox's VM is gone: its worker process exited, and domed's count dropped by one.
+    // (An absolute `workers: 0` would be wrong under the full suite — other sandboxes' VMs may
+    // still be running — so assert on this worker specifically plus the count delta.)
     assert!(
-        status.contains("workers: 0") || status.contains("daemon is down"),
-        "after stopping the worker the VM should be gone; status:\n{status}"
+        !worker_process_alive(&name),
+        "after stopping the worker its process should be gone"
+    );
+    let after = worker_count();
+    assert!(
+        after < before,
+        "stopping the worker must release its VM (worker count {before} -> {after})"
     );
 
     cleanup(&name);

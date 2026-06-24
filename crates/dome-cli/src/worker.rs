@@ -1117,8 +1117,13 @@ pub(crate) fn attach_and_relay(
         let writer = stream.try_clone().context("cloning worker socket")?;
         Ok(dome_vm::client::run_pty_client(writer, stream, stdin_fd))
     } else {
-        Ok(dome_vm::client::run_piped_client(
+        // Forward host stdin to the guest (and EOF when it closes), same as the in-process
+        // `dome run` path: the worker splices the STDIN frames and the half-close through to
+        // the guest, so a piped command (`… | dome sandbox run -- cat`) or a bare shell sees
+        // its input and a clean EOF instead of blocking forever.
+        Ok(dome_vm::client::run_piped_client_with_stdin(
             stream,
+            std::io::stdin(),
             &mut std::io::stdout(),
             &mut std::io::stderr(),
         ))

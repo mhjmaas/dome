@@ -48,13 +48,37 @@ fn run_in(project_dir: &Path, guest_cmd: &str) -> std::process::Output {
 
 /// The number of published layer indexes currently on disk.
 fn published_layers() -> usize {
+    layer_paths().len()
+}
+
+/// The set of published layer index paths currently on disk. Used to pin down the layer a
+/// given run published by diffing before/after: the provision cache is global and accumulates
+/// layers from other tests and prior runs, so picking "the first `.idx`" would grab an
+/// arbitrary unrelated layer.
+fn layer_paths() -> std::collections::HashSet<std::path::PathBuf> {
     std::fs::read_dir(provision_dir())
         .map(|rd| {
             rd.filter_map(|e| e.ok())
-                .filter(|e| e.path().extension().and_then(|x| x.to_str()) == Some("idx"))
-                .count()
+                .map(|e| e.path())
+                .filter(|p| p.extension().and_then(|x| x.to_str()) == Some("idx"))
+                .collect()
         })
-        .unwrap_or(0)
+        .unwrap_or_default()
+}
+
+/// The single layer published between `before` and now (panics if not exactly one appeared).
+fn newly_published_layer(before: &std::collections::HashSet<std::path::PathBuf>) -> std::path::PathBuf {
+    let after = layer_paths();
+    let mut new_layers = after.difference(before);
+    let layer = new_layers
+        .next()
+        .cloned()
+        .expect("a newly published layer index");
+    assert!(
+        new_layers.next().is_none(),
+        "expected exactly one newly published layer for this spec"
+    );
+    layer
 }
 
 /// Cold build on first `run`, cache-hit on the second: the toolchain is present both times,
@@ -64,6 +88,7 @@ fn published_layers() -> usize {
 fn cold_build_then_second_run_is_a_cache_hit() {
     let marker = format!("prov-{}", std::process::id());
     let project = project_with_provision(&marker);
+    let layers_before = layer_paths();
 
     // First run: cold build. The step ran in the build VM, so the marker is present.
     let first = run_in(project.path(), &format!("cat /opt/{marker}"));
@@ -79,21 +104,9 @@ fn cold_build_then_second_run_is_a_cache_hit() {
         String::from_utf8_lossy(&first.stderr),
     );
 
-    // The layer was published as a hidden checkpoint under provision/.
-    let layers_after_first = published_layers();
-    assert!(
-        layers_after_first >= 1,
-        "the cold build must publish a provision/<hash>.idx layer"
-    );
-
-    // Find the layer this spec keyed to and capture its mtime, so we can prove the second
-    // run does not rebuild it.
-    let layer = std::fs::read_dir(provision_dir())
-        .unwrap()
-        .filter_map(|e| e.ok())
-        .map(|e| e.path())
-        .find(|p| p.extension().and_then(|x| x.to_str()) == Some("idx"))
-        .expect("a published layer index");
+    // The cold build published exactly one new layer under provision/. Capture it (and its
+    // mtime) so we can prove the second run does not rebuild it.
+    let layer = newly_published_layer(&layers_before);
     let mtime_before = std::fs::metadata(&layer).unwrap().modified().unwrap();
 
     // Second run on the same spec: cache hit. The marker is still present (booted from the
@@ -233,7 +246,7 @@ fn provision_secret_is_substituted_only_for_the_matched_host() {
         r#"{{
   "provision": {{
     "allow": ["postman-echo.com"],
-    "secrets": {{ "echo": {{ "from": "ECHO_TOKEN", "hosts": ["postman-echo.com"] }} }},
+    "secrets": {{ "ECHO_TOKEN": {{ "from": "ECHO_TOKEN", "hosts": ["postman-echo.com"] }} }},
     "steps": [
       "test \"$ECHO_TOKEN\" != real-secret-value && echo placeholder-only > /opt/{marker}.guest",
       "curl -sS -H \"Authorization: $ECHO_TOKEN\" https://postman-echo.com/get > /opt/{marker}.echo",
@@ -309,6 +322,7 @@ fn provision_secret_is_substituted_only_for_the_matched_host() {
 fn rebuild_forces_a_fresh_build_and_list_shows_the_layer() {
     let marker = format!("prov-rebuild-{}", std::process::id());
     let project = project_with_provision(&marker);
+    let layers_before = layer_paths();
 
     // First run: cold build publishes the layer.
     let first = run_in(project.path(), &format!("cat /opt/{marker}"));
@@ -318,12 +332,7 @@ fn rebuild_forces_a_fresh_build_and_list_shows_the_layer() {
         String::from_utf8_lossy(&first.stderr)
     );
 
-    let layer = std::fs::read_dir(provision_dir())
-        .unwrap()
-        .filter_map(|e| e.ok())
-        .map(|e| e.path())
-        .find(|p| p.extension().and_then(|x| x.to_str()) == Some("idx"))
-        .expect("a published layer index");
+    let layer = newly_published_layer(&layers_before);
     let mtime_before = std::fs::metadata(&layer).unwrap().modified().unwrap();
 
     // `dome provision list` shows the cached layer (and not via `checkpoint list`).
@@ -416,6 +425,7 @@ fn provision_composes_on_top_of_a_seeded_checkpoint() {
     let project = project_with_provision(&prov_marker);
 
     // 3. Create the sandbox composing the provision steps on top of the seed checkpoint.
+    let layers_before = layer_paths();
     let create = Command::new(dome_bin())
         .current_dir(project.path())
         .args(["sandbox", "create", &sandbox, "--from", &ckpt])
@@ -426,6 +436,16 @@ fn provision_composes_on_top_of_a_seeded_checkpoint() {
         "composed sandbox create should succeed; stderr: {}",
         String::from_utf8_lossy(&create.stderr)
     );
+    // The composed layer this create published — identified so the regression check below can
+    // scope its assertion to OUR layer rather than any pre-existing broken layer in the shared
+    // provision cache (the cache accumulates across runs, and a pre-flatten-fix layer would
+    // otherwise make the check spuriously fail).
+    let our_layer = newly_published_layer(&layers_before);
+    let our_layer_file = our_layer
+        .file_name()
+        .and_then(|s| s.to_str())
+        .expect("layer file name")
+        .to_string();
 
     // 4. Both markers must be present: the seed's content survived AND provisioning layered the
     //    toolchain marker on top.
@@ -481,10 +501,14 @@ fn provision_composes_on_top_of_a_seeded_checkpoint() {
         prune.status.success(),
         "prune should succeed after the seed is gone; stderr: {prune_err}"
     );
+    // Scope the check to OUR layer: prune may warn about unrelated pre-existing broken layers
+    // in the shared cache, but it must NOT report ours as dangling once its seed is deleted.
     assert!(
-        !prune_err.contains("skipping unreadable index"),
-        "the composed layer must be self-contained: prune found a dangling parent after the \
-         seed checkpoint was deleted; stderr: {prune_err}"
+        !prune_err
+            .lines()
+            .any(|l| l.contains("skipping unreadable index") && l.contains(&our_layer_file)),
+        "the composed layer must be self-contained: prune found a dangling parent for our layer \
+         ({our_layer_file}) after the seed checkpoint was deleted; stderr: {prune_err}"
     );
     // The composed sandbox (which flattened the layer at seed time) still runs after the prune.
     let after = Command::new(dome_bin())

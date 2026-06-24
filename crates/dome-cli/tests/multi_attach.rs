@@ -70,6 +70,20 @@ fn ls_attached(name: &str) -> Option<usize> {
     cols.get(state_idx + 1)?.parse::<usize>().ok()
 }
 
+/// Poll `cond` every 250ms until it returns true or `secs` elapses; returns whether it became
+/// true. Cold-boot latency varies (and rises when other suite VMs are live), so a fixed sleep
+/// before reading `ls` is flaky — poll for the state we expect instead.
+fn wait_until(secs: u64, cond: impl Fn() -> bool) -> bool {
+    let deadline = std::time::Instant::now() + Duration::from_secs(secs);
+    while std::time::Instant::now() < deadline {
+        if cond() {
+            return true;
+        }
+        std::thread::sleep(Duration::from_millis(250));
+    }
+    cond()
+}
+
 /// Stop the per-sandbox worker (no user-facing `sandbox stop` until #27): SIGTERM it so
 /// it saves + tears the VM down cleanly. Best-effort.
 fn stop_worker(name: &str) {
@@ -106,7 +120,13 @@ fn second_terminal_attaches_to_the_same_live_vm_and_sees_its_writes() {
             "--",
             "sh",
             "-c",
-            "echo from-terminal-a > /root/shared.txt; sleep 8",
+            // The sleep keeps A attached through B's checks. It runs in GUEST time *after* boot,
+            // so it gives a fixed attached window regardless of how long the cold boot took. A
+            // generous window keeps the poll below non-flaky even under full-suite load. A ends
+            // when this command exits — we wait it out below, which is what drains the attached
+            // count back to 0 (killing the host client would leave the guest sleep running, so
+            // the session — and the count — would linger).
+            "echo from-terminal-a > /root/shared.txt; sleep 20",
         ])
         .stdin(Stdio::null())
         .stdout(Stdio::null())
@@ -114,19 +134,19 @@ fn second_terminal_attaches_to_the_same_live_vm_and_sees_its_writes() {
         .spawn()
         .expect("failed to spawn terminal A");
 
-    // Give A time to cold-boot the VM and write the file before B attaches.
-    std::thread::sleep(Duration::from_secs(6));
-
-    // While A is still attached, `ls` must show the sandbox running with >=1 terminal.
+    // Wait (polling) for A to cold-boot and attach: `ls` must show the sandbox running with at
+    // least one attached terminal. Cold boots aren't instant — especially with other suite VMs
+    // live — so poll rather than sleep a fixed interval.
+    assert!(
+        wait_until(60, || ls_attached(&name).unwrap_or(0) >= 1),
+        "ls should report at least one attached terminal while A is live; got {:?}, state {:?}",
+        ls_attached(&name),
+        ls_state(&name)
+    );
     assert_eq!(
         ls_state(&name).as_deref(),
         Some("running"),
         "the sandbox should be running while terminal A is attached"
-    );
-    assert!(
-        ls_attached(&name).unwrap_or(0) >= 1,
-        "ls should report at least one attached terminal while A is live; got {:?}",
-        ls_attached(&name)
     );
 
     // Terminal B attaches to the SAME live VM (A is still running, so this is not a cold
@@ -143,20 +163,21 @@ fn second_terminal_attaches_to_the_same_live_vm_and_sees_its_writes() {
         String::from_utf8_lossy(&b.stdout)
     );
 
-    // Let terminal A finish; both terminals are now closed.
+    // Let terminal A's command finish so its session ends cleanly; both terminals are now
+    // closed. (B already detached when its `cat` returned.)
     let _ = a.wait();
-    std::thread::sleep(Duration::from_secs(1));
 
-    // The VM stays up after every terminal closes: still running, zero attached.
+    // The VM stays up after every terminal closes: still running, and the attached count
+    // drains back to 0 (poll — the worker observes the session end asynchronously).
+    assert!(
+        wait_until(15, || ls_attached(&name) == Some(0)),
+        "ls should report 0 attached once every terminal has detached; got {:?}",
+        ls_attached(&name)
+    );
     assert_eq!(
         ls_state(&name).as_deref(),
         Some("running"),
         "closing all terminals must leave the VM running"
-    );
-    assert_eq!(
-        ls_attached(&name),
-        Some(0),
-        "ls should report 0 attached once every terminal has detached"
     );
 
     // And a later attach still hits that same live VM.
