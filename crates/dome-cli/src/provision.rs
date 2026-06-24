@@ -28,17 +28,25 @@ use anyhow::{Context, Result};
 use sha2::{Digest, Sha256};
 
 use crate::cli::VmArgs;
-use crate::sandbox_config::{ProvisionSpec, ResolvedConfig};
+use crate::sandbox_config::{ProvisionSpec, ResolvedConfig, SecretSpec};
 
 /// Compute the content hash that keys a provisioned layer:
-/// `sha256(base identity ‖ normalized steps ‖ provision.allow)`.
+/// `sha256(base identity ‖ normalized steps ‖ provision.allow ‖ secret mappings)`.
 ///
 /// The base identity is the CLI VERSION string (the bare base image is version-pinned), so a
 /// new dome release rebuilds layers rather than serving one baked against an older base.
 /// Steps are framed length-prefixed and hashed in order, so the key is **order-sensitive** on
 /// steps; the allow-list is framed the same way, so the key is **sensitive to `allow`** too.
-/// (Seed identity for `--from` composition is #E; the secret mapping joins the key in #C.)
-pub(crate) fn cache_key(version: &str, steps: &[String], allow: &[String]) -> String {
+/// Each secret's *mapping* (`name + from + hosts`) joins the key — so re-pointing a secret to a
+/// different env var or host rebuilds — but the secret **value never enters the key** (it isn't
+/// even available here: a [`SecretSpec`] carries the mapping only). (Seed identity for `--from`
+/// composition is #E.)
+pub(crate) fn cache_key(
+    version: &str,
+    steps: &[String],
+    allow: &[String],
+    secrets: &[SecretSpec],
+) -> String {
     let mut hasher = Sha256::new();
     // Length-prefix every field so no concatenation of inputs can collide with another
     // (e.g. steps ["ab","c"] must not hash the same as ["a","bc"]).
@@ -55,6 +63,21 @@ pub(crate) fn cache_key(version: &str, steps: &[String], allow: &[String]) -> St
     for a in allow {
         hasher.update((a.len() as u64).to_le_bytes());
         hasher.update(a.as_bytes());
+    }
+    // Secret mappings: name + from + hosts, framed so re-pointing a secret rebuilds the layer.
+    // The value is deliberately absent — only the mapping affects the key.
+    hasher.update(b"secrets");
+    hasher.update((secrets.len() as u64).to_le_bytes());
+    for s in secrets {
+        for field in [&s.name, &s.from] {
+            hasher.update((field.len() as u64).to_le_bytes());
+            hasher.update(field.as_bytes());
+        }
+        hasher.update((s.hosts.len() as u64).to_le_bytes());
+        for h in &s.hosts {
+            hasher.update((h.len() as u64).to_le_bytes());
+            hasher.update(h.as_bytes());
+        }
     }
     format!("{:x}", hasher.finalize())
 }
@@ -132,7 +155,7 @@ pub(crate) fn ensure_layer(
         return Ok(None);
     }
 
-    let hash = cache_key(version, &spec.steps, &spec.allow);
+    let hash = cache_key(version, &spec.steps, &spec.allow, &spec.secrets);
     let idx_path = layer_path(data_dir, &hash);
 
     // Fast path: a published layer is served instantly, without taking the lock.
@@ -353,6 +376,15 @@ mod tests {
         ProvisionSpec {
             steps: steps.iter().map(|s| s.to_string()).collect(),
             allow: allow.iter().map(|s| s.to_string()).collect(),
+            ..Default::default()
+        }
+    }
+
+    fn secret(name: &str, from: &str, hosts: &[&str]) -> SecretSpec {
+        SecretSpec {
+            name: name.to_string(),
+            from: from.to_string(),
+            hosts: hosts.iter().map(|s| s.to_string()).collect(),
         }
     }
 
@@ -360,7 +392,10 @@ mod tests {
     fn cache_key_is_deterministic() {
         let s = vec!["apt-get install -y nodejs".to_string()];
         let a = vec!["deb.debian.org".to_string()];
-        assert_eq!(cache_key("0.6.3", &s, &a), cache_key("0.6.3", &s, &a));
+        assert_eq!(
+            cache_key("0.6.3", &s, &a, &[]),
+            cache_key("0.6.3", &s, &a, &[])
+        );
     }
 
     #[test]
@@ -368,8 +403,8 @@ mod tests {
         let a = ["one".to_string(), "two".to_string()];
         let b = ["two".to_string(), "one".to_string()];
         assert_ne!(
-            cache_key("v", &a, &[]),
-            cache_key("v", &b, &[]),
+            cache_key("v", &a, &[], &[]),
+            cache_key("v", &b, &[], &[]),
             "reordering steps must change the key (order matters for a build)"
         );
     }
@@ -378,24 +413,77 @@ mod tests {
     fn cache_key_is_sensitive_to_allow_and_to_framing() {
         let steps = ["s".to_string()];
         assert_ne!(
-            cache_key("v", &steps, &["a.com".to_string()]),
-            cache_key("v", &steps, &["b.com".to_string()]),
+            cache_key("v", &steps, &["a.com".to_string()], &[]),
+            cache_key("v", &steps, &["b.com".to_string()], &[]),
             "changing the allow-list must change the key"
         );
         // Length-prefix framing means a moved boundary cannot collide: ["ab","c"] != ["a","bc"].
         let x = ["ab".to_string(), "c".to_string()];
         let y = ["a".to_string(), "bc".to_string()];
-        assert_ne!(cache_key("v", &x, &[]), cache_key("v", &y, &[]));
+        assert_ne!(cache_key("v", &x, &[], &[]), cache_key("v", &y, &[], &[]));
     }
 
     #[test]
     fn cache_key_is_sensitive_to_base_version() {
         let s = ["s".to_string()];
         assert_ne!(
-            cache_key("0.6.3", &s, &[]),
-            cache_key("0.7.0", &s, &[]),
+            cache_key("0.6.3", &s, &[], &[]),
+            cache_key("0.7.0", &s, &[], &[]),
             "the CLI VERSION is the base identity; bumping it must rebuild the layer"
         );
+    }
+
+    #[test]
+    fn cache_key_is_sensitive_to_the_secret_mapping() {
+        let s = ["s".to_string()];
+        // Re-pointing a secret to a different env var or host changes the key, so the cache
+        // never serves a layer built against a different secret wiring.
+        let base = vec![secret("npm", "NPM_TOKEN", &["registry.corp.internal"])];
+        let diff_from = vec![secret("npm", "OTHER_TOKEN", &["registry.corp.internal"])];
+        let diff_host = vec![secret("npm", "NPM_TOKEN", &["registry.other.internal"])];
+        let diff_name = vec![secret("pip", "NPM_TOKEN", &["registry.corp.internal"])];
+        assert_ne!(
+            cache_key("v", &s, &[], &base),
+            cache_key("v", &s, &[], &[]),
+            "adding a secret must change the key"
+        );
+        assert_ne!(
+            cache_key("v", &s, &[], &base),
+            cache_key("v", &s, &[], &diff_from)
+        );
+        assert_ne!(
+            cache_key("v", &s, &[], &base),
+            cache_key("v", &s, &[], &diff_host)
+        );
+        assert_ne!(
+            cache_key("v", &s, &[], &base),
+            cache_key("v", &s, &[], &diff_name)
+        );
+        // The same mapping yields the same key (determinism).
+        assert_eq!(
+            cache_key("v", &s, &[], &base),
+            cache_key(
+                "v",
+                &s,
+                &[],
+                &[secret("npm", "NPM_TOKEN", &["registry.corp.internal"])]
+            )
+        );
+    }
+
+    #[test]
+    fn cache_key_ignores_the_secret_value() {
+        // The key is computed from the {name, from, hosts} mapping only — a SecretSpec carries
+        // no value, so the real token's bytes can never enter the key. Setting/changing the
+        // env var the secret reads from must not change the layer hash.
+        let s = ["s".to_string()];
+        let secrets = vec![secret("npm", "NPM_TOKEN", &["registry.corp.internal"])];
+        std::env::set_var("NPM_TOKEN", "value-one");
+        let k1 = cache_key("v", &s, &[], &secrets);
+        std::env::set_var("NPM_TOKEN", "a-completely-different-value");
+        let k2 = cache_key("v", &s, &[], &secrets);
+        std::env::remove_var("NPM_TOKEN");
+        assert_eq!(k1, k2, "the secret value must never affect the cache key");
     }
 
     /// A fake runner that records its build calls and writes a sentinel index file, so the
@@ -484,7 +572,7 @@ mod tests {
         assert_eq!(calls.load(Ordering::SeqCst), 1, "cold build ran once");
         assert!(Path::new(&first).exists(), "the layer was published");
         // Published atomically into the per-hash path (no temp left behind).
-        let hash = cache_key("v", &s.steps, &s.allow);
+        let hash = cache_key("v", &s.steps, &s.allow, &s.secrets);
         assert_eq!(first, layer_path(data_dir, &hash).to_str().unwrap());
         let leftovers: Vec<_> = std::fs::read_dir(provision_dir(data_dir).as_path())
             .unwrap()
@@ -649,7 +737,7 @@ mod tests {
         );
         assert!(msg.contains("exit 1"), "error carries the exit code: {msg}");
 
-        let hash = cache_key("v", &s.steps, &s.allow);
+        let hash = cache_key("v", &s.steps, &s.allow, &s.secrets);
         assert!(
             !layer_path(data_dir, &hash).exists(),
             "nothing is published under the success hash after a failure"
@@ -678,7 +766,7 @@ mod tests {
         let tmp = tempfile::tempdir().unwrap();
         let data_dir = tmp.path().to_str().unwrap();
         let s = spec(&["install toolchain"], &[]);
-        let hash = cache_key("v", &s.steps, &s.allow);
+        let hash = cache_key("v", &s.steps, &s.allow, &s.secrets);
 
         // First: fail → debug disk parked, nothing published.
         let fail = FailingRunner {

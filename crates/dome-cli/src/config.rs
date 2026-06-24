@@ -60,6 +60,11 @@ pub(crate) struct ProvisionEntry {
     pub steps: Vec<String>,
     /// Provision-time network allow-list. Empty/absent = all allowed.
     pub allow: Option<Vec<String>>,
+    /// Provision-time secrets, same shape as the runtime [`SecretEntry`] map. Injected via
+    /// the egress proxy during the build: the guest only ever sees a random placeholder and
+    /// the real value is substituted on egress to the secret's matched `hosts`, which are
+    /// auto-whitelisted into the provision allow-list. Provision-only — never affects runtime.
+    pub secrets: Option<HashMap<String, SecretEntry>>,
 }
 
 /// Parse "HOST_PORT:GUEST_PORT" or "PORT" into an ExposeHostMapping.

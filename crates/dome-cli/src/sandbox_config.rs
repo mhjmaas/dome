@@ -99,6 +99,35 @@ impl ProxyResolved {
 pub(crate) struct ProvisionSpec {
     pub steps: Vec<String>,
     pub allow: Vec<String>,
+    /// Provision-time secrets (mapping only — values are never persisted, same as runtime).
+    /// Injected via the egress proxy during the build; their `hosts` are auto-whitelisted
+    /// into the build network (see [`Self::effective_allow`]).
+    pub secrets: Vec<SecretSpec>,
+}
+
+impl ProvisionSpec {
+    /// The build-time network allow-list: the declared `allow` plus every secret's `hosts`
+    /// auto-whitelisted, so a corp mirror you authenticate to need not be declared twice.
+    /// De-duplicated while preserving first-seen order.
+    ///
+    /// An empty `allow` means "all allowed" — there is nothing to whitelist *into*, and
+    /// folding the secret hosts in would wrongly narrow an open build network down to just
+    /// them. So an empty allow-list stays empty (all allowed) regardless of secrets. The
+    /// auto-whitelist applies to the provision allow-list only — runtime is untouched.
+    pub(crate) fn effective_allow(&self) -> Vec<String> {
+        if self.allow.is_empty() {
+            return Vec::new();
+        }
+        let mut out = self.allow.clone();
+        for s in &self.secrets {
+            for host in &s.hosts {
+                if !out.contains(host) {
+                    out.push(host.clone());
+                }
+            }
+        }
+        out
+    }
 }
 
 /// The single structured, versioned resolved config: both the sidecar schema and the input
@@ -205,17 +234,7 @@ impl ResolvedConfig {
         let secrets = if let Some(secret_flags) = flags.secret_flag() {
             parse_secret_specs(&secret_flags)?
         } else if let Some(dome_secrets) = &dome.secrets {
-            let mut secrets: Vec<SecretSpec> = dome_secrets
-                .iter()
-                .map(|(name, entry)| SecretSpec {
-                    name: name.clone(),
-                    from: entry.from.clone(),
-                    hosts: entry.hosts.clone(),
-                })
-                .collect();
-            // Deterministic order regardless of dome.json's HashMap iteration order.
-            secrets.sort_by(|a, b| a.name.cmp(&b.name));
-            secrets
+            secret_specs_from_map(dome_secrets)
         } else {
             base.proxy.secrets.clone()
         };
@@ -228,6 +247,11 @@ impl ResolvedConfig {
             Some(p) if !p.steps.is_empty() => Some(ProvisionSpec {
                 steps: p.steps.clone(),
                 allow: p.allow.clone().unwrap_or_default(),
+                secrets: p
+                    .secrets
+                    .as_ref()
+                    .map(secret_specs_from_map)
+                    .unwrap_or_default(),
             }),
             Some(_) => None,
             None => base.provision.clone(),
@@ -536,6 +560,24 @@ fn upsert_secret(secrets: &mut Vec<SecretSpec>, spec: SecretSpec) {
     } else {
         secrets.push(spec);
     }
+}
+
+/// Convert a `dome.json` secret map (`{name: {from, hosts}}`) into structured specs, sorted by
+/// name for a deterministic result regardless of the map's iteration order. Shared by the
+/// runtime `secrets` and the `provision.secrets` resolve paths (same shape, same machinery).
+fn secret_specs_from_map(
+    map: &std::collections::HashMap<String, config::SecretEntry>,
+) -> Vec<SecretSpec> {
+    let mut secrets: Vec<SecretSpec> = map
+        .iter()
+        .map(|(name, entry)| SecretSpec {
+            name: name.clone(),
+            from: entry.from.clone(),
+            hosts: entry.hosts.clone(),
+        })
+        .collect();
+    secrets.sort_by(|a, b| a.name.cmp(&b.name));
+    secrets
 }
 
 /// Parse `NAME=ENV@host1,host2` secret flag strings into structured specs, de-duplicating by
@@ -882,6 +924,7 @@ mod tests {
                     "curl -fsSL https://get.pnpm.io/install.sh | sh -".into(),
                 ],
                 allow: Some(vec!["deb.debian.org".into(), "get.pnpm.io".into()]),
+                secrets: None,
             }),
             ..Default::default()
         };
@@ -899,6 +942,7 @@ mod tests {
             provision: Some(ProvisionEntry {
                 steps: vec![],
                 allow: Some(vec!["x".into()]),
+                secrets: None,
             }),
             ..Default::default()
         };
@@ -911,6 +955,7 @@ mod tests {
             provision: Some(ProvisionSpec {
                 steps: vec!["echo hi".into()],
                 allow: vec![],
+                secrets: vec![],
             }),
             ..Default::default()
         };
@@ -919,6 +964,94 @@ mod tests {
             r.provision.unwrap().steps,
             vec!["echo hi".to_string()],
             "an omitted dome.json provision inherits the base spec"
+        );
+    }
+
+    #[test]
+    fn resolve_provision_secrets_parse_and_auto_whitelist_hosts() {
+        // provision.secrets parse via the same resolve() path as runtime secrets (mapping only),
+        // and their hosts are auto-whitelisted into the provision allow-list.
+        let mut secrets = HashMap::new();
+        secrets.insert(
+            "npm".to_string(),
+            SecretEntry {
+                from: "NPM_TOKEN".into(),
+                hosts: vec!["registry.corp.internal".into()],
+            },
+        );
+        let dome = DomeConfig {
+            provision: Some(ProvisionEntry {
+                steps: vec!["npm ci".into()],
+                allow: Some(vec!["deb.debian.org".into()]),
+                secrets: Some(secrets),
+            }),
+            ..Default::default()
+        };
+        let r =
+            ResolvedConfig::resolve(&ResolvedConfig::default(), &dome, &VmArgs::default()).unwrap();
+        let p = r
+            .provision
+            .as_ref()
+            .expect("a declared provision block resolves");
+        assert_eq!(p.secrets.len(), 1);
+        assert_eq!(p.secrets[0].name, "npm");
+        assert_eq!(p.secrets[0].from, "NPM_TOKEN");
+        assert_eq!(
+            p.secrets[0].hosts,
+            vec!["registry.corp.internal".to_string()]
+        );
+
+        // The declared `allow` is kept as-is on the spec; the secret host is added only in the
+        // effective (build-time) allow-list — no double-declaration required.
+        assert_eq!(p.allow, vec!["deb.debian.org".to_string()]);
+        assert_eq!(
+            p.effective_allow(),
+            vec![
+                "deb.debian.org".to_string(),
+                "registry.corp.internal".to_string()
+            ],
+            "a secret's hosts are auto-whitelisted into the provision allow-list"
+        );
+
+        // The serialized sidecar carries the mapping but never a secret *value* field.
+        let json = serde_json::to_string(&r).unwrap();
+        assert!(json.contains("NPM_TOKEN") && !json.contains("\"value\""));
+    }
+
+    #[test]
+    fn effective_allow_keeps_open_network_open_and_dedupes() {
+        // An empty allow = all allowed: secrets must NOT narrow it down to just their hosts.
+        let open = ProvisionSpec {
+            steps: vec!["s".into()],
+            allow: vec![],
+            secrets: vec![SecretSpec {
+                name: "npm".into(),
+                from: "NPM_TOKEN".into(),
+                hosts: vec!["registry.corp.internal".into()],
+            }],
+        };
+        assert!(
+            open.effective_allow().is_empty(),
+            "an empty allow-list stays open (all allowed) regardless of secrets"
+        );
+
+        // A host already declared in allow is not duplicated by the auto-whitelist.
+        let dup = ProvisionSpec {
+            steps: vec!["s".into()],
+            allow: vec!["registry.corp.internal".into(), "deb.debian.org".into()],
+            secrets: vec![SecretSpec {
+                name: "npm".into(),
+                from: "NPM_TOKEN".into(),
+                hosts: vec!["registry.corp.internal".into()],
+            }],
+        };
+        assert_eq!(
+            dup.effective_allow(),
+            vec![
+                "registry.corp.internal".to_string(),
+                "deb.debian.org".to_string()
+            ],
+            "an already-declared host is not whitelisted twice"
         );
     }
 

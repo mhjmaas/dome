@@ -471,7 +471,10 @@ pub(crate) fn run_command(prepared: &PreparedVm, command: &[String]) -> Result<R
 /// state as the provisioned layer index at `out_index`.
 ///
 /// The build boots from the bare base (project dir NOT mounted), with networking on and
-/// narrowed by `spec.allow` (empty = all allowed). Steps run as **root**, **sequentially**,
+/// narrowed by `spec.effective_allow()` — `spec.allow` plus each secret's auto-whitelisted
+/// hosts (empty allow = all allowed). Provision secrets are injected via the egress proxy: a
+/// step sees only a placeholder and the proxy substitutes the real value on egress to a matched
+/// host, so the value never touches the guest. Steps run as **root**, **sequentially**,
 /// **stop-on-first-failure**, each via its own `sh -c` so `cd`/`export` don't cross steps. A
 /// banner and live per-step output make the cold run visible. On success the layer is saved to
 /// `out_index`; on any step failure nothing is saved and the error propagates (failing the
@@ -485,14 +488,17 @@ pub(crate) fn build_provision_layer(
     out_index: &str,
     failed_index: Option<&str>,
 ) -> Result<()> {
-    // Build-VM shape: default cpus/memory, the requested disk size, networking on and
-    // narrowed by the provision-time allow-list. No mounts — the project dir is never exposed
-    // to the build.
+    // Build-VM shape: default cpus/memory, the requested disk size, networking on and narrowed
+    // by the provision-time allow-list (with each secret's hosts auto-whitelisted). Provision
+    // secrets ride the same proxy MITM path as runtime secrets: the guest steps see only a
+    // placeholder, and the proxy substitutes the real value on egress to a matched host. No
+    // mounts — the project dir is never exposed to the build.
     let cfg = ResolvedConfig {
         disk_size: Some(disk_size_mb),
         allow_net: true,
         proxy: ProxyResolved {
-            allow: spec.allow.clone(),
+            secrets: spec.secrets.clone(),
+            allow: spec.effective_allow(),
             ..Default::default()
         },
         ..Default::default()
