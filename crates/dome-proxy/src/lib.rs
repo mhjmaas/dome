@@ -115,6 +115,8 @@ pub fn start(host_fd: RawFd, config: ProxyConfig) -> anyhow::Result<ProxyHandle>
         NonZeroUsize::new(ALLOWED_IPS_CAPACITY).expect("non-zero capacity"),
     )));
 
+    let dns_cache: dns::SharedDnsCache = Arc::new(dns::DnsCache::new());
+
     let (event_tx, event_rx) = mpsc::unbounded_channel();
     let (cmd_tx, cmd_rx) = mpsc::unbounded_channel();
 
@@ -128,6 +130,7 @@ pub fn start(host_fd: RawFd, config: ProxyConfig) -> anyhow::Result<ProxyHandle>
     let proxy_config = config;
     let proxy_placeholders = placeholders.clone();
     let proxy_allowed_ips = allowed_ips.clone();
+    let proxy_dns_cache = dns_cache.clone();
     let runtime_thread = std::thread::Builder::new()
         .name("dome-proxy".into())
         .spawn(move || {
@@ -145,6 +148,7 @@ pub fn start(host_fd: RawFd, config: ProxyConfig) -> anyhow::Result<ProxyHandle>
                     ca,
                     proxy_placeholders,
                     proxy_allowed_ips,
+                    proxy_dns_cache,
                 );
                 engine.run().await;
             });
