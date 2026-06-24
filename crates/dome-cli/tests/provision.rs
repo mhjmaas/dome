@@ -210,3 +210,93 @@ fn failing_step_preserves_a_bootable_debug_disk() {
         }
     }
 }
+
+/// Provision-time secrets (#68): the build can authenticate to a secret's matched host while
+/// the guest only ever sees a placeholder, the allow-list (auto-whitelisting the secret host)
+/// blocks a non-listed domain, and the placeholder is useless against an off-target host.
+///
+/// This needs egress to a real HTTPS host that echoes the request, so it talks to
+/// `https://postman-echo.com/get` (which reflects request headers as JSON). The secret rides
+/// an `Authorization` header: the proxy substitutes the real value only on egress to the
+/// secret's matched host, so the echo from the matched host shows the real value while the
+/// guest's own view (and any other host) shows only the `dome_tok_…` placeholder.
+#[test]
+#[ignore]
+fn provision_secret_is_substituted_only_for_the_matched_host() {
+    let marker = format!("prov-secret-{}", std::process::id());
+    let dir = tempfile::tempdir().expect("tempdir");
+    // allow lists only the echo host; the secret's host (also the echo host) is auto-whitelisted.
+    // Step 1: the guest's own env must show the placeholder, never the real token.
+    // Step 2: egress to the matched host echoes back the substituted (real) Authorization value.
+    // Step 3: a curl to a NON-listed domain must be blocked by the provision allow-list.
+    let dome_json = format!(
+        r#"{{
+  "provision": {{
+    "allow": ["postman-echo.com"],
+    "secrets": {{ "echo": {{ "from": "ECHO_TOKEN", "hosts": ["postman-echo.com"] }} }},
+    "steps": [
+      "test \"$ECHO_TOKEN\" != real-secret-value && echo placeholder-only > /opt/{marker}.guest",
+      "curl -sS -H \"Authorization: $ECHO_TOKEN\" https://postman-echo.com/get > /opt/{marker}.echo",
+      "curl -sS --max-time 10 https://example.com/ && echo REACHED > /opt/{marker}.blocked || echo BLOCKED > /opt/{marker}.blocked"
+    ]
+  }}
+}}"#
+    );
+    std::fs::write(dir.path().join("dome.json"), dome_json).expect("write dome.json");
+
+    let out = Command::new(dome_bin())
+        .current_dir(dir.path())
+        .env("ECHO_TOKEN", "real-secret-value")
+        .args([
+            "run",
+            "--",
+            "sh",
+            "-c",
+            &format!(
+                "cat /opt/{marker}.guest; echo ---; cat /opt/{marker}.echo; echo ---; cat /opt/{marker}.blocked"
+            ),
+        ])
+        .output()
+        .expect("failed to spawn dome — is DOME_BIN correct?");
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert!(
+        out.status.success(),
+        "the provisioned run should succeed; stdout: {stdout}, stderr: {stderr}"
+    );
+
+    // The guest's own $ECHO_TOKEN was the placeholder, not the real value.
+    assert!(
+        stdout.contains("placeholder-only"),
+        "the guest must see a placeholder, never the real token; stdout: {stdout}"
+    );
+    // The echo from the matched host reflects the *real* value (proxy substituted it on egress).
+    assert!(
+        stdout.contains("real-secret-value"),
+        "egress to the matched host must carry the substituted real value; stdout: {stdout}"
+    );
+    // The placeholder must never appear on the wire to the matched host.
+    assert!(
+        !stdout.contains("dome_tok_"),
+        "the placeholder must be substituted out on egress to the matched host; stdout: {stdout}"
+    );
+    // A non-listed domain was blocked by the provision allow-list.
+    assert!(
+        stdout.contains("BLOCKED") && !stdout.contains("REACHED"),
+        "a non-listed domain must be blocked by the provision allow-list; stdout: {stdout}"
+    );
+
+    // Best-effort cleanup of the layer this test published.
+    if let Ok(rd) = std::fs::read_dir(provision_dir()) {
+        for e in rd.filter_map(|e| e.ok()) {
+            let ext = e
+                .path()
+                .extension()
+                .and_then(|x| x.to_str())
+                .map(str::to_string);
+            if matches!(ext.as_deref(), Some("idx") | Some("failed")) {
+                let _ = std::fs::remove_file(e.path());
+            }
+        }
+    }
+}
