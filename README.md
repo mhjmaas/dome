@@ -128,6 +128,47 @@ dome checkpoint list
 dome checkpoint delete myenv
 ```
 
+### Persistent sandboxes
+
+Where `dome run` is ephemeral — a fresh disk every time, everything discarded on exit — a **sandbox** is a long-lived named VM whose disk persists across runs. Use it as a stable environment you return to.
+
+```sh
+# Open a shell (the sandbox is created lazily on first use)
+dome sandbox shell myenv
+
+# Run a command in it
+dome sandbox run myenv -- python3 script.py
+
+# Seed a new sandbox from a checkpoint or another sandbox
+dome sandbox create myenv --from python-env
+
+# List sandboxes (size, pinned base version, running/idle status)
+dome sandbox ls
+
+# Stop a running sandbox (flush + save, then shut the VM down)
+dome sandbox stop myenv
+
+# Force a durable save without stopping
+dome sandbox save myenv
+
+# Remove a sandbox
+dome sandbox rm myenv
+```
+
+The name is optional — it defaults to the `sandbox` field in `dome.json`, otherwise a slug of the current directory. A sandbox resolves its config **once, at creation**, and stores it in a sidecar (see [Config file](#config-file)). Multiple terminals can attach to the same running sandbox at once; a fully idle sandbox shuts its VM down on its own and reboots on next use.
+
+### Daemon
+
+A background control plane (`domed`) supervises running sandboxes and their VMs. It starts automatically on first use and shuts itself down once idle, so you normally never invoke it directly. Manage it explicitly when you need to:
+
+```sh
+dome daemon status   # report pid, uptime, worker count, socket path
+dome daemon start    # pre-warm the control plane (optional)
+dome daemon stop     # stop the daemon; running sandboxes are left untouched
+```
+
+Use `dome prune` to reclaim disk from removed sandboxes and clear leftover data from crashed VMs.
+
 ### Secrets
 
 Secrets keep API keys on the host. The guest receives a random placeholder token; the proxy substitutes the real value only on HTTPS requests to the specified hosts. The real secret never enters the VM.
@@ -249,6 +290,10 @@ Once installed, agents will use `dome run` whenever they need sandboxed executio
 ## Changelog
 
 See [CHANGELOG.md](CHANGELOG.md) for release notes and breaking changes.
+
+## Acknowledgements
+
+Dome started as a fork of [shuru](https://github.com/superhq-ai/shuru) and has been substantially built upon since.
 
 ## Support
 
