@@ -25,6 +25,121 @@ pub(crate) const ACTIVATE_UNTRUSTED: i32 = 10;
 /// guest / `$CI` / `$DOME_NO_AUTO` fired). The hook stays quiet and does not re-invoke.
 pub(crate) const ACTIVATE_SKIP: i32 = 11;
 
+/// The sentinel env var the installed shell hook exports on `eval`. Its presence in a manual
+/// `dome sandbox` session means the hook is active, so the one-time install tip is suppressed.
+/// (A child `dome` process inherits the shell's environment, so it sees the export.)
+pub(crate) const HOOK_SENTINEL: &str = "DOME_HOOK_INSTALLED";
+
+/// The exact shell rc line that enables the hook for `shell`, e.g. `eval "$(dome hook zsh)"`.
+/// This is the single source of truth printed by the install tip, written by `dome hook
+/// --install`, and mentioned by `dome init`.
+fn hook_rc_line(shell: &str) -> String {
+    format!("eval \"$(dome hook {shell})\"")
+}
+
+/// The one-time, copy-paste install tip shown after a manual `dome sandbox` session when the
+/// hook is not installed. Shows the exact rc line for `shell` and points at the convenience
+/// installer, and promises not to nag again.
+fn install_tip(shell: &str) -> String {
+    format!(
+        "dome: tip — auto-activate this project's sandbox on `cd` by adding the shell hook.\n\
+         Add this line to your shell rc:\n\n    {}\n\n\
+         …or run `dome hook --install` to do it for you. (This tip won't show again.)",
+        hook_rc_line(shell)
+    )
+}
+
+/// The shell to offer hook integration for, derived from `$SHELL`, limited to shells whose
+/// hook `dome` can currently emit. Returns `Some("zsh")` for a zsh `$SHELL` (or when `$SHELL`
+/// is unset — zsh is the macOS default and the only supported shell), and `None` for any other
+/// shell so neither the install tip nor `dome hook --install` suggests a line that would not
+/// work yet (bash/fish emission is a follow-up). Pure given the env lookup, so it is unit-tested.
+fn supported_shell(getenv: impl Fn(&str) -> Option<String>) -> Option<String> {
+    let Some(shell) = getenv("SHELL").filter(|s| !s.is_empty()) else {
+        return Some("zsh".to_string());
+    };
+    match Path::new(&shell).file_name().and_then(|s| s.to_str()) {
+        Some("zsh") => Some("zsh".to_string()),
+        _ => None,
+    }
+}
+
+/// The marker file whose existence records that the one-time install tip has been shown, so it
+/// never nags again. Lives in the dome data dir alongside the other per-machine state.
+fn hook_tip_marker(data_dir: &str) -> String {
+    format!("{data_dir}/hook-tip-shown")
+}
+
+/// Decide whether a manual `dome sandbox` session should print the one-time install tip, and for
+/// which shell. Returns `Some(shell)` only when the hook is NOT installed (the [`HOOK_SENTINEL`]
+/// env var is absent), the tip has not been shown before (no marker in `data_dir`), the session
+/// is an interactive TTY (`is_tty`), no environment guard (`$CI`, inside a guest, `$DOME_NO_AUTO`)
+/// is set, and the shell is one `dome` can emit a hook for. `None` in every other case. Pure given
+/// the filesystem, the env lookup, and the TTY flag, so it is unit-tested without printing.
+fn hook_tip_shell(
+    data_dir: &str,
+    getenv: impl Fn(&str) -> Option<String>,
+    is_tty: bool,
+) -> Option<String> {
+    // A copy-paste tip only makes sense on an interactive terminal; never spam a piped log/CI.
+    if !is_tty {
+        return None;
+    }
+    // The same guards that block auto-activation suppress the nudge (guest / $CI / opt-out).
+    if activation_blocked(&getenv).is_some() {
+        return None;
+    }
+    // The hook exports this on eval; its presence means the hook is already installed.
+    if getenv(HOOK_SENTINEL).is_some_and(|v| !v.is_empty()) {
+        return None;
+    }
+    // Shown once: the marker makes the tip a one-time nudge.
+    if Path::new(&hook_tip_marker(data_dir)).exists() {
+        return None;
+    }
+    supported_shell(&getenv)
+}
+
+/// The shell rc file `dome hook --install` appends the hook line to, for a supported `shell`,
+/// resolved relative to `home`. `None` for a shell we don't write an rc path for. Pure, so the
+/// mapping is unit-tested without touching `$HOME`.
+fn rc_path(shell: &str, home: &Path) -> Option<std::path::PathBuf> {
+    match shell {
+        "zsh" => Some(home.join(".zshrc")),
+        "bash" => Some(home.join(".bashrc")),
+        "fish" => Some(home.join(".config/fish/config.fish")),
+        _ => None,
+    }
+}
+
+/// Append the hook `line` to existing rc `contents`, returning the new contents — or `None` when
+/// the line (ignoring surrounding whitespace) is already present, so re-running `dome hook
+/// --install` never duplicates it. A managed comment precedes the line so it is identifiable in
+/// the rc file, and a missing trailing newline is repaired first. Pure, so idempotency is
+/// unit-tested without filesystem I/O.
+fn append_rc_line(contents: &str, line: &str) -> Option<String> {
+    if contents.lines().any(|l| l.trim() == line) {
+        return None;
+    }
+    let mut out = contents.to_string();
+    if !out.is_empty() && !out.ends_with('\n') {
+        out.push('\n');
+    }
+    out.push_str(&format!("\n# dome directory auto-activation\n{line}\n"));
+    Some(out)
+}
+
+/// The one-line directory-auto-activation hint `dome init` prints after readying the OS image,
+/// so the feature is discoverable right after install. Mentions the exact rc line and the
+/// convenience installer.
+pub(crate) fn init_hook_hint() -> String {
+    format!(
+        "dome: tip — enable directory auto-activation (drop into a project's sandbox on `cd`) \
+         by adding `{}` to your shell rc, or run `dome hook --install`.",
+        hook_rc_line("zsh")
+    )
+}
+
 /// `dome hook <shell>`: print the shell-integration hook to stdout. Only `zsh` is supported
 /// in this slice (bash/fish are a follow-up); any other shell is a clear error rather than a
 /// silent no-op the developer would `eval` into nothing.
@@ -42,6 +157,63 @@ pub(crate) fn run_hook(shell: &str) -> Result<()> {
         ),
         other => anyhow::bail!("unknown shell '{other}'. Supported: zsh."),
     }
+}
+
+/// Print the one-time install tip before a manual `dome sandbox shell`/`run` boots its VM, when
+/// the shell hook is not installed (see [`hook_tip_shell`] for the full set of conditions). Drops
+/// a marker afterward so it never nags again. Never fails the command — discoverability is a
+/// convenience, and a session must run even if the marker can't be written.
+pub(crate) fn maybe_print_hook_tip() {
+    use std::io::IsTerminal;
+
+    let data_dir = dome_vm::default_data_dir();
+    let is_tty = std::io::stderr().is_terminal();
+    let Some(shell) = hook_tip_shell(&data_dir, |k| std::env::var(k).ok(), is_tty) else {
+        return;
+    };
+    eprintln!("{}", install_tip(&shell));
+    // Best effort: record that the tip has been shown so it stays a one-time nudge.
+    let _ = std::fs::create_dir_all(&data_dir);
+    let _ = std::fs::write(hook_tip_marker(&data_dir), b"1");
+}
+
+/// `dome hook --install`: append the hook line to the shell rc file detected from `$SHELL`, as an
+/// opt-in convenience over copy-pasting it. Idempotent — re-running never duplicates the line.
+/// Refuses (with the manual line to paste) when `$SHELL` is not a shell `dome` can emit a hook for
+/// yet, and never modifies any rc file in that case.
+pub(crate) fn run_hook_install() -> Result<()> {
+    let getenv = |k: &str| std::env::var(k).ok();
+    let shell = supported_shell(getenv).ok_or_else(|| {
+        anyhow::anyhow!(
+            "could not detect a supported shell from $SHELL (zsh only for now). Add this to \
+             your shell rc manually:\n\n    {}",
+            hook_rc_line("zsh")
+        )
+    })?;
+    let home = std::env::var("HOME")
+        .map(std::path::PathBuf::from)
+        .map_err(|_| anyhow::anyhow!("$HOME is not set — cannot locate your shell rc file"))?;
+    let rc = rc_path(&shell, &home)
+        .ok_or_else(|| anyhow::anyhow!("no known rc file for shell '{shell}'"))?;
+    let existing = std::fs::read_to_string(&rc).unwrap_or_default();
+    match append_rc_line(&existing, &hook_rc_line(&shell)) {
+        Some(updated) => {
+            if let Some(parent) = rc.parent() {
+                std::fs::create_dir_all(parent).ok();
+            }
+            std::fs::write(&rc, updated)?;
+            eprintln!(
+                "dome: added the {shell} hook to {} — restart your shell or run `source {}`.",
+                rc.display(),
+                rc.display()
+            );
+        }
+        None => eprintln!(
+            "dome: the hook is already installed in {} — nothing to do.",
+            rc.display()
+        ),
+    }
+    Ok(())
 }
 
 /// `dome allow`: trust the nearest project so the hook will auto-activate it. Walks up from
@@ -156,6 +328,9 @@ pub(crate) fn emit_zsh_hook(cmd: &str) -> String {
     let cmd = cmd.replace('\'', r"'\''");
     format!(
         r#"# dome directory auto-activation (zsh). Installed via: eval "$(dome hook zsh)"
+# Sentinel: marks the hook as installed so a manual `dome sandbox` session can skip the
+# one-time install tip. Child processes inherit it from the shell environment.
+export {sentinel}=1
 __dome_hook() {{
   emulate -L zsh
   # No-op guards: only ever activate an interactive terminal the developer is driving.
@@ -208,6 +383,7 @@ add-zsh-hook chpwd __dome_hook
 add-zsh-hook precmd __dome_hook
 "#,
         cmd = cmd,
+        sentinel = HOOK_SENTINEL,
         dropped = ACTIVATE_DROPPED_IN,
         untrusted = ACTIVATE_UNTRUSTED,
     )
@@ -726,6 +902,128 @@ mod tests {
     fn insert_sandbox_field_rejects_non_object_json() {
         // A dome.json that is not a top-level object can't take a `sandbox` key safely.
         assert!(insert_sandbox_field("[1, 2, 3]\n", "api").is_none());
+    }
+
+    #[test]
+    fn init_hook_hint_mentions_the_eval_line() {
+        let hint = init_hook_hint();
+        assert!(
+            hint.contains("eval \"$(dome hook zsh)\""),
+            "`dome init` output must mention the hook eval line; got:\n{hint}"
+        );
+    }
+
+    #[test]
+    fn rc_path_maps_the_shell_to_its_rc_file() {
+        let home = Path::new("/home/dev");
+        assert_eq!(rc_path("zsh", home), Some(home.join(".zshrc")));
+    }
+
+    #[test]
+    fn append_rc_line_adds_the_line_and_is_idempotent() {
+        let line = hook_rc_line("zsh");
+        // First install: the line is appended to the existing rc content.
+        let first =
+            append_rc_line("# my rc\nexport PATH=foo\n", &line).expect("appends when absent");
+        assert!(first.contains(&line), "the line is added; got:\n{first}");
+        assert!(
+            first.contains("export PATH=foo"),
+            "existing content is preserved"
+        );
+        // Re-install: the line is already present, so nothing is appended (no duplicate).
+        assert!(
+            append_rc_line(&first, &line).is_none(),
+            "re-running --install must not duplicate the line"
+        );
+    }
+
+    #[test]
+    fn append_rc_line_separates_from_content_missing_a_trailing_newline() {
+        let line = hook_rc_line("zsh");
+        let out = append_rc_line("export PATH=foo", &line).expect("appends");
+        assert!(
+            out.starts_with("export PATH=foo\n"),
+            "a missing trailing newline is added before the appended block; got:\n{out}"
+        );
+        assert!(out.trim_end().ends_with(&line));
+    }
+
+    #[test]
+    fn supported_shell_detects_zsh_and_rejects_unsupported() {
+        // A zsh $SHELL → zsh; an unset $SHELL defaults to zsh (the only supported + macOS default).
+        assert_eq!(
+            supported_shell(|k| (k == "SHELL").then(|| "/bin/zsh".to_string())).as_deref(),
+            Some("zsh")
+        );
+        assert_eq!(supported_shell(no_env).as_deref(), Some("zsh"));
+        // bash/fish hook emission lands in a follow-up; don't suggest a line that won't work yet.
+        assert!(supported_shell(|k| (k == "SHELL").then(|| "/bin/bash".to_string())).is_none());
+        assert!(supported_shell(|k| (k == "SHELL").then(|| "/usr/bin/fish".to_string())).is_none());
+    }
+
+    #[test]
+    fn hook_tip_offered_until_the_marker_is_written() {
+        let data = tempfile::tempdir().unwrap();
+        let dd = data.path().to_str().unwrap();
+        // Unhooked interactive session, no marker yet → the tip is offered (default zsh).
+        assert_eq!(hook_tip_shell(dd, no_env, true).as_deref(), Some("zsh"));
+        // After the tip has been shown (marker dropped), it never appears again.
+        std::fs::write(hook_tip_marker(dd), b"1").unwrap();
+        assert!(
+            hook_tip_shell(dd, no_env, true).is_none(),
+            "the marker must suppress the tip on subsequent runs"
+        );
+    }
+
+    #[test]
+    fn hook_tip_suppressed_when_the_sentinel_is_present() {
+        let data = tempfile::tempdir().unwrap();
+        let dd = data.path().to_str().unwrap();
+        // The hook is installed (it exported the sentinel into this session) → no tip.
+        let getenv = |k: &str| (k == HOOK_SENTINEL).then(|| "1".to_string());
+        assert!(hook_tip_shell(dd, getenv, true).is_none());
+    }
+
+    #[test]
+    fn hook_tip_suppressed_without_a_tty() {
+        let data = tempfile::tempdir().unwrap();
+        let dd = data.path().to_str().unwrap();
+        // A piped/non-interactive session must not emit a copy-paste tip into a log.
+        assert!(hook_tip_shell(dd, no_env, false).is_none());
+    }
+
+    #[test]
+    fn hook_tip_suppressed_by_an_environment_guard() {
+        let data = tempfile::tempdir().unwrap();
+        let dd = data.path().to_str().unwrap();
+        // The same guards that block auto-activation ($CI here) suppress the tip (don't nag in CI).
+        let getenv = |k: &str| (k == "CI").then(|| "true".to_string());
+        assert!(hook_tip_shell(dd, getenv, true).is_none());
+    }
+
+    #[test]
+    fn rc_line_is_the_documented_eval() {
+        assert_eq!(hook_rc_line("zsh"), "eval \"$(dome hook zsh)\"");
+    }
+
+    #[test]
+    fn install_tip_shows_the_exact_rc_line() {
+        let tip = install_tip("zsh");
+        assert!(
+            tip.contains("eval \"$(dome hook zsh)\""),
+            "the tip must show the exact rc line; got:\n{tip}"
+        );
+    }
+
+    #[test]
+    fn zsh_hook_exports_the_install_sentinel() {
+        // The hook exports a sentinel env var on eval so a manual `dome sandbox` session can
+        // tell the hook is installed (and suppress the one-time install tip).
+        let script = emit_zsh_hook("/usr/local/bin/dome");
+        assert!(
+            script.contains(&format!("export {HOOK_SENTINEL}=")),
+            "the hook must export the {HOOK_SENTINEL} sentinel; got:\n{script}"
+        );
     }
 
     #[test]

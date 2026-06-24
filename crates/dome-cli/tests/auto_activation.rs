@@ -94,7 +94,9 @@ fn dome_in_pty(cwd: &Path, args: &[&str], input: &str) -> String {
     cmd.args(args).current_dir(cwd);
     // Scrub guards the host may set (CI runners export $CI), so the inline-offer guards behave
     // as on a developer's machine rather than being suppressed by the test environment.
-    for guard in ["CI", "DOME_SANDBOX", "DOME_NO_AUTO"] {
+    // DOME_HOOK_INSTALLED is scrubbed too so the one-time install tip behaves as on a fresh
+    // (un-hooked) machine regardless of the host shell.
+    for guard in ["CI", "DOME_SANDBOX", "DOME_NO_AUTO", "DOME_HOOK_INSTALLED"] {
         cmd.env_remove(guard);
     }
     let slave_fd = slave;
@@ -278,6 +280,52 @@ fn pin_offer_writes_a_stable_name_and_converges_auto_activation() {
         stdout.lines().any(|l| l == format!("SANDBOX={base}")),
         "auto-activation must use the pinned name (no path-hash); stdout:\n{stdout}"
     );
+}
+
+/// Discoverability (#63): a manual `dome sandbox run` with the shell hook NOT installed prints
+/// the one-time install tip (showing the exact `eval "$(dome hook zsh)"` rc line), then drops a
+/// marker so the tip never shows again on subsequent manual runs. Driven under a pty so the tip's
+/// interactive-TTY guard is satisfied, in a project with no dome.json so the inline trust prompt
+/// stays silent and the tip is the only nudge.
+#[test]
+#[ignore]
+fn install_tip_shows_once_then_the_marker_suppresses_it() {
+    let name = sandbox_name("tip");
+    cleanup(&name);
+
+    // The tip's "shown once" marker lives in the global dome data dir; clear it so this run
+    // starts as on a fresh machine, and reclaim it afterward so it can't leak into other tests.
+    let home = std::env::var("HOME").unwrap_or_else(|_| "/tmp".to_string());
+    let marker = format!("{home}/.local/share/dome/hook-tip-shown");
+    let _ = std::fs::remove_file(&marker);
+
+    let tmp = tempfile::tempdir().expect("tempdir");
+    let project = tmp.path(); // no dome.json → the inline trust prompt stays silent
+
+    // First manual run: the tip appears with the exact rc line and the convenience installer.
+    let first = dome_in_pty(project, &["sandbox", "run", &name, "--", "true"], "");
+    assert!(
+        first.contains("eval \"$(dome hook zsh)\""),
+        "the install tip must show the exact rc line on a first un-hooked run; output:\n{first}"
+    );
+    assert!(
+        first.contains("dome hook --install"),
+        "the tip must mention the convenience installer; output:\n{first}"
+    );
+    assert!(
+        std::path::Path::new(&marker).exists(),
+        "showing the tip must drop the marker so it never nags again"
+    );
+
+    // Second manual run: the marker now suppresses the tip entirely.
+    let second = dome_in_pty(project, &["sandbox", "run", &name, "--", "true"], "");
+    assert!(
+        !second.contains("eval \"$(dome hook zsh)\""),
+        "the tip must not reappear once the marker exists; output:\n{second}"
+    );
+
+    let _ = std::fs::remove_file(&marker);
+    cleanup(&name);
 }
 
 /// The full tracer bullet: untrusted → no drop-in; `dome allow` → trusted; drop-in lands in the
