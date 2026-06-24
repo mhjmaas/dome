@@ -668,6 +668,9 @@ fn print_sandbox_config(name: &str, c: &ResolvedConfig) {
         scalar(c.disk_size)
     );
     eprintln!("  allow_net:        {}", c.allow_net);
+    if let Some(w) = crate::sandbox_config::network_disabled_warning(c.allow_net, &c.proxy.allow) {
+        eprintln!("dome: warning: {w}");
+    }
     eprintln!("  allow_host_writes:{}", c.allow_host_writes);
     eprintln!("  ports:            {}", list(&c.ports));
     eprintln!("  mounts:           {}", list(&c.mounts));

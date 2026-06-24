@@ -99,6 +99,11 @@ pub(crate) fn prepare_vm(
     let proxy_config = if allow_net {
         Some(cfg.proxy.to_proxy_config()?)
     } else {
+        if let Some(w) =
+            crate::sandbox_config::network_disabled_warning(allow_net, &cfg.proxy.allow)
+        {
+            eprintln!("dome: warning: {w}");
+        }
         None
     };
 
