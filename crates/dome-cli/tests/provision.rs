@@ -300,3 +300,78 @@ fn provision_secret_is_substituted_only_for_the_matched_host() {
         }
     }
 }
+
+/// `--rebuild` (#69) forces a fresh provision even when a cached layer would otherwise be
+/// served: the published layer is rewritten in place (its mtime advances), `dome provision
+/// list` shows it, and the toolchain marker is still present after the rebuild.
+#[test]
+#[ignore]
+fn rebuild_forces_a_fresh_build_and_list_shows_the_layer() {
+    let marker = format!("prov-rebuild-{}", std::process::id());
+    let project = project_with_provision(&marker);
+
+    // First run: cold build publishes the layer.
+    let first = run_in(project.path(), &format!("cat /opt/{marker}"));
+    assert!(
+        first.status.success(),
+        "first run should succeed; stderr: {}",
+        String::from_utf8_lossy(&first.stderr)
+    );
+
+    let layer = std::fs::read_dir(provision_dir())
+        .unwrap()
+        .filter_map(|e| e.ok())
+        .map(|e| e.path())
+        .find(|p| p.extension().and_then(|x| x.to_str()) == Some("idx"))
+        .expect("a published layer index");
+    let mtime_before = std::fs::metadata(&layer).unwrap().modified().unwrap();
+
+    // `dome provision list` shows the cached layer (and not via `checkpoint list`).
+    let list = Command::new(dome_bin())
+        .args(["provision", "list"])
+        .output()
+        .expect("failed to spawn dome provision list");
+    let list_out = format!(
+        "{}{}",
+        String::from_utf8_lossy(&list.stdout),
+        String::from_utf8_lossy(&list.stderr)
+    );
+    assert!(
+        list_out.contains("HASH") && list_out.contains("current"),
+        "provision list must show the cached layer with a status; out: {list_out}"
+    );
+
+    // `--rebuild` rewrites the SAME layer in place: the toolchain is still present and the
+    // layer file's mtime advanced (a plain cache hit would have left it untouched).
+    std::thread::sleep(std::time::Duration::from_millis(1100));
+    let rebuilt = Command::new(dome_bin())
+        .current_dir(project.path())
+        .args([
+            "run",
+            "--rebuild",
+            "--",
+            "sh",
+            "-c",
+            &format!("cat /opt/{marker}"),
+        ])
+        .output()
+        .expect("failed to spawn dome run --rebuild");
+    assert!(
+        rebuilt.status.success(),
+        "rebuild run should succeed; stderr: {}",
+        String::from_utf8_lossy(&rebuilt.stderr)
+    );
+    assert!(
+        String::from_utf8_lossy(&rebuilt.stdout).contains("ok"),
+        "the freshly rebuilt layer must still carry the toolchain; stdout: {}",
+        String::from_utf8_lossy(&rebuilt.stdout)
+    );
+    let mtime_after = std::fs::metadata(&layer).unwrap().modified().unwrap();
+    assert!(
+        mtime_after > mtime_before,
+        "--rebuild must rewrite the published layer in place (mtime should advance)"
+    );
+
+    // Best-effort cleanup of the layer this test published.
+    let _ = std::fs::remove_file(&layer);
+}

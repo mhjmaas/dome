@@ -208,6 +208,11 @@ pub(crate) enum Commands {
         #[arg(long)]
         from: Option<String>,
 
+        /// Force a fresh provision build, overwriting any cached toolchain layer for this
+        /// project's `provision` spec in place (ignored when `--from` is given)
+        #[arg(long)]
+        rebuild: bool,
+
         /// Attach to raw serial console instead of running a command
         #[arg(long)]
         console: bool,
@@ -256,9 +261,15 @@ pub(crate) enum Commands {
     },
 
     /// Remove leftover instance data from crashed VMs
-    Prune,
+    Prune {
+        /// Also force-clear the entire provision cache (every cached toolchain layer),
+        /// not just layers stale against the installed OS version. Layers rebuild on the
+        /// next creation.
+        #[arg(long)]
+        provision: bool,
+    },
 
-    /// Inspect declarative provisioning state (e.g. debug a failed build)
+    /// Inspect declarative provisioning state (e.g. list or debug cached layers)
     Provision {
         #[command(subcommand)]
         action: ProvisionCommands,
@@ -281,6 +292,10 @@ pub(crate) enum Commands {
 #[allow(clippy::large_enum_variant)]
 #[derive(clap::Subcommand)]
 pub(crate) enum ProvisionCommands {
+    /// List the cached provisioned layers (hidden from `checkpoint list`) with their delta
+    /// size, pinned OS base, staleness, and age.
+    List,
+
     /// Open a shell on the preserved half-provisioned disk from a failed provision build,
     /// without re-running any provision steps, to investigate why a step died.
     Debug {
@@ -316,6 +331,12 @@ pub(crate) enum SandboxCommands {
         /// Seed a new sandbox from a checkpoint or another sandbox (only when creating it)
         #[arg(long)]
         from: Option<String>,
+
+        /// Force a fresh provision build before seeding the new sandbox, overwriting any
+        /// cached toolchain layer in place (ignored when `--from` is given or the sandbox
+        /// already exists)
+        #[arg(long)]
+        rebuild: bool,
     },
 
     /// Run a command in a persistent sandbox (lazily created on first use)
@@ -329,6 +350,12 @@ pub(crate) enum SandboxCommands {
         /// Seed a new sandbox from a checkpoint or another sandbox (only when creating it)
         #[arg(long)]
         from: Option<String>,
+
+        /// Force a fresh provision build before seeding the new sandbox, overwriting any
+        /// cached toolchain layer in place (ignored when `--from` is given or the sandbox
+        /// already exists)
+        #[arg(long)]
+        rebuild: bool,
 
         /// Command and arguments to run inside the sandbox
         #[arg(trailing_var_arg = true, allow_hyphen_values = true)]
@@ -346,6 +373,11 @@ pub(crate) enum SandboxCommands {
         /// Seed the new sandbox from a checkpoint or another sandbox
         #[arg(long)]
         from: Option<String>,
+
+        /// Force a fresh provision build before seeding the new sandbox, overwriting any
+        /// cached toolchain layer in place (ignored when `--from` is given)
+        #[arg(long)]
+        rebuild: bool,
     },
 
     /// View or edit a sandbox's persisted config (applied on the next cold boot)
