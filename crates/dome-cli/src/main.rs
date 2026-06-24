@@ -55,7 +55,7 @@ fn main() -> Result<()> {
             };
 
             // Ephemeral runs resolve `dome.json` + flags per invocation and persist nothing.
-            let resolved = sandbox_config::ResolvedConfig::resolve(
+            let mut resolved = sandbox_config::ResolvedConfig::resolve(
                 &sandbox_config::ResolvedConfig::default(),
                 &cfg,
                 &vm,
@@ -92,6 +92,18 @@ fn main() -> Result<()> {
                 }
                 (from, None) => (from, None),
             };
+
+            // Auto-mount the project root into the runtime guest at the standard path so the
+            // developer sees their project. RUNTIME only — the provision build above is
+            // hermetic (unmounted). Skipped when there is no `dome.json` (no project to mount).
+            if let Some(root) = config::project_root(vm.config.as_deref()) {
+                resolved.mounts = vm::with_project_root_mount(
+                    &resolved.mounts,
+                    &root,
+                    resolved.allow_host_writes,
+                );
+            }
+
             let prepared = vm::prepare_vm(
                 &resolved,
                 &vm,

@@ -657,6 +657,48 @@ impl<W: std::io::Write> std::io::Write for CaptureTee<'_, W> {
     }
 }
 
+/// The standard guest path at which the RUNTIME auto-mounts the project root (the directory
+/// containing `dome.json`), so a developer working inside the sandbox sees their project here.
+///
+/// This is a **runtime-only** mount. The provision BUILD phase ([`build_provision_layer`])
+/// stays unmounted on purpose: the project dir must never affect the build's cache key and a
+/// build must not be able to read or exfiltrate project contents. The two phases are
+/// intentionally asymmetric — build is hermetic, runtime is convenient.
+///
+/// #58 (directory auto-activation) lands the developer at the mapped subdirectory, computed as
+/// `GUEST_PROJECT_ROOT + (host_cwd − project_root)`, so this constant is the documented anchor
+/// that calculation resolves against.
+pub(crate) const GUEST_PROJECT_ROOT: &str = "/workspace";
+
+/// Return `mounts` with the project-root auto-mount prepended: `project_root` mapped to
+/// [`GUEST_PROJECT_ROOT`], read-write when `allow_host_writes` is set, else read-only —
+/// honoring the same `mounts`/`allow_host_writes` semantics as an explicit mount. If the user
+/// already declared a mount targeting [`GUEST_PROJECT_ROOT`], their explicit mapping wins and
+/// the list is returned unchanged (the auto-mount is never doubled onto the same guest path).
+///
+/// Pure string assembly — no filesystem access — so the mount-spec resolution is unit-testable
+/// without a hypervisor. The resulting spec is parsed and validated like any other mount when
+/// [`prepare_vm`] consumes the list (host-within-cwd and the rw/`--allow-host-writes` gate
+/// still apply).
+pub(crate) fn with_project_root_mount(
+    mounts: &[String],
+    project_root: &std::path::Path,
+    allow_host_writes: bool,
+) -> Vec<String> {
+    let already_mapped = mounts
+        .iter()
+        .any(|m| m.split(':').nth(1) == Some(GUEST_PROJECT_ROOT));
+    if already_mapped {
+        return mounts.to_vec();
+    }
+    let mode = if allow_host_writes { "rw" } else { "ro" };
+    let spec = format!("{}:{}:{}", project_root.display(), GUEST_PROJECT_ROOT, mode);
+    let mut out = Vec::with_capacity(mounts.len() + 1);
+    out.push(spec);
+    out.extend(mounts.iter().cloned());
+    out
+}
+
 /// Pure string validation — no filesystem access. Separated from `parse_mount_spec`
 /// so unit tests can exercise mode/path logic without touching the filesystem.
 fn parse_mount_parts(host: &str, guest: &str, mode: Option<&str>) -> Result<MountConfig> {
@@ -812,6 +854,44 @@ mod tests {
         let mc = parse_mount_parts("/some/host", "/workspace", None).unwrap();
         assert!(mc.read_only);
         assert_eq!(mc.guest_path, "/workspace");
+    }
+
+    #[test]
+    fn project_root_mount_is_read_only_by_default() {
+        // The runtime auto-mounts the project root at the standard guest path, read-only when
+        // host writes are not allowed (mirroring an explicit mount's default).
+        let out = with_project_root_mount(&[], std::path::Path::new("/home/dev/proj"), false);
+        assert_eq!(out, vec!["/home/dev/proj:/workspace:ro".to_string()]);
+    }
+
+    #[test]
+    fn project_root_mount_is_read_write_when_host_writes_allowed() {
+        let out = with_project_root_mount(&[], std::path::Path::new("/home/dev/proj"), true);
+        assert_eq!(out, vec!["/home/dev/proj:/workspace:rw".to_string()]);
+        // The standard guest path is the documented anchor for #58 subdir landing.
+        assert_eq!(GUEST_PROJECT_ROOT, "/workspace");
+    }
+
+    #[test]
+    fn project_root_mount_is_prepended_to_existing_mounts() {
+        let existing = vec!["/home/dev/proj/data:/data:ro".to_string()];
+        let out = with_project_root_mount(&existing, std::path::Path::new("/home/dev/proj"), false);
+        assert_eq!(
+            out,
+            vec![
+                "/home/dev/proj:/workspace:ro".to_string(),
+                "/home/dev/proj/data:/data:ro".to_string(),
+            ]
+        );
+    }
+
+    #[test]
+    fn explicit_workspace_mount_wins_over_the_auto_mount() {
+        // A user mapping something to the standard guest path keeps their mapping; the
+        // auto-mount is not doubled onto the same guest path.
+        let existing = vec!["/home/dev/proj/src:/workspace:rw".to_string()];
+        let out = with_project_root_mount(&existing, std::path::Path::new("/home/dev/proj"), true);
+        assert_eq!(out, existing);
     }
 
     #[test]

@@ -632,6 +632,17 @@ fn boot_and_serve(name: &str, data_dir: &str) -> Result<()> {
     }
     resolved.save_live(data_dir, name);
 
+    // Auto-mount the project root into the runtime guest at the standard path so a developer
+    // shelling in sees their project. We are already chdir'd to the originating cwd (boot.cwd),
+    // so `dome.json` — and thus the project root — resolves there. RUNTIME only: the provision
+    // build rode a hermetic, unmounted VM. Not persisted to the sidecar (kept out of the saved
+    // mounts above) so the mount tracks the `dome.json` the developer is launching from rather
+    // than baking the create-time host path.
+    if let Some(root) = crate::config::project_root(boot.vm_args.config.as_deref()) {
+        resolved.mounts =
+            vm::with_project_root_mount(&resolved.mounts, &root, resolved.allow_host_writes);
+    }
+
     let prepared = vm::prepare_vm(&resolved, &boot.vm_args, None, None, Some(&source))?;
     let instance_dir = prepared.instance_dir.clone();
 

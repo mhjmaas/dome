@@ -25,6 +25,12 @@ Session/project keys are *not* part of the VM shape and are never persisted to t
 | `command` | string[] | ["/bin/sh"] | Default command to run (live; not persisted) |
 | `sandbox` | string | cwd slug | Default sandbox name for `dome sandbox …` (live; not persisted) |
 
+## Project root auto-mount
+
+At **runtime** (`dome run`, `dome sandbox shell/run`), the project root — the directory containing the `dome.json` in use — is automatically mounted into the guest at the standard path **`/workspace`**, so a developer working inside the sandbox sees their project. It honors `allow_host_writes`: read-write when set, read-only otherwise (the same semantics as an explicit mount). If you already declare a mount targeting `/workspace`, your explicit mapping wins and the auto-mount is skipped (no double-mount). When there is no `dome.json`, there is no project root to mount.
+
+**Build vs. runtime — an intentional asymmetry.** The `provision` build phase runs in a **hermetic, unmounted** VM: the project directory is never exposed to provisioning, so the cache key cannot depend on project contents and a build step cannot read or exfiltrate them. The project-root mount described above is **runtime-only**. (Directory auto-activation lands you at the matching subdirectory under `/workspace`, computed as `/workspace` + (host cwd − project root).)
+
 ## Resolution Order
 
 Every field follows one rule. The highest **set** layer wins:

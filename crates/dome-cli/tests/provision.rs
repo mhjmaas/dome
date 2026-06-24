@@ -465,3 +465,50 @@ fn provision_composes_on_top_of_a_seeded_checkpoint() {
         .args(["checkpoint", "delete", &ckpt])
         .output();
 }
+
+/// Runtime project-root mount (#71): a project with a `dome.json` boots a runtime guest where
+/// the project root (the dir containing `dome.json`) is mounted at the standard guest path
+/// `/workspace`, honoring `allow_host_writes`. A host file under the project is visible inside
+/// the guest at `/workspace/...`, and — because `allow_host_writes` is set — a file the guest
+/// writes under `/workspace` lands back on the host. The provision BUILD phase stays unmounted
+/// (covered by the other tests, which never mount the project dir into the build VM).
+#[test]
+#[ignore]
+fn runtime_mounts_the_project_root_at_workspace_writable() {
+    let id = std::process::id();
+    let project = tempfile::tempdir().expect("tempdir");
+    // A writable project: allow_host_writes makes the auto-mount read-write.
+    std::fs::write(
+        project.path().join("dome.json"),
+        r#"{ "allow_host_writes": true }"#,
+    )
+    .expect("write dome.json");
+
+    // A host file under the project root must be visible inside the guest at /workspace.
+    let host_marker = format!("host-{id}");
+    std::fs::write(project.path().join(&host_marker), "hostok\n").expect("write host marker");
+
+    let guest_marker = format!("guest-{id}");
+    let out = run_in(
+        project.path(),
+        &format!("cat /workspace/{host_marker} && echo guestok > /workspace/{guest_marker}"),
+    );
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    assert!(
+        out.status.success(),
+        "runtime run should succeed; stderr: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    assert!(
+        stdout.contains("hostok"),
+        "the host project file must be visible inside the guest at /workspace; stdout: {stdout}"
+    );
+
+    // The guest's write under /workspace must appear on the host (writable mount).
+    let written = std::fs::read_to_string(project.path().join(&guest_marker))
+        .expect("guest write should land on the host under the project root");
+    assert!(
+        written.contains("guestok"),
+        "the guest's /workspace write must reach the host; got: {written}"
+    );
+}
