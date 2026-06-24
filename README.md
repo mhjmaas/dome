@@ -157,6 +157,58 @@ dome sandbox rm myenv
 
 The name is optional — it defaults to the `sandbox` field in `dome.json`, otherwise a slug of the current directory. A sandbox resolves its config **once, at creation**, and stores it in a sidecar (see [Config file](#config-file)). Multiple terminals can attach to the same running sandbox at once; a fully idle sandbox shuts its VM down on its own and reboots on next use.
 
+### Provisioning
+
+The base image is intentionally bare. Declare your project's **toolchain** in a `provision` block in `dome.json` and dome installs it once, snapshots the result as a hidden cache layer, and seeds every later sandbox or `dome run` from that layer — so the cost is paid exactly once.
+
+```json
+{
+  "provision": {
+    "steps": [
+      "apt-get update && apt-get install -y nodejs",
+      "curl -fsSL https://get.pnpm.io/install.sh | sh -"
+    ],
+    "allow": ["deb.debian.org", "get.pnpm.io"],
+    "secrets": {
+      "NPM_TOKEN": { "from": "NPM_TOKEN", "hosts": ["registry.corp.internal"] }
+    }
+  }
+}
+```
+
+- **`steps`** — ordered shell commands run as root inside a build VM, sequentially, stop-on-first-failure. Toolchain/prerequisites only (node, gcc, python3). Project-dependency installs (`pnpm install`, `pip install -r …`) belong in the live sandbox, where its persistence captures them — not here.
+- **`allow`** — the *provision-time* network allow-list, separate from runtime `network.allow`. Empty/unset = all hosts allowed (the build has network by default so `apt-get`/`curl` just work).
+- **`secrets`** — same shape as runtime `secrets`; injected through the egress proxy so the real value never enters the build VM. A secret's `hosts` are auto-added to the provision allow-list.
+
+The first creation on a given spec runs a **cold build** with a live banner and streamed step output:
+
+```sh
+dome sandbox shell                  # no cached layer yet
+# dome: ── provisioning toolchain (cold build) ──
+# dome:   → apt-get update && apt-get install -y nodejs
+# dome:   → curl -fsSL https://get.pnpm.io/install.sh | sh -
+
+dome sandbox shell                  # later, same spec — instant (reused layer)
+```
+
+The layer is keyed by a hash of the spec (steps + `allow` + secret mappings + the base it composes on). Edit the spec and the next creation rebuilds automatically; the cache never serves a stale toolchain. A failed step caches nothing — it surfaces the failing command, exit code, and captured output, and preserves the half-provisioned disk so you can shell in without re-running steps. During the build the project directory is **not** mounted (nothing to exfiltrate over the open-network build window); at runtime it auto-mounts at `/workspace`.
+
+```sh
+# Force a fresh build without editing the spec (also on sandbox create/run)
+dome sandbox shell --rebuild
+
+# Inspect cached layers (hidden from `checkpoint list`): delta size, base, staleness, age
+dome provision list
+
+# Shell into the preserved disk from the most recent failed build to debug it
+dome provision debug [hash]
+
+# Clear the whole provision cache (layers rebuild on next use)
+dome prune --provision
+```
+
+Provisioning composes on top of a `--from` seed, so you can layer a toolchain onto a pre-baked checkpoint or sandbox. Stale-base layers (built against an older OS version) are reclaimed by `dome upgrade` and `dome prune`.
+
 ### Daemon
 
 A background control plane (`domed`) supervises running sandboxes and their VMs. It starts automatically on first use and shuts itself down once idle, so you normally never invoke it directly. Manage it explicitly when you need to:
@@ -209,11 +261,15 @@ Dome loads `dome.json` from the current directory (or `--config PATH`). All fiel
   },
   "network": {
     "allow": ["api.openai.com", "registry.npmjs.org"]
+  },
+  "provision": {
+    "steps": ["apt-get update && apt-get install -y nodejs"],
+    "allow": ["deb.debian.org"]
   }
 }
 ```
 
-The `network.allow` list restricts which hosts the guest can reach. Omit it to allow all hosts.
+The `network.allow` list restricts which hosts the guest can reach. Omit it to allow all hosts. The `provision` block declares a cached toolchain layer built once per spec (see [Provisioning](#provisioning)).
 
 #### One resolution rule
 
