@@ -483,6 +483,7 @@ pub(crate) fn build_provision_layer(
     disk_size_mb: u64,
     env: &VmArgs,
     out_index: &str,
+    failed_index: Option<&str>,
 ) -> Result<()> {
     // Build-VM shape: default cpus/memory, the requested disk size, networking on and
     // narrowed by the provision-time allow-list. No mounts — the project dir is never exposed
@@ -501,35 +502,42 @@ pub(crate) fn build_provision_layer(
     let booted = boot_vm(&prepared)?;
 
     eprintln!("dome: ── provisioning toolchain (cold build) ──");
+    // Capture the running step's combined output (tail-bounded) so a failure can surface
+    // exactly what the step printed before it died, while still streaming it live.
+    let capture = std::cell::RefCell::new(Vec::<u8>::new());
     let mut failure: Option<anyhow::Error> = None;
     for step in &spec.steps {
         eprintln!("dome:   → {}", step);
+        capture.borrow_mut().clear();
         let cmd = vec!["sh".to_string(), "-c".to_string(), step.clone()];
-        match booted.sandbox.exec_with_env(
-            &cmd,
-            &booted.env,
-            &mut std::io::stdout(),
-            &mut std::io::stderr(),
-        ) {
+        let exec = {
+            let mut out = CaptureTee::new(std::io::stdout(), &capture);
+            let mut err = CaptureTee::new(std::io::stderr(), &capture);
+            booted
+                .sandbox
+                .exec_with_env(&cmd, &booted.env, &mut out, &mut err)
+        };
+        match exec {
             Ok(0) => {}
             Ok(code) => {
-                failure = Some(anyhow::anyhow!(
-                    "provision step failed (exit {}): {}",
-                    code,
-                    step
-                ));
+                failure = Some(provision_step_error(step, Some(code), &capture.borrow()));
                 break;
             }
             Err(e) => {
-                failure = Some(e.context(format!("running provision step: {}", step)));
+                // An exec transport error (not a step exit code): keep the captured tail too.
+                failure = Some(
+                    e.context(provision_step_error(step, None, &capture.borrow()).to_string()),
+                );
                 break;
             }
         }
     }
 
-    // Tear down the support services and stop the VM (mirroring `run_command`), then — only on
-    // success — save the resulting disk state as the layer index. Saving via the temp path the
-    // caller chose lets it publish the layer atomically.
+    // Tear down the support services and stop the VM (mirroring `run_command`), then save the
+    // resulting disk state: on success to the caller's temp path (published atomically), on
+    // failure — if a debug path was given — to that path so the developer can shell into the
+    // half-provisioned disk without re-running steps. Nothing partial is ever written to
+    // `out_index`, so the success hash is never published from a failed build.
     let BootedVm {
         sandbox,
         proxy_handle,
@@ -542,7 +550,18 @@ pub(crate) fn build_provision_layer(
     let _ = sandbox.stop();
 
     let result = match failure {
-        Some(e) => Err(e),
+        Some(e) => {
+            if let (Some(failed), Some(h)) = (failed_index, &nbd_handle) {
+                match h.save_checkpoint(failed) {
+                    Ok(_) => eprintln!("dome: preserved the half-provisioned disk for debugging"),
+                    Err(se) => eprintln!(
+                        "dome: warning: could not preserve the debug disk ({}): {:#}",
+                        failed, se
+                    ),
+                }
+            }
+            Err(e)
+        }
         None => match &nbd_handle {
             Some(h) => h
                 .save_checkpoint(out_index)
@@ -555,6 +574,63 @@ pub(crate) fn build_provision_layer(
     drop(nbd_handle);
     let _ = std::fs::remove_dir_all(&prepared.instance_dir);
     result
+}
+
+/// Build the error for a failed provision step, surfacing the command, exit code, and the
+/// captured tail of its output so the failure is self-explanatory without scrolling back.
+fn provision_step_error(step: &str, code: Option<i32>, output: &[u8]) -> anyhow::Error {
+    let code = match code {
+        Some(c) => c.to_string(),
+        None => "error".to_string(),
+    };
+    let tail = String::from_utf8_lossy(output);
+    let tail = tail.trim_end();
+    if tail.is_empty() {
+        anyhow::anyhow!("provision step failed (exit {code}): {step}\n  (no output captured)")
+    } else {
+        anyhow::anyhow!(
+            "provision step failed (exit {code}): {step}\n\
+             --- captured output (tail) ---\n{tail}\n\
+             ------------------------------"
+        )
+    }
+}
+
+/// A `Write` that streams bytes straight through to `inner` while also appending them to a
+/// shared, tail-bounded capture buffer. Used to tee a provision step's live output into a
+/// buffer the failure path can quote. Single-threaded (`exec_with_env` writes inline), so a
+/// `RefCell` is sufficient — no locking.
+struct CaptureTee<'a, W: std::io::Write> {
+    inner: W,
+    capture: &'a std::cell::RefCell<Vec<u8>>,
+}
+
+impl<'a, W: std::io::Write> CaptureTee<'a, W> {
+    /// Cap the capture so a chatty step cannot balloon memory; the tail is what matters.
+    const MAX_CAPTURE: usize = 64 * 1024;
+
+    fn new(inner: W, capture: &'a std::cell::RefCell<Vec<u8>>) -> Self {
+        Self { inner, capture }
+    }
+}
+
+impl<W: std::io::Write> std::io::Write for CaptureTee<'_, W> {
+    fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+        {
+            let mut cap = self.capture.borrow_mut();
+            cap.extend_from_slice(buf);
+            if cap.len() > Self::MAX_CAPTURE {
+                let drop = cap.len() - Self::MAX_CAPTURE;
+                cap.drain(0..drop);
+            }
+        }
+        self.inner.write_all(buf)?;
+        Ok(buf.len())
+    }
+
+    fn flush(&mut self) -> std::io::Result<()> {
+        self.inner.flush()
+    }
 }
 
 /// Pure string validation — no filesystem access. Separated from `parse_mount_spec`

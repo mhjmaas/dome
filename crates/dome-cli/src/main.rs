@@ -21,7 +21,7 @@ use clap::Parser;
 
 use dome_vm::{default_data_dir, VmState};
 
-use cli::{CheckpointCommands, Cli, Commands, DaemonCommands, SandboxCommands};
+use cli::{CheckpointCommands, Cli, Commands, DaemonCommands, ProvisionCommands, SandboxCommands};
 use config::load_config;
 
 fn main() -> Result<()> {
@@ -143,7 +143,17 @@ fn main() -> Result<()> {
                 eprintln!("dome: removed {} orphaned instance(s)", instances);
             }
 
-            // 2. Mark-and-sweep the CAS store: reclaim chunks and superseded base images
+            // 2. Reclaim preserved half-provisioned ("debug") disks left by failed provision
+            // builds. Their now-unreferenced chunks are swept in step 3.
+            let failed = provision::prune_failed_layers(&data_dir)?;
+            if failed > 0 {
+                eprintln!(
+                    "dome: removed {} preserved provisioning debug disk(s)",
+                    failed
+                );
+            }
+
+            // 3. Mark-and-sweep the CAS store: reclaim chunks and superseded base images
             // no live sandbox or checkpoint references (deferred from `sandbox rm`).
             let stats = gc::sweep(&data_dir)?;
             if stats.chunks_removed == 0 && stats.bases_removed == 0 {
@@ -157,6 +167,12 @@ fn main() -> Result<()> {
                 );
             }
         }
+        Commands::Provision { action } => match action {
+            ProvisionCommands::Debug { hash, vm } => {
+                let exit_code = provision::debug_shell(hash.as_deref(), &vm)?;
+                process::exit(exit_code);
+            }
+        },
         Commands::Checkpoint { action } => match action {
             CheckpointCommands::Create {
                 name,

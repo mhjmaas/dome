@@ -258,6 +258,12 @@ pub(crate) enum Commands {
     /// Remove leftover instance data from crashed VMs
     Prune,
 
+    /// Inspect declarative provisioning state (e.g. debug a failed build)
+    Provision {
+        #[command(subcommand)]
+        action: ProvisionCommands,
+    },
+
     /// Internal: run as the domed supervisor (re-exec target; not for direct use)
     #[command(name = "__domed", hide = true)]
     Domed,
@@ -269,6 +275,21 @@ pub(crate) enum Commands {
     Worker {
         /// Sandbox name this worker serves.
         name: String,
+    },
+}
+
+#[allow(clippy::large_enum_variant)]
+#[derive(clap::Subcommand)]
+pub(crate) enum ProvisionCommands {
+    /// Open a shell on the preserved half-provisioned disk from a failed provision build,
+    /// without re-running any provision steps, to investigate why a step died.
+    Debug {
+        /// The failed layer hash (or a unique prefix) printed by the failing build. May be
+        /// omitted when exactly one preserved disk exists.
+        hash: Option<String>,
+
+        #[command(flatten)]
+        vm: VmArgs,
     },
 }
 
