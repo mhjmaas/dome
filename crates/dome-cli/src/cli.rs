@@ -209,7 +209,7 @@ pub(crate) enum Commands {
         from: Option<String>,
 
         /// Force a fresh provision build, overwriting any cached toolchain layer for this
-        /// project's `provision` spec in place (ignored when `--from` is given)
+        /// project's `provision` spec in place (with `--from`, re-composes on top of the seed)
         #[arg(long)]
         rebuild: bool,
 
@@ -333,8 +333,8 @@ pub(crate) enum SandboxCommands {
         from: Option<String>,
 
         /// Force a fresh provision build before seeding the new sandbox, overwriting any
-        /// cached toolchain layer in place (ignored when `--from` is given or the sandbox
-        /// already exists)
+        /// cached toolchain layer in place (with `--from`, re-composes on top of the seed;
+        /// ignored when the sandbox already exists)
         #[arg(long)]
         rebuild: bool,
     },
@@ -352,8 +352,8 @@ pub(crate) enum SandboxCommands {
         from: Option<String>,
 
         /// Force a fresh provision build before seeding the new sandbox, overwriting any
-        /// cached toolchain layer in place (ignored when `--from` is given or the sandbox
-        /// already exists)
+        /// cached toolchain layer in place (with `--from`, re-composes on top of the seed;
+        /// ignored when the sandbox already exists)
         #[arg(long)]
         rebuild: bool,
 
@@ -375,7 +375,7 @@ pub(crate) enum SandboxCommands {
         from: Option<String>,
 
         /// Force a fresh provision build before seeding the new sandbox, overwriting any
-        /// cached toolchain layer in place (ignored when `--from` is given)
+        /// cached toolchain layer in place (with `--from`, re-composes on top of the seed)
         #[arg(long)]
         rebuild: bool,
     },

@@ -375,3 +375,93 @@ fn rebuild_forces_a_fresh_build_and_list_shows_the_layer() {
     // Best-effort cleanup of the layer this test published.
     let _ = std::fs::remove_file(&layer);
 }
+
+/// Compose (#70): when a creation both declares a `provision` block AND seeds `--from <seed>`,
+/// the steps run on top of the seeded disk (not the bare base). This creates a seed checkpoint
+/// carrying its own marker, then `dome sandbox create --from <seed>` in a project whose
+/// `provision` block writes a second marker — and asserts BOTH markers are present in the
+/// resulting sandbox (seed content survived; provisioning layered on top).
+#[test]
+#[ignore]
+fn provision_composes_on_top_of_a_seeded_checkpoint() {
+    let id = std::process::id();
+    let seed_marker = format!("seed-{id}");
+    let prov_marker = format!("prov-compose-{id}");
+    let ckpt = format!("compose-seed-{id}");
+    let sandbox = format!("compose-sb-{id}");
+
+    // 1. Build a seed checkpoint that carries its own marker. Created from a project with NO
+    //    provision block, so the checkpoint is just the bare base + the seed marker.
+    let seed_project = tempfile::tempdir().expect("tempdir");
+    let ckpt_out = Command::new(dome_bin())
+        .current_dir(seed_project.path())
+        .args([
+            "checkpoint",
+            "create",
+            &ckpt,
+            "--",
+            "sh",
+            "-c",
+            &format!("mkdir -p /opt && echo seedok > /opt/{seed_marker}"),
+        ])
+        .output()
+        .expect("failed to spawn dome checkpoint create");
+    assert!(
+        ckpt_out.status.success(),
+        "seed checkpoint create should succeed; stderr: {}",
+        String::from_utf8_lossy(&ckpt_out.stderr)
+    );
+
+    // 2. A project whose provision block writes a SECOND marker on top of whatever it seeds.
+    let project = project_with_provision(&prov_marker);
+
+    // 3. Create the sandbox composing the provision steps on top of the seed checkpoint.
+    let create = Command::new(dome_bin())
+        .current_dir(project.path())
+        .args(["sandbox", "create", &sandbox, "--from", &ckpt])
+        .output()
+        .expect("failed to spawn dome sandbox create --from");
+    assert!(
+        create.status.success(),
+        "composed sandbox create should succeed; stderr: {}",
+        String::from_utf8_lossy(&create.stderr)
+    );
+
+    // 4. Both markers must be present: the seed's content survived AND provisioning layered the
+    //    toolchain marker on top.
+    let run = Command::new(dome_bin())
+        .current_dir(project.path())
+        .args([
+            "sandbox",
+            "run",
+            &sandbox,
+            "--",
+            "sh",
+            "-c",
+            &format!("cat /opt/{seed_marker} /opt/{prov_marker}"),
+        ])
+        .output()
+        .expect("failed to spawn dome sandbox run");
+    let out = String::from_utf8_lossy(&run.stdout);
+    assert!(
+        run.status.success(),
+        "composed sandbox run should succeed; stderr: {}",
+        String::from_utf8_lossy(&run.stderr)
+    );
+    assert!(
+        out.contains("seedok"),
+        "the seed's content must survive the compose; stdout: {out}"
+    );
+    assert!(
+        out.contains("ok"),
+        "provisioning must layer its marker on top of the seed; stdout: {out}"
+    );
+
+    // Best-effort cleanup.
+    let _ = Command::new(dome_bin())
+        .args(["sandbox", "rm", &sandbox])
+        .output();
+    let _ = Command::new(dome_bin())
+        .args(["checkpoint", "delete", &ckpt])
+        .output();
+}

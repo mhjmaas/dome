@@ -66,27 +66,42 @@ pub(crate) fn run_sandbox(
     }
 
     // Declarative provisioning: when the project declares a `provision` block and this is a
-    // brand-new sandbox with no explicit `--from`, resolve (building once if uncached) the
-    // cached toolchain layer here in the front-end — so the cold-build banner and live step
-    // output are visible to the user — and hand the worker the layer to seed the new sandbox
-    // index from. `--from` composition with a provisioned layer is a later slice, so an
-    // explicit seed wins. The per-hash lock inside `ensure_layer` dedups concurrent builds.
-    let provision_seed = if from.is_none() && !Path::new(&index_path).exists() {
+    // brand-new sandbox, resolve (building once if uncached) the cached toolchain layer here in
+    // the front-end — so the cold-build banner and live step output are visible to the user —
+    // and hand the worker the layer to seed the new sandbox index from. With `--from`,
+    // provisioning *composes* on top of that seed: the steps run over the seeded disk and the
+    // layer's cache key reflects the seed's content. The composed layer subsumes the seed, so
+    // the worker seeds from the layer and the raw `--from` is dropped. The per-hash lock inside
+    // `ensure_layer` dedups concurrent builds.
+    let (effective_from, provision_seed) = if !Path::new(&index_path).exists() {
         let resolved = ResolvedConfig::resolve(&ResolvedConfig::default(), &cfg, vm_args)?;
         match &resolved.provision {
-            Some(spec) => crate::provision::ensure_layer(
-                &data_dir,
-                assets::CURRENT_VERSION,
-                spec,
-                resolved.disk_size.unwrap_or(4096),
-                vm_args,
-                &crate::provision::VmStepRunner,
-                rebuild,
-            )?,
-            None => None,
+            Some(spec) => {
+                let seed_idx = match from {
+                    Some(name) => Some(resolve_seed_index(name, &data_dir)?),
+                    None => None,
+                };
+                let layer = crate::provision::ensure_layer(
+                    &data_dir,
+                    assets::CURRENT_VERSION,
+                    spec,
+                    resolved.disk_size.unwrap_or(4096),
+                    vm_args,
+                    &crate::provision::VmStepRunner,
+                    rebuild,
+                    seed_idx.as_deref(),
+                )?;
+                // The composed layer subsumes the seed; ride the layer, drop the raw `--from`.
+                // If no layer was built (an empty-steps spec), keep the raw `--from` seed.
+                match layer {
+                    Some(l) => (None, Some(l)),
+                    None => (from, None),
+                }
+            }
+            None => (from, None),
         }
     } else {
-        None
+        (from, None)
     };
 
     // `--rebuild` forces a fresh layer build, which only matters while seeding a brand-new
@@ -102,7 +117,13 @@ pub(crate) fn run_sandbox(
 
     // The boot spec is consumed by the worker only on a cold boot; it captures exactly
     // what this invocation would have booted (resolved name, seed, cwd, and VM flags).
-    let boot = worker::BootSpec::new(&name, from, provision_seed.as_deref(), &cwd, vm_args)?;
+    let boot = worker::BootSpec::new(
+        &name,
+        effective_from,
+        provision_seed.as_deref(),
+        &cwd,
+        vm_args,
+    )?;
 
     // Flags always win: any config flag passed to an *existing* sandbox resolves into and
     // updates its sidecar before we attach, so a cold boot reproduces from the new values.
@@ -292,55 +313,75 @@ pub(crate) fn create_sandbox(
     // We capture the cloned disk's real size and stamp it onto the sidecar so the sidecar
     // stays truthful (the #46 invariant: a sidecar's `disk_size` always equals the pinned
     // disk, so a cold boot never has to ignore-and-warn a mismatched `--disk-size`).
-    let seeded_disk_size_mb = match from {
-        Some(seed_name) => {
-            let seed_idx = resolve_seed_index(seed_name, &data_dir)?;
-            seed_sandbox_index(&seed_idx, &index_path)?;
-            let mb = dome_store::ChunkIndex::load(&index_path)?.disk_size() / (1024 * 1024);
-            // A `--disk-size` cannot resize a clone; say so rather than silently dropping it.
-            if let Some(requested) = vm_args.disk_size {
-                if requested != mb {
-                    eprintln!(
-                        "dome: ignoring --disk-size {}MB; '{}' clones the disk of '{}' \
-                         (pinned to {}MB)",
-                        requested, name, seed_name, mb
-                    );
-                }
+    let disk_size_mb = vm_args.disk_size.or(cfg.disk_size).unwrap_or(4096);
+    let resolved_for_provision =
+        ResolvedConfig::resolve(&ResolvedConfig::default(), &cfg, vm_args)?;
+
+    // Resolve a `--from` seed (if any) once: it is both the clone source and — when a
+    // `provision` block is present — the disk provisioning composes on top of.
+    let seed_idx = match from {
+        Some(seed_name) => Some(resolve_seed_index(seed_name, &data_dir)?),
+        None => None,
+    };
+
+    // Declarative provisioning: when the project declares a `provision` block, seed the new
+    // sandbox from the cached toolchain layer (built once, in the foreground where the banner is
+    // visible) rather than the bare base. With `--from`, provisioning *composes* on top of that
+    // seed and the layer subsumes it. `None` here means no `provision` block (or no steps) —
+    // then the plain `--from` clone / bare-base path below seeds the index instead.
+    let provision_layer = match &resolved_for_provision.provision {
+        Some(spec) => crate::provision::ensure_layer(
+            &data_dir,
+            assets::CURRENT_VERSION,
+            spec,
+            disk_size_mb,
+            vm_args,
+            &crate::provision::VmStepRunner,
+            rebuild,
+            seed_idx.as_deref(),
+        )?,
+        None => None,
+    };
+
+    let seeded_disk_size_mb = if let Some(layer_idx) = provision_layer {
+        // Seed from the composed/provisioned layer (it already incorporates any `--from` seed).
+        seed_sandbox_index(&layer_idx, &index_path)?;
+        let mb = dome_store::ChunkIndex::load(&index_path)?.disk_size() / (1024 * 1024);
+        match from {
+            Some(seed_name) => {
+                eprintln!(
+                    "dome: created sandbox '{}' from '{}' (provisioned)",
+                    name, seed_name
+                )
             }
-            eprintln!("dome: created sandbox '{}' from '{}'", name, seed_name);
-            Some(mb)
+            None => eprintln!("dome: created sandbox '{}' (provisioned)", name),
         }
-        None => {
-            let disk_size_mb = vm_args.disk_size.or(cfg.disk_size).unwrap_or(4096);
-            // Declarative provisioning: when the project declares a `provision` block, seed
-            // the new sandbox from the cached toolchain layer (built once, in the foreground
-            // where the banner is visible) rather than the bare base. The seeded disk's real
-            // size is stamped onto the sidecar below, the same as a `--from` clone.
-            let resolved = ResolvedConfig::resolve(&ResolvedConfig::default(), &cfg, vm_args)?;
-            let layer = match &resolved.provision {
-                Some(spec) => crate::provision::ensure_layer(
-                    &data_dir,
-                    assets::CURRENT_VERSION,
-                    spec,
-                    disk_size_mb,
-                    vm_args,
-                    &crate::provision::VmStepRunner,
-                    rebuild,
-                )?,
-                None => None,
-            };
-            if let Some(layer_idx) = layer {
-                seed_sandbox_index(&layer_idx, &index_path)?;
-                let mb = dome_store::ChunkIndex::load(&index_path)?.disk_size() / (1024 * 1024);
-                eprintln!("dome: created sandbox '{}' (provisioned)", name);
-                Some(mb)
-            } else {
-                let base_path = ensure_current_base(&data_dir, vm_args)?;
-                materialize_from_base(&index_path, &base_path, disk_size_mb)?;
-                eprintln!("dome: created sandbox '{}'", name);
-                None
+        Some(mb)
+    } else if let Some(seed_name) = from {
+        // Plain `--from` clone (no provisioning): clone disk/index state only.
+        let seed_idx = seed_idx
+            .as_deref()
+            .expect("seed_idx is resolved whenever from is Some");
+        seed_sandbox_index(seed_idx, &index_path)?;
+        let mb = dome_store::ChunkIndex::load(&index_path)?.disk_size() / (1024 * 1024);
+        // A `--disk-size` cannot resize a clone; say so rather than silently dropping it.
+        if let Some(requested) = vm_args.disk_size {
+            if requested != mb {
+                eprintln!(
+                    "dome: ignoring --disk-size {}MB; '{}' clones the disk of '{}' \
+                     (pinned to {}MB)",
+                    requested, name, seed_name, mb
+                );
             }
         }
+        eprintln!("dome: created sandbox '{}' from '{}'", name, seed_name);
+        Some(mb)
+    } else {
+        // Fresh from the bare base.
+        let base_path = ensure_current_base(&data_dir, vm_args)?;
+        materialize_from_base(&index_path, &base_path, disk_size_mb)?;
+        eprintln!("dome: created sandbox '{}'", name);
+        None
     };
 
     // Resolve `dome.json` + flags once and write the structured, versioned sidecar. From
