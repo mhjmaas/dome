@@ -28,7 +28,7 @@ use anyhow::{Context, Result};
 use sha2::{Digest, Sha256};
 
 use crate::cli::VmArgs;
-use crate::sandbox_config::ProvisionSpec;
+use crate::sandbox_config::{ProvisionSpec, ResolvedConfig};
 
 /// Compute the content hash that keys a provisioned layer:
 /// `sha256(base identity ‖ normalized steps ‖ provision.allow)`.
@@ -65,12 +65,17 @@ pub(crate) trait StepRunner {
     /// Build a provisioned layer: run `spec.steps` (as root, sequentially, stop-on-first-
     /// failure, each via `sh -c`, project dir NOT mounted, network narrowed by `spec.allow`)
     /// starting from the bare base, and write the resulting CAS index to `out_index`.
+    ///
+    /// On failure, the half-provisioned disk is saved to `failed_index` (when set) so the
+    /// developer can shell into it without re-running steps; nothing is ever written to
+    /// `out_index` from a failed build, so the success hash is never published partially.
     fn build(
         &self,
         spec: &ProvisionSpec,
         disk_size_mb: u64,
         env: &VmArgs,
         out_index: &str,
+        failed_index: Option<&str>,
     ) -> Result<()>;
 }
 
@@ -84,8 +89,9 @@ impl StepRunner for VmStepRunner {
         disk_size_mb: u64,
         env: &VmArgs,
         out_index: &str,
+        failed_index: Option<&str>,
     ) -> Result<()> {
-        crate::vm::build_provision_layer(spec, disk_size_mb, env, out_index)
+        crate::vm::build_provision_layer(spec, disk_size_mb, env, out_index, failed_index)
     }
 }
 
@@ -97,6 +103,14 @@ fn provision_dir(data_dir: &str) -> PathBuf {
 /// The cached layer index path for a given hash: `{data_dir}/provision/<hash>.idx`.
 pub(crate) fn layer_path(data_dir: &str, hash: &str) -> PathBuf {
     provision_dir(data_dir).join(format!("{hash}.idx"))
+}
+
+/// The preserved half-provisioned ("debug") disk path for a given hash:
+/// `{data_dir}/provision/<hash>.failed`. Parked when a build fails so the developer can
+/// shell into it without re-running steps; overwritten by the next successful build and
+/// reclaimed by `dome prune`.
+pub(crate) fn failed_layer_path(data_dir: &str, hash: &str) -> PathBuf {
+    provision_dir(data_dir).join(format!("{hash}.failed"))
 }
 
 /// Resolve the provisioned layer for `spec`, building it once if uncached, and return its CAS
@@ -143,12 +157,24 @@ pub(crate) fn ensure_layer(
     // partial `.idx`. A failed build leaves no temp behind to be mistaken for a layer.
     let tmp_path = dir.join(format!("{hash}.{}.tmp.idx", std::process::id()));
     let tmp = path_string(&tmp_path)?;
+    let failed_path = failed_layer_path(data_dir, &hash);
+    let failed = path_string(&failed_path)?;
     let _ = std::fs::remove_file(&tmp_path);
 
     eprintln!("dome: provisioning (first run for this spec)…");
-    let build = runner.build(spec, disk_size_mb, env, &tmp);
+    let build = runner.build(spec, disk_size_mb, env, &tmp, Some(&failed));
     if let Err(e) = build {
         let _ = std::fs::remove_file(&tmp_path);
+        // The build parks the half-provisioned disk at `<hash>.failed` on failure. If it's
+        // there, point the developer at the opt-in debug shell — booting that disk without
+        // re-running steps. Nothing was published under the success hash.
+        if failed_path.exists() {
+            let short = &hash[..hash.len().min(12)];
+            eprintln!("dome:");
+            eprintln!("dome: the half-provisioned disk was preserved for inspection.");
+            eprintln!("dome: open a debug shell on it (provision steps are NOT re-run) with:");
+            eprintln!("dome:     dome provision debug {short}");
+        }
         return Err(e).context("provisioning failed");
     }
 
@@ -159,11 +185,125 @@ pub(crate) fn ensure_layer(
             idx_path.display()
         )
     })?;
+    // A clean build supersedes any preserved failure disk for this exact spec; drop it so a
+    // stale debug disk can't linger (and its chunks become reclaimable by `dome prune`).
+    let _ = std::fs::remove_file(&failed_path);
     eprintln!(
         "dome: provisioned, cached ({}…)",
         &hash[..hash.len().min(12)]
     );
     Ok(Some(path_string(&idx_path)?))
+}
+
+/// Boot the preserved half-provisioned disk for a failed build into an interactive shell,
+/// **without re-running any provision steps**, so the developer can investigate why a step
+/// died (a missing package, a wrong path, …). The disk is ridden read-only-ish like any seed:
+/// this is an ephemeral session that saves nothing, so poking around never mutates the cache.
+///
+/// `hash` is the value (or a unique prefix of it) printed by the failing build; when omitted
+/// and exactly one failure disk is present, that one is used.
+pub(crate) fn debug_shell(hash: Option<&str>, env: &VmArgs) -> Result<i32> {
+    let data_dir = dome_vm::default_data_dir();
+    let (full_hash, failed) = resolve_failed_layer(&data_dir, hash)?;
+    let short = &full_hash[..full_hash.len().min(12)];
+    eprintln!("dome: opening a shell on the half-provisioned disk for {short}…");
+    eprintln!("dome: (provision steps are NOT re-run; nothing here is saved back to the cache)");
+
+    // Pin the disk size to whatever the preserved index was built with: the index encodes a
+    // fixed chunk count, so booting it at a different size would corrupt the filesystem. (Same
+    // invariant the persistent-sandbox boot path enforces.)
+    let stored = dome_store::ChunkIndex::load(&failed)
+        .with_context(|| format!("loading preserved provisioning disk {failed}"))?
+        .disk_size()
+        / (1024 * 1024);
+    let cfg = ResolvedConfig {
+        disk_size: Some(stored),
+        ..Default::default()
+    };
+
+    // Ride the failure disk as a provision seed (an absolute CAS index path), exactly as a
+    // normal provisioned layer is ridden — reads resolve through it and its pinned base.
+    let prepared = crate::vm::prepare_vm(&cfg, env, None, Some(&failed), None)?;
+    crate::session::run_session(
+        &prepared,
+        &["/bin/sh".to_string()],
+        &crate::session::SaveTarget::None,
+    )
+}
+
+/// Resolve a preserved failure disk under `{data_dir}/provision` by full hash or unique
+/// prefix; with no selector, succeed only when exactly one is present. Returns
+/// `(full_hash, index_path)`.
+fn resolve_failed_layer(data_dir: &str, selector: Option<&str>) -> Result<(String, String)> {
+    let dir = provision_dir(data_dir);
+    let mut found: Vec<(String, PathBuf)> = Vec::new();
+    if let Ok(entries) = std::fs::read_dir(&dir) {
+        for entry in entries.flatten() {
+            let path = entry.path();
+            if path.extension().and_then(|e| e.to_str()) != Some("failed") {
+                continue;
+            }
+            if let Some(stem) = path.file_stem().and_then(|s| s.to_str()) {
+                found.push((stem.to_string(), path));
+            }
+        }
+    }
+
+    let matches: Vec<(String, PathBuf)> = match selector {
+        Some(sel) => found
+            .into_iter()
+            .filter(|(stem, _)| stem.starts_with(sel))
+            .collect(),
+        None => found,
+    };
+
+    match matches.len() {
+        0 => match selector {
+            Some(sel) => {
+                anyhow::bail!("no preserved provisioning disk matches '{sel}' under {}/provision", data_dir)
+            }
+            None => anyhow::bail!(
+                "no preserved provisioning disk found under {}/provision (a build must fail to leave one)",
+                data_dir
+            ),
+        },
+        1 => {
+            let (stem, path) = matches.into_iter().next().unwrap();
+            Ok((stem, path_string(&path)?))
+        }
+        _ => {
+            let shorts: Vec<String> = matches
+                .iter()
+                .map(|(stem, _)| stem[..stem.len().min(12)].to_string())
+                .collect();
+            anyhow::bail!(
+                "multiple preserved provisioning disks; pick one: {}",
+                shorts.join(", ")
+            )
+        }
+    }
+}
+
+/// Remove every preserved failure disk under `{data_dir}/provision`, returning how many were
+/// removed. Their now-unreferenced chunks are reclaimed by the CAS sweep that follows in
+/// `dome prune`. Called by `dome prune`; missing dir is treated as "nothing to do".
+pub(crate) fn prune_failed_layers(data_dir: &str) -> Result<usize> {
+    let dir = provision_dir(data_dir);
+    let entries = match std::fs::read_dir(&dir) {
+        Ok(e) => e,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(0),
+        Err(e) => return Err(e).with_context(|| format!("reading {}", dir.display())),
+    };
+    let mut removed = 0;
+    for entry in entries.flatten() {
+        let path = entry.path();
+        if path.extension().and_then(|e| e.to_str()) == Some("failed") {
+            std::fs::remove_file(&path)
+                .with_context(|| format!("removing preserved disk {}", path.display()))?;
+            removed += 1;
+        }
+    }
+    Ok(removed)
 }
 
 /// A blocking, advisory per-hash build lock. `acquire` blocks until the lock is held (so a
@@ -272,10 +412,36 @@ mod tests {
             _disk_size_mb: u64,
             _env: &VmArgs,
             out_index: &str,
+            _failed_index: Option<&str>,
         ) -> Result<()> {
             self.calls.fetch_add(1, Ordering::SeqCst);
             std::fs::write(out_index, self.contents).unwrap();
             Ok(())
+        }
+    }
+
+    /// A runner that always fails after parking a half-provisioned disk at `failed_index`,
+    /// mirroring the real build: nothing is written to `out_index` on failure.
+    struct FailingRunner {
+        calls: Arc<AtomicUsize>,
+    }
+
+    impl StepRunner for FailingRunner {
+        fn build(
+            &self,
+            _spec: &ProvisionSpec,
+            _disk_size_mb: u64,
+            _env: &VmArgs,
+            _out_index: &str,
+            failed_index: Option<&str>,
+        ) -> Result<()> {
+            self.calls.fetch_add(1, Ordering::SeqCst);
+            if let Some(failed) = failed_index {
+                std::fs::write(failed, "half-provisioned").unwrap();
+            }
+            Err(anyhow::anyhow!(
+                "provision step failed (exit 1): apt-get install nope"
+            ))
         }
     }
 
@@ -391,6 +557,7 @@ mod tests {
             _disk_size_mb: u64,
             _env: &VmArgs,
             out_index: &str,
+            _failed_index: Option<&str>,
         ) -> Result<()> {
             self.calls.fetch_add(1, Ordering::SeqCst);
             std::thread::sleep(std::time::Duration::from_millis(80));
@@ -457,6 +624,139 @@ mod tests {
         assert_eq!(
             std::fs::read_to_string(&layer).unwrap(),
             "exact-layer-bytes"
+        );
+    }
+
+    #[test]
+    fn a_failed_build_publishes_nothing_and_parks_a_debug_disk() {
+        // The headline #67 invariant: a failing step fails the create, nothing is published
+        // under the success hash, and the half-provisioned disk is parked at `<hash>.failed`.
+        let tmp = tempfile::tempdir().unwrap();
+        let data_dir = tmp.path().to_str().unwrap();
+        let calls = Arc::new(AtomicUsize::new(0));
+        let runner = FailingRunner {
+            calls: calls.clone(),
+        };
+        let s = spec(&["apt-get install nope"], &[]);
+
+        let err = ensure_layer(data_dir, "v", &s, 4096, &VmArgs::default(), &runner)
+            .expect_err("a failed build must propagate the error");
+        // The failure surfaces the failing step's command + exit code (carried in the error).
+        let msg = format!("{err:#}");
+        assert!(
+            msg.contains("apt-get install nope"),
+            "error names the step: {msg}"
+        );
+        assert!(msg.contains("exit 1"), "error carries the exit code: {msg}");
+
+        let hash = cache_key("v", &s.steps, &s.allow);
+        assert!(
+            !layer_path(data_dir, &hash).exists(),
+            "nothing is published under the success hash after a failure"
+        );
+        assert!(
+            failed_layer_path(data_dir, &hash).exists(),
+            "the half-provisioned disk is parked at <hash>.failed"
+        );
+        // No temp index survives a failed build either.
+        let leftovers: Vec<_> = std::fs::read_dir(provision_dir(data_dir).as_path())
+            .unwrap()
+            .filter_map(|e| e.ok())
+            .filter(|e| e.file_name().to_string_lossy().contains(".tmp."))
+            .collect();
+        assert!(
+            leftovers.is_empty(),
+            "no temp index survives a failed build"
+        );
+        assert_eq!(calls.load(Ordering::SeqCst), 1, "the build ran once");
+    }
+
+    #[test]
+    fn a_subsequent_successful_build_overwrites_the_failed_disk() {
+        // Lifecycle: once the spec builds cleanly, the stale `.failed` disk is dropped and the
+        // success layer is published.
+        let tmp = tempfile::tempdir().unwrap();
+        let data_dir = tmp.path().to_str().unwrap();
+        let s = spec(&["install toolchain"], &[]);
+        let hash = cache_key("v", &s.steps, &s.allow);
+
+        // First: fail → debug disk parked, nothing published.
+        let fail = FailingRunner {
+            calls: Arc::new(AtomicUsize::new(0)),
+        };
+        ensure_layer(data_dir, "v", &s, 4096, &VmArgs::default(), &fail).unwrap_err();
+        assert!(failed_layer_path(data_dir, &hash).exists());
+
+        // Then: succeed → success layer published, stale `.failed` removed.
+        let ok = FakeRunner {
+            calls: Arc::new(AtomicUsize::new(0)),
+            contents: "clean-layer",
+        };
+        let layer = ensure_layer(data_dir, "v", &s, 4096, &VmArgs::default(), &ok)
+            .unwrap()
+            .unwrap();
+        assert!(Path::new(&layer).exists(), "the clean layer is published");
+        assert!(
+            !failed_layer_path(data_dir, &hash).exists(),
+            "a successful build supersedes (removes) the stale failure disk"
+        );
+    }
+
+    #[test]
+    fn prune_failed_layers_removes_only_failure_disks() {
+        // `dome prune` reclaims preserved failure disks but leaves published layers and locks.
+        let tmp = tempfile::tempdir().unwrap();
+        let data_dir = tmp.path().to_str().unwrap();
+        let dir = provision_dir(data_dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(dir.join("aaaa.failed"), "x").unwrap();
+        std::fs::write(dir.join("bbbb.failed"), "y").unwrap();
+        std::fs::write(dir.join("cccc.idx"), "live").unwrap();
+        std::fs::write(dir.join("cccc.lock"), "").unwrap();
+
+        let removed = prune_failed_layers(data_dir).unwrap();
+        assert_eq!(removed, 2, "both failure disks are reclaimed");
+        assert!(!dir.join("aaaa.failed").exists());
+        assert!(!dir.join("bbbb.failed").exists());
+        assert!(
+            dir.join("cccc.idx").exists(),
+            "published layers are left alone"
+        );
+        assert!(dir.join("cccc.lock").exists(), "locks are left alone");
+
+        // Idempotent: a second prune with nothing to do reclaims zero.
+        assert_eq!(prune_failed_layers(data_dir).unwrap(), 0);
+    }
+
+    #[test]
+    fn resolve_failed_layer_handles_prefix_unique_and_ambiguous() {
+        let tmp = tempfile::tempdir().unwrap();
+        let data_dir = tmp.path().to_str().unwrap();
+        let dir = provision_dir(data_dir);
+        std::fs::create_dir_all(&dir).unwrap();
+
+        // None present → a clear error.
+        assert!(resolve_failed_layer(data_dir, None).is_err());
+
+        std::fs::write(dir.join("abc123.failed"), "x").unwrap();
+        // Exactly one present, no selector → that one.
+        let (h, path) = resolve_failed_layer(data_dir, None).unwrap();
+        assert_eq!(h, "abc123");
+        assert!(path.ends_with("abc123.failed"));
+        // Prefix selects it.
+        assert_eq!(
+            resolve_failed_layer(data_dir, Some("abc")).unwrap().0,
+            "abc123"
+        );
+        // A non-matching selector errors.
+        assert!(resolve_failed_layer(data_dir, Some("zzz")).is_err());
+
+        // Two present + no selector → ambiguous error; a disambiguating prefix still resolves.
+        std::fs::write(dir.join("abd999.failed"), "y").unwrap();
+        assert!(resolve_failed_layer(data_dir, None).is_err());
+        assert_eq!(
+            resolve_failed_layer(data_dir, Some("abc")).unwrap().0,
+            "abc123"
         );
     }
 }

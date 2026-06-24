@@ -118,3 +118,95 @@ fn cold_build_then_second_run_is_a_cache_hit() {
     // Best-effort cleanup of the layer this test published.
     let _ = std::fs::remove_file(&layer);
 }
+
+/// The number of preserved failure ("debug") disks currently on disk.
+fn failed_disks() -> usize {
+    std::fs::read_dir(provision_dir())
+        .map(|rd| {
+            rd.filter_map(|e| e.ok())
+                .filter(|e| e.path().extension().and_then(|x| x.to_str()) == Some("failed"))
+                .count()
+        })
+        .unwrap_or(0)
+}
+
+/// A failing step fails the create, publishes nothing, and preserves a half-provisioned debug
+/// disk that `dome provision debug` can boot — without re-running the steps. The marker the
+/// first (succeeding) step wrote must be present on that debug disk.
+#[test]
+#[ignore]
+fn failing_step_preserves_a_bootable_debug_disk() {
+    let marker = format!("prov-fail-{}", std::process::id());
+    let dir = tempfile::tempdir().expect("tempdir");
+    // First step succeeds and leaves a marker; the second fails. The debug disk must carry the
+    // marker (the half-provisioned state) and the second step's effect must be absent.
+    let dome_json =
+        format!(r#"{{ "provision": {{ "steps": ["echo ok > /opt/{marker}", "exit 7"] }} }}"#);
+    std::fs::write(dir.path().join("dome.json"), dome_json).expect("write dome.json");
+
+    let failed_before = failed_disks();
+    let layers_before = published_layers();
+
+    let run = run_in(dir.path(), "true");
+    assert!(
+        !run.status.success(),
+        "a failing provision step must fail the create"
+    );
+    let stderr = String::from_utf8_lossy(&run.stderr);
+    assert!(
+        stderr.contains("exit 7"),
+        "the failure must surface the step's exit code; stderr: {stderr}"
+    );
+    assert!(
+        stderr.contains("dome provision debug"),
+        "the failure must print the opt-in debug-shell hint; stderr: {stderr}"
+    );
+
+    assert_eq!(
+        published_layers(),
+        layers_before,
+        "a failed build must publish nothing under the success hash"
+    );
+    assert_eq!(
+        failed_disks(),
+        failed_before + 1,
+        "the half-provisioned disk must be preserved as <hash>.failed"
+    );
+
+    // Boot the debug disk without re-running steps. `provision debug` opens an interactive
+    // `/bin/sh`, so drive it by piping a command to stdin: the first step's marker must be
+    // present (the preserved half-provisioned state), proving the disk booted and no steps
+    // re-ran.
+    use std::io::Write;
+    use std::process::Stdio;
+    let mut child = Command::new(dome_bin())
+        .current_dir(dir.path())
+        .args(["provision", "debug"])
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .expect("failed to spawn dome provision debug");
+    child
+        .stdin
+        .take()
+        .unwrap()
+        .write_all(format!("cat /opt/{marker}\nexit\n").as_bytes())
+        .unwrap();
+    let debug = child.wait_with_output().expect("debug shell output");
+    assert!(
+        String::from_utf8_lossy(&debug.stdout).contains("ok"),
+        "the debug shell must boot the preserved half-provisioned disk and see the marker; stdout: {}, stderr: {}",
+        String::from_utf8_lossy(&debug.stdout),
+        String::from_utf8_lossy(&debug.stderr),
+    );
+
+    // Best-effort cleanup of the failure disk this test produced.
+    if let Ok(rd) = std::fs::read_dir(provision_dir()) {
+        for e in rd.filter_map(|e| e.ok()) {
+            if e.path().extension().and_then(|x| x.to_str()) == Some("failed") {
+                let _ = std::fs::remove_file(e.path());
+            }
+        }
+    }
+}
