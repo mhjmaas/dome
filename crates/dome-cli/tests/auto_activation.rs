@@ -328,6 +328,203 @@ fn install_tip_shows_once_then_the_marker_suppresses_it() {
     cleanup(&name);
 }
 
+/// Is `shell` runnable on this host? Real-shell parity tests self-skip when it is not.
+fn have(shell: &str) -> bool {
+    Command::new(shell)
+        .arg("--version")
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .status()
+        .map(|s| s.success())
+        .unwrap_or(false)
+}
+
+/// Drive a REAL `shell` (argv) under a pty so it sources the emitted hook and, on `cd`, boots a
+/// real guest — then return the pty output as soon as `marker` appears in it (or a VM-boot-sized
+/// timeout elapses). The marker is the guest's own sandbox-labeled prompt: seeing it proves the
+/// real shell hook reached the real guest. We deliberately do NOT feed the guest any stdin and
+/// stop reading the moment the marker lands — driving a nested interactive guest shell over the
+/// same pty (typing `exit` to unwind it) deadlocks, because the host shell's line reader buffers
+/// the post-`cd` input before the guest can read it. The child (and its session) is killed after,
+/// and the caller force-stops the sandbox.
+///
+/// The pty gets a non-zero window size (fish bails otherwise) and the hook's guard env vars are
+/// scrubbed so it behaves as on a developer's machine.
+fn boot_guest_via_shell(argv: &[&str], input: &str, marker: &str) -> String {
+    let mut master: libc::c_int = 0;
+    let mut slave: libc::c_int = 0;
+    let rc = unsafe {
+        libc::openpty(
+            &mut master,
+            &mut slave,
+            std::ptr::null_mut(),
+            std::ptr::null_mut(),
+            std::ptr::null_mut(),
+        )
+    };
+    assert_eq!(rc, 0, "openpty failed");
+
+    let mut cmd = Command::new(argv[0]);
+    cmd.args(&argv[1..]);
+    cmd.env("TERM", "xterm");
+    for guard in ["CI", "DOME_SANDBOX", "DOME_NO_AUTO", "DOME_HOOK_INSTALLED"] {
+        cmd.env_remove(guard);
+    }
+    let slave_fd = slave;
+    unsafe {
+        cmd.stdin(Stdio::from_raw_fd(libc::dup(slave_fd)));
+        cmd.stdout(Stdio::from_raw_fd(libc::dup(slave_fd)));
+        cmd.stderr(Stdio::from_raw_fd(libc::dup(slave_fd)));
+        cmd.pre_exec(move || {
+            libc::setsid();
+            let ws = libc::winsize {
+                ws_row: 40,
+                ws_col: 120,
+                ws_xpixel: 0,
+                ws_ypixel: 0,
+            };
+            libc::ioctl(slave_fd, libc::TIOCSWINSZ as _, &ws);
+            let _ = libc::ioctl(slave_fd, libc::TIOCSCTTY as _, 0);
+            Ok(())
+        });
+    }
+    let mut child = cmd.spawn().expect("spawn shell under pty");
+    let child_pid = child.id() as libc::pid_t;
+    unsafe {
+        libc::close(slave);
+    }
+
+    if !input.is_empty() {
+        let mut writer = unsafe { std::fs::File::from_raw_fd(libc::dup(master)) };
+        writer.write_all(input.as_bytes()).ok();
+        writer.flush().ok();
+    }
+
+    let mut reader = unsafe { std::fs::File::from_raw_fd(master) };
+    let start = Instant::now();
+    let mut buf = [0u8; 4096];
+    let mut out = String::new();
+    loop {
+        if out.contains(marker) {
+            break; // the guest prompt rendered — the hook reached the real guest.
+        }
+        match reader.read(&mut buf) {
+            Ok(0) | Err(_) => break,
+            Ok(n) => out.push_str(&String::from_utf8_lossy(&buf[..n])),
+        }
+        if start.elapsed() > Duration::from_secs(90) {
+            break;
+        }
+    }
+    // Tear down the whole session (host shell + the guest shell it is blocked on); the caller's
+    // `cleanup` then force-stops the sandbox VM itself.
+    unsafe {
+        libc::killpg(child_pid, libc::SIGKILL);
+    }
+    let _ = child.wait();
+    out
+}
+
+/// Hook parity, real VM (#64): a REAL bash shell that sources `dome hook bash` boots a real guest
+/// on `cd` into a trusted project. Bash's hook fires via `PROMPT_COMMAND`, so the shell is driven
+/// interactively over a pty. We assert on the guest's sandbox-labeled prompt `[sandbox:<name>]`,
+/// which only renders once the hook has dropped into the named guest VM.
+#[test]
+#[ignore]
+fn bash_hook_drops_into_real_guest() {
+    if !have("bash") {
+        eprintln!("skipping: bash not available");
+        return;
+    }
+    let name = sandbox_name("bash");
+    cleanup(&name);
+
+    let tmp = tempfile::tempdir().expect("tempdir");
+    let project = tmp.path();
+    std::fs::write(
+        project.join("dome.json"),
+        format!("{{\"sandbox\":\"{name}\"}}"),
+    )
+    .unwrap();
+
+    // Trust it (piped, non-interactive → no pin prompt) so the drop-in actually boots a VM.
+    let allow = dome_in(project, &["allow"]);
+    assert!(allow.status.success(), "dome allow failed");
+
+    // Emit the real bash hook to a file the script sources, wiring DOME_HOOK_CMD at the real
+    // codesigned binary so the drop-in boots an actual guest.
+    let hook = project.join("hook.bash");
+    let out = Command::new(dome_bin())
+        .args(["hook", "bash"])
+        .output()
+        .expect("dome hook bash");
+    std::fs::write(&hook, out.stdout).unwrap();
+
+    // Source the hook, then `cd` in → PROMPT_COMMAND fires the hook → it boots the named guest.
+    let input = format!(
+        "export DOME_HOOK_CMD='{dome}'\nsource {hook}\ncd {proj}\n",
+        dome = dome_bin(),
+        hook = hook.display(),
+        proj = project.display(),
+    );
+    let marker = format!("[sandbox:{name}]");
+    let output = boot_guest_via_shell(&["bash", "--norc", "--noprofile", "-i"], &input, &marker);
+    cleanup(&name);
+
+    assert!(
+        output.contains(&marker),
+        "the bash hook must drop into the named guest (prompt `{marker}`); output:\n{output}"
+    );
+}
+
+/// Hook parity, real VM (#64): a REAL fish shell that sources `dome hook fish` boots a real guest
+/// on `cd` into a trusted project. Fish fires `--on-variable PWD` synchronously, so a single
+/// `fish -i -c` script suffices. We assert on the guest's sandbox-labeled prompt `[sandbox:<name>]`.
+#[test]
+#[ignore]
+fn fish_hook_drops_into_real_guest() {
+    if !have("fish") {
+        eprintln!("skipping: fish not available");
+        return;
+    }
+    let name = sandbox_name("fish");
+    cleanup(&name);
+
+    let tmp = tempfile::tempdir().expect("tempdir");
+    let project = tmp.path();
+    std::fs::write(
+        project.join("dome.json"),
+        format!("{{\"sandbox\":\"{name}\"}}"),
+    )
+    .unwrap();
+
+    let allow = dome_in(project, &["allow"]);
+    assert!(allow.status.success(), "dome allow failed");
+
+    let hook = project.join("hook.fish");
+    let out = Command::new(dome_bin())
+        .args(["hook", "fish"])
+        .output()
+        .expect("dome hook fish");
+    std::fs::write(&hook, out.stdout).unwrap();
+
+    // fish wires DOME_HOOK_CMD with `set -gx`; the `cd` fires the PWD event, which boots the guest.
+    let script = format!(
+        "set -gx DOME_HOOK_CMD '{dome}'\nsource {hook}\ncd {proj}",
+        dome = dome_bin(),
+        hook = hook.display(),
+        proj = project.display(),
+    );
+    let marker = format!("[sandbox:{name}]");
+    let output = boot_guest_via_shell(&["fish", "--no-config", "-i", "-c", &script], "", &marker);
+    cleanup(&name);
+
+    assert!(
+        output.contains(&marker),
+        "the fish hook must drop into the named guest (prompt `{marker}`); output:\n{output}"
+    );
+}
+
 /// The full tracer bullet: untrusted → no drop-in; `dome allow` → trusted; drop-in lands in the
 /// guest at the mapped SUBDIRECTORY and returns the "dropped-in" exit code.
 #[test]
