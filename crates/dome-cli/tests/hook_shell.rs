@@ -82,6 +82,14 @@ fn run_in_pty(script: &str, envs: &[(&str, &str)]) -> String {
     // script string and exits.
     let mut cmd = Command::new("zsh");
     cmd.args(["-ifc", script]);
+    // Scrub the hook's environment guards from whatever the host process inherited so the spawned
+    // shell starts from a known-clean state. Without this, a runner that sets `$CI` (every GitHub
+    // Actions job does) would trip the hook's `[[ -n "$CI" ]]` guard and silently suppress every
+    // drop-in — making the positive-activation tests pass locally but fail in CI. Each test then
+    // re-adds exactly the guard it wants to exercise via `envs`, applied on top below.
+    for guard in ["CI", "DOME_SANDBOX", "DOME_NO_AUTO"] {
+        cmd.env_remove(guard);
+    }
     for (k, v) in envs {
         cmd.env(k, v);
     }
