@@ -32,9 +32,13 @@ pub(crate) const HOOK_SENTINEL: &str = "DOME_HOOK_INSTALLED";
 
 /// The exact shell rc line that enables the hook for `shell`, e.g. `eval "$(dome hook zsh)"`.
 /// This is the single source of truth printed by the install tip, written by `dome hook
-/// --install`, and mentioned by `dome init`.
+/// --install`, and mentioned by `dome init`. Fish has no `eval "$(...)"`; its idiom is to pipe
+/// the emitted hook into `source`.
 fn hook_rc_line(shell: &str) -> String {
-    format!("eval \"$(dome hook {shell})\"")
+    match shell {
+        "fish" => "dome hook fish | source".to_string(),
+        _ => format!("eval \"$(dome hook {shell})\""),
+    }
 }
 
 /// The one-time, copy-paste install tip shown after a manual `dome sandbox` session when the
@@ -50,16 +54,18 @@ fn install_tip(shell: &str) -> String {
 }
 
 /// The shell to offer hook integration for, derived from `$SHELL`, limited to shells whose
-/// hook `dome` can currently emit. Returns `Some("zsh")` for a zsh `$SHELL` (or when `$SHELL`
-/// is unset — zsh is the macOS default and the only supported shell), and `None` for any other
-/// shell so neither the install tip nor `dome hook --install` suggests a line that would not
-/// work yet (bash/fish emission is a follow-up). Pure given the env lookup, so it is unit-tested.
+/// hook `dome` can emit. Returns `Some(shell)` for a zsh/bash/fish `$SHELL` (or when `$SHELL`
+/// is unset — zsh is the macOS default), and `None` for any other shell so neither the install
+/// tip nor `dome hook --install` suggests a line that would not work. Pure given the env lookup,
+/// so it is unit-tested.
 fn supported_shell(getenv: impl Fn(&str) -> Option<String>) -> Option<String> {
     let Some(shell) = getenv("SHELL").filter(|s| !s.is_empty()) else {
         return Some("zsh".to_string());
     };
     match Path::new(&shell).file_name().and_then(|s| s.to_str()) {
         Some("zsh") => Some("zsh".to_string()),
+        Some("bash") => Some("bash".to_string()),
+        Some("fish") => Some("fish".to_string()),
         _ => None,
     }
 }
@@ -140,22 +146,27 @@ pub(crate) fn init_hook_hint() -> String {
     )
 }
 
-/// `dome hook <shell>`: print the shell-integration hook to stdout. Only `zsh` is supported
-/// in this slice (bash/fish are a follow-up); any other shell is a clear error rather than a
-/// silent no-op the developer would `eval` into nothing.
+/// `dome hook <shell>`: print the shell-integration hook to stdout. Supports `zsh`, `bash`, and
+/// `fish`; any other shell is a clear error rather than a silent no-op the developer would `eval`
+/// into nothing.
 pub(crate) fn run_hook(shell: &str) -> Result<()> {
+    let cmd = std::env::current_exe()
+        .map(|p| p.to_string_lossy().to_string())
+        .unwrap_or_else(|_| "dome".to_string());
     match shell {
         "zsh" => {
-            let cmd = std::env::current_exe()
-                .map(|p| p.to_string_lossy().to_string())
-                .unwrap_or_else(|_| "dome".to_string());
             print!("{}", emit_zsh_hook(&cmd));
             Ok(())
         }
-        "bash" | "fish" => anyhow::bail!(
-            "`dome hook {shell}` is not available yet (zsh only for now). Use `dome hook zsh`."
-        ),
-        other => anyhow::bail!("unknown shell '{other}'. Supported: zsh."),
+        "bash" => {
+            print!("{}", emit_bash_hook(&cmd));
+            Ok(())
+        }
+        "fish" => {
+            print!("{}", emit_fish_hook(&cmd));
+            Ok(())
+        }
+        other => anyhow::bail!("unknown shell '{other}'. Supported: zsh, bash, fish."),
     }
 }
 
@@ -185,8 +196,8 @@ pub(crate) fn run_hook_install() -> Result<()> {
     let getenv = |k: &str| std::env::var(k).ok();
     let shell = supported_shell(getenv).ok_or_else(|| {
         anyhow::anyhow!(
-            "could not detect a supported shell from $SHELL (zsh only for now). Add this to \
-             your shell rc manually:\n\n    {}",
+            "could not detect a supported shell from $SHELL (supported: zsh, bash, fish). Add \
+             this to your shell rc manually:\n\n    {}",
             hook_rc_line("zsh")
         )
     })?;
@@ -381,6 +392,147 @@ __dome_hook() {{
 autoload -Uz add-zsh-hook
 add-zsh-hook chpwd __dome_hook
 add-zsh-hook precmd __dome_hook
+"#,
+        cmd = cmd,
+        sentinel = HOOK_SENTINEL,
+        dropped = ACTIVATE_DROPPED_IN,
+        untrusted = ACTIVATE_UNTRUSTED,
+    )
+}
+
+/// Emit the bash shell-integration hook for `eval "$(dome hook bash)"`. Bash has no per-`cd`
+/// hook, so the function is wired into `PROMPT_COMMAND` (it runs before every prompt) and a
+/// `$PWD`-change guard makes it a no-op unless the directory actually changed — the bash analog
+/// of zsh's `chpwd`+`precmd`. Detection, the no-op guard set, per-terminal-session suppression,
+/// and the untrusted hint all match the zsh hook exactly; only the idioms differ (`$-`/`${x%/*}`
+/// instead of `-o interactive`/`:h`). `cmd` is the baked dome path; `DOME_HOOK_CMD` overrides it
+/// (used to drive a fake shim in shell-level tests).
+pub(crate) fn emit_bash_hook(cmd: &str) -> String {
+    let cmd = cmd.replace('\'', r"'\''");
+    format!(
+        r#"# dome directory auto-activation (bash). Installed via: eval "$(dome hook bash)"
+# Sentinel: marks the hook as installed so a manual `dome sandbox` session can skip the
+# one-time install tip. Child processes inherit it from the shell environment.
+export {sentinel}=1
+__dome_hook() {{
+  # No-op guards: only ever activate an interactive terminal the developer is driving.
+  case $- in *i*) ;; *) return 0 ;; esac
+  [[ -t 0 && -t 1 ]] || return 0
+  [[ -n "$CI" ]] && return 0
+  [[ -n "$DOME_SANDBOX" ]] && return 0
+  [[ "$DOME_NO_AUTO" == "1" ]] && return 0
+
+  # PROMPT_COMMAND runs before every prompt; only react when the directory changed.
+  [[ "$PWD" == "$__dome_last_pwd" ]] && return 0
+  __dome_last_pwd="$PWD"
+
+  # Pure-shell walk up to the nearest dome.json. `dome` is never exec'd on a miss.
+  local dir="$PWD" found=""
+  while [[ -n "$dir" ]]; do
+    if [[ -f "$dir/dome.json" ]]; then found="$dir"; break; fi
+    [[ "$dir" == "/" ]] && break
+    dir="${{dir%/*}}"
+    [[ -z "$dir" ]] && dir="/"
+  done
+  if [[ -z "$found" ]]; then
+    # Left every project: clear suppression so re-entering re-activates.
+    __dome_suppressed_root=""
+    return 0
+  fi
+
+  # Already activated this project this session (and returned to the host): stay put until
+  # the developer leaves the project and comes back.
+  [[ "$__dome_suppressed_root" == "$found" ]] && return 0
+
+  "${{DOME_HOOK_CMD:-'{cmd}'}}" __hook-activate "$found"
+  local rc=$?
+  # Suppress re-entry for this project until the developer leaves and returns.
+  __dome_suppressed_root="$found"
+  if [[ $rc -eq {dropped} ]]; then
+    printf '%s\n' "dome: back on the host — cd out of and into ${{found##*/}} to re-enter" >&2
+  elif [[ $rc -eq {untrusted} ]]; then
+    # Print the `dome allow` hint at most once per terminal session, even across re-entries.
+    if [[ " $__dome_hinted " != *" $found "* ]]; then
+      __dome_hinted="$__dome_hinted $found"
+      printf '%s\n' "dome: ${{found##*/}} has a dome.json but is not trusted. Run 'dome allow' to auto-activate it." >&2
+    fi
+  fi
+}}
+# Prepend the hook to PROMPT_COMMAND (once), preserving any existing value.
+case "$PROMPT_COMMAND" in
+  *__dome_hook*) ;;
+  *) PROMPT_COMMAND="__dome_hook${{PROMPT_COMMAND:+;$PROMPT_COMMAND}}" ;;
+esac
+"#,
+        cmd = cmd,
+        sentinel = HOOK_SENTINEL,
+        dropped = ACTIVATE_DROPPED_IN,
+        untrusted = ACTIVATE_UNTRUSTED,
+    )
+}
+
+/// Emit the fish shell-integration hook for `dome hook fish | source`. Fish fires the function
+/// on every `$PWD` change via `--on-variable PWD` (its native directory-change event — the
+/// analog of zsh's `chpwd`). Detection, the no-op guard set, per-terminal-session suppression,
+/// and the untrusted hint all match the zsh hook exactly, translated to fish idioms (`test`,
+/// `status is-interactive`, `isatty`, `dirname`). `cmd` is the baked dome path; `DOME_HOOK_CMD`
+/// overrides it (used to drive a fake shim in shell-level tests).
+pub(crate) fn emit_fish_hook(cmd: &str) -> String {
+    let cmd = cmd.replace('\'', r"\'");
+    format!(
+        r#"# dome directory auto-activation (fish). Installed via: dome hook fish | source
+# Sentinel: marks the hook as installed so a manual `dome sandbox` session can skip the
+# one-time install tip. Child processes inherit it from the shell environment.
+set -gx {sentinel} 1
+function __dome_hook --on-variable PWD
+  # No-op guards: only ever activate an interactive terminal the developer is driving.
+  status is-interactive; or return 0
+  isatty stdin; and isatty stdout; or return 0
+  test -n "$CI"; and return 0
+  test -n "$DOME_SANDBOX"; and return 0
+  test "$DOME_NO_AUTO" = "1"; and return 0
+
+  # --on-variable PWD only fires on a real change, but guard defensively all the same.
+  test "$PWD" = "$__dome_last_pwd"; and return 0
+  set -g __dome_last_pwd "$PWD"
+
+  # Pure-shell walk up to the nearest dome.json. `dome` is never exec'd on a miss.
+  set -l dir "$PWD"
+  set -l found ""
+  while true
+    if test -f "$dir/dome.json"
+      set found "$dir"
+      break
+    end
+    test "$dir" = "/"; and break
+    set dir (dirname "$dir")
+  end
+  if test -z "$found"
+    # Left every project: clear suppression so re-entering re-activates.
+    set -g __dome_suppressed_root ""
+    return 0
+  end
+
+  # Already activated this project this session (and returned to the host): stay put until
+  # the developer leaves the project and comes back.
+  test "$__dome_suppressed_root" = "$found"; and return 0
+
+  set -l cmd $DOME_HOOK_CMD
+  test -z "$cmd"; and set cmd '{cmd}'
+  "$cmd" __hook-activate "$found"
+  set -l rc $status
+  # Suppress re-entry for this project until the developer leaves and returns.
+  set -g __dome_suppressed_root "$found"
+  if test $rc -eq {dropped}
+    echo "dome: back on the host — cd out of and into "(basename "$found")" to re-enter" >&2
+  else if test $rc -eq {untrusted}
+    # Print the `dome allow` hint at most once per terminal session, even across re-entries.
+    if not contains -- "$found" $__dome_hinted
+      set -g __dome_hinted $__dome_hinted "$found"
+      echo "dome: "(basename "$found")" has a dome.json but is not trusted. Run 'dome allow' to auto-activate it." >&2
+    end
+  end
+end
 "#,
         cmd = cmd,
         sentinel = HOOK_SENTINEL,
@@ -949,16 +1101,85 @@ mod tests {
     }
 
     #[test]
-    fn supported_shell_detects_zsh_and_rejects_unsupported() {
-        // A zsh $SHELL → zsh; an unset $SHELL defaults to zsh (the only supported + macOS default).
+    fn supported_shell_detects_zsh_bash_fish_and_rejects_others() {
+        // A zsh $SHELL → zsh; an unset $SHELL defaults to zsh (the macOS default).
         assert_eq!(
             supported_shell(|k| (k == "SHELL").then(|| "/bin/zsh".to_string())).as_deref(),
             Some("zsh")
         );
         assert_eq!(supported_shell(no_env).as_deref(), Some("zsh"));
-        // bash/fish hook emission lands in a follow-up; don't suggest a line that won't work yet.
-        assert!(supported_shell(|k| (k == "SHELL").then(|| "/bin/bash".to_string())).is_none());
-        assert!(supported_shell(|k| (k == "SHELL").then(|| "/usr/bin/fish".to_string())).is_none());
+        // bash and fish are now at parity with zsh.
+        assert_eq!(
+            supported_shell(|k| (k == "SHELL").then(|| "/bin/bash".to_string())).as_deref(),
+            Some("bash")
+        );
+        assert_eq!(
+            supported_shell(|k| (k == "SHELL").then(|| "/usr/bin/fish".to_string())).as_deref(),
+            Some("fish")
+        );
+        // An unsupported shell still suggests no line that wouldn't work.
+        assert!(supported_shell(|k| (k == "SHELL").then(|| "/bin/tcsh".to_string())).is_none());
+    }
+
+    #[test]
+    fn fish_rc_line_uses_the_source_idiom_not_eval() {
+        // Fish has no `eval "$(...)"`; its idiom pipes the emitted hook into `source`.
+        assert_eq!(hook_rc_line("fish"), "dome hook fish | source");
+        assert_eq!(hook_rc_line("bash"), "eval \"$(dome hook bash)\"");
+    }
+
+    #[test]
+    fn bash_hook_wires_into_prompt_command_with_the_guards_and_walk_up() {
+        let script = emit_bash_hook("/opt/dome");
+        // Bash's per-prompt hook is PROMPT_COMMAND (the chpwd/precmd analog).
+        assert!(
+            script.contains("PROMPT_COMMAND"),
+            "bash hook must wire into PROMPT_COMMAND; got:\n{script}"
+        );
+        // Sentinel export so a manual session can detect the installed hook.
+        assert!(script.contains(&format!("export {HOOK_SENTINEL}=")));
+        // The full environment guard set is present.
+        assert!(script.contains("DOME_SANDBOX"), "guest sentinel guard");
+        assert!(script.contains("CI"), "CI guard");
+        assert!(script.contains("DOME_NO_AUTO"), "opt-out guard");
+        assert!(script.contains("$-"), "interactive-shell guard");
+        assert!(
+            script.contains("-t 0") || script.contains("-t 1"),
+            "tty guard"
+        );
+        // Pure-shell walk-up to dome.json that only execs dome on a hit, via the baked path,
+        // overridable for tests.
+        assert!(script.contains("dome.json"));
+        assert!(script.contains("__hook-activate"));
+        assert!(script.contains("/opt/dome"));
+        assert!(script.contains("DOME_HOOK_CMD"));
+    }
+
+    #[test]
+    fn fish_hook_uses_the_pwd_event_with_the_guards_and_walk_up() {
+        let script = emit_fish_hook("/opt/dome");
+        // Fish's native directory-change event (the chpwd analog).
+        assert!(
+            script.contains("--on-variable PWD"),
+            "fish hook must react to PWD changes; got:\n{script}"
+        );
+        // Sentinel export (fish idiom: `set -gx`).
+        assert!(script.contains(&format!("set -gx {HOOK_SENTINEL}")));
+        // The full environment guard set is present.
+        assert!(script.contains("DOME_SANDBOX"), "guest sentinel guard");
+        assert!(script.contains("CI"), "CI guard");
+        assert!(script.contains("DOME_NO_AUTO"), "opt-out guard");
+        assert!(
+            script.contains("status is-interactive"),
+            "interactive guard"
+        );
+        assert!(script.contains("isatty"), "tty guard");
+        // Pure-shell walk-up to dome.json that only execs dome on a hit, via the baked path,
+        // overridable for tests.
+        assert!(script.contains("dome.json"));
+        assert!(script.contains("__hook-activate"));
+        assert!(script.contains("/opt/dome"));
+        assert!(script.contains("DOME_HOOK_CMD"));
     }
 
     #[test]
