@@ -14,7 +14,9 @@
 //! the worker is a transparent pipe, never in a position to reinterpret the frames.
 
 use std::io::{BufReader, BufWriter, Read, Write};
+use std::net::{Shutdown, TcpStream};
 use std::os::fd::RawFd;
+use std::os::unix::net::UnixStream;
 use std::sync::{Arc, Mutex};
 
 use dome_proto::frame;
@@ -153,4 +155,76 @@ pub fn run_piped_client(
     let _ = stdout.flush();
     let _ = stderr.flush();
     exit_code
+}
+
+/// A duplex stream a client relay can split into an independent read and write half and then
+/// half-close the write side on, to signal end-of-input while still reading output. Both
+/// transports a relay runs over implement it: a direct vsock [`TcpStream`] (the in-process
+/// `dome run` path) and the [`UnixStream`] to a persistent worker (whose `splice` propagates
+/// the half-close through to the guest). Keeping the relay generic over this — like
+/// [`run_pty_client`]/[`run_piped_client`] — lets one implementation serve both paths.
+pub trait DuplexStream: Read + Write + Send + 'static {
+    /// A clone sharing the same underlying socket, used as the write half.
+    fn try_clone_stream(&self) -> std::io::Result<Self>
+    where
+        Self: Sized;
+    /// Shut down only the write direction (a half-close): the peer sees EOF on its read while
+    /// this side can still read the peer's output.
+    fn shutdown_write(&self) -> std::io::Result<()>;
+}
+
+impl DuplexStream for TcpStream {
+    fn try_clone_stream(&self) -> std::io::Result<Self> {
+        self.try_clone()
+    }
+    fn shutdown_write(&self) -> std::io::Result<()> {
+        self.shutdown(Shutdown::Write)
+    }
+}
+
+impl DuplexStream for UnixStream {
+    fn try_clone_stream(&self) -> std::io::Result<Self> {
+        self.try_clone()
+    }
+    fn shutdown_write(&self) -> std::io::Result<()> {
+        self.shutdown(Shutdown::Write)
+    }
+}
+
+/// Like [`run_piped_client`], but also forwards host `stdin` to the guest as STDIN frames and
+/// half-closes the write side on EOF. Without this, a non-interactive guest process that reads
+/// stdin — a bare shell booted by `dome provision debug`, or the consumer in
+/// `printf '…' | dome run -- cat` — blocks forever: the guest holds its child's stdin open
+/// waiting for STDIN frames, and the child never sees EOF. `stream` is the bidirectional exec
+/// connection — a vsock [`TcpStream`] for an in-process session, or the worker [`UnixStream`]
+/// for a persistent one (the worker splices the STDIN frames and the half-close to the guest).
+///
+/// The stdin pump runs on its own thread and is intentionally NOT joined: it may be parked in a
+/// blocking read on a host stdin that never closes (e.g. an inherited terminal), and the only
+/// callers are the one-shot/relay paths that exit as soon as the guest command does. Leaving it
+/// detached lets the EXIT frame end the session promptly; the process teardown reaps it.
+pub fn run_piped_client_with_stdin<S: DuplexStream>(
+    stream: S,
+    mut stdin: impl Read + Send + 'static,
+    stdout: &mut impl Write,
+    stderr: &mut impl Write,
+) -> i32 {
+    if let Ok(mut writer) = stream.try_clone_stream() {
+        std::thread::spawn(move || {
+            let mut buf = [0u8; 8192];
+            loop {
+                match stdin.read(&mut buf) {
+                    Ok(0) | Err(_) => break,
+                    Ok(n) => {
+                        if frame::write_frame(&mut writer, frame::STDIN, &buf[..n]).is_err() {
+                            break;
+                        }
+                    }
+                }
+            }
+            // Tell the guest our end of stdin is done so it closes the child's stdin (EOF).
+            let _ = writer.shutdown_write();
+        });
+    }
+    run_piped_client(stream, stdout, stderr)
 }

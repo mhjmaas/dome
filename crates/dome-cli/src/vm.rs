@@ -443,12 +443,17 @@ pub(crate) fn run_command(prepared: &PreparedVm, command: &[String]) -> Result<R
     let exit_code = if std::io::stdin().is_terminal() {
         booted.sandbox.shell(command, &booted.env)?
     } else {
-        booted.sandbox.exec_with_env(
-            command,
-            &booted.env,
+        // Non-interactive, but still forward host stdin: a piped command (`… | dome run -- cat`)
+        // or a piped interactive shell (`dome provision debug` driven from a script/CI) must be
+        // fed its input and see EOF when ours closes. A bare guest shell that reads stdin would
+        // otherwise block forever — the guest keeps the child's stdin open awaiting STDIN frames.
+        let stream = booted.sandbox.open_exec(command, &booted.env, None)?;
+        dome_vm::client::run_piped_client_with_stdin(
+            stream,
+            std::io::stdin(),
             &mut std::io::stdout(),
             &mut std::io::stderr(),
-        )?
+        )
     };
 
     let BootedVm {
@@ -689,6 +694,22 @@ pub(crate) const GUEST_PROJECT_ROOT: &str = "/workspace";
 /// without a hypervisor. The resulting spec is parsed and validated like any other mount when
 /// [`prepare_vm`] consumes the list (host-within-cwd and the rw/`--allow-host-writes` gate
 /// still apply).
+/// Whether `path` lies within the current working directory — the same boundary
+/// [`validate_mounts`] enforces. The auto project-root mount is only added when its root
+/// satisfies this, so an out-of-tree `dome.json` (e.g. an explicit `--config /elsewhere`,
+/// whose directory is not under CWD) does not hard-fail the boot on a mount the user never
+/// asked for; the convenience mount is simply skipped. A canonicalization failure (path
+/// gone) reads as "outside".
+pub(crate) fn path_within_cwd(path: &std::path::Path) -> bool {
+    let Ok(cwd) = std::env::current_dir().and_then(std::fs::canonicalize) else {
+        return false;
+    };
+    match std::fs::canonicalize(path) {
+        Ok(p) => p.starts_with(&cwd),
+        Err(_) => false,
+    }
+}
+
 pub(crate) fn with_project_root_mount(
     mounts: &[String],
     project_root: &std::path::Path,

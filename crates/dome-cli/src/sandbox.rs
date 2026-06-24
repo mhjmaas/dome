@@ -702,7 +702,12 @@ pub(crate) fn delete_sandbox_index(data_dir: &str, name: &str) -> Result<()> {
     let index_path = format!("{}/sandboxes/{}.idx", data_dir, name);
     let lock_path = PathBuf::from(format!("{}/sandboxes/{}.lock", data_dir, name));
 
-    if !Path::new(&index_path).exists() {
+    // A sandbox exists once it has a config sidecar (sidecar-as-truth, #40) — the index only
+    // appears on the first save, so a running-but-never-saved sandbox has a config but no
+    // `.idx`. Keying existence on the index alone would report such a sandbox "not found"
+    // instead of letting the running guard below refuse it; check the sidecar too.
+    let config_path = ResolvedConfig::path(data_dir, name);
+    if !Path::new(&index_path).exists() && !config_path.exists() {
         bail!("sandbox '{}' not found", name);
     }
 
@@ -727,8 +732,12 @@ pub(crate) fn delete_sandbox_index(data_dir: &str, name: &str) -> Result<()> {
         ),
     };
 
-    std::fs::remove_file(&index_path)
-        .with_context(|| format!("failed to remove sandbox index '{}'", index_path))?;
+    // Remove the index if it exists; a config-only sandbox (created or booted but never
+    // saved) has none, and removing its sidecar below is what actually deletes it.
+    if Path::new(&index_path).exists() {
+        std::fs::remove_file(&index_path)
+            .with_context(|| format!("failed to remove sandbox index '{}'", index_path))?;
+    }
     // Drop any crash marker too, so a sandbox later reusing this name does not inherit a
     // stale `failed` state in `ls` before its first cold boot. Best-effort.
     worker::clear_failed_marker(data_dir, name);

@@ -82,7 +82,10 @@ pub(crate) fn sweep(data_dir: &str) -> Result<SweepStats> {
     let (chunk_refs, base_refs) = collect_referenced(data_dir)?;
     let mut stats = SweepStats::default();
 
-    let chunks_dir = format!("{}/chunks", data_dir);
+    // The CAS chunk store lives at `{data_dir}/cas/chunks` (see `vm.rs`: `cas_dir =
+    // {data_dir}/cas`, and `LocalChunkStore` appends `chunks`). Pointing the sweep at
+    // `{data_dir}/chunks` would always hit NotFound and silently reclaim nothing.
+    let chunks_dir = format!("{}/cas/chunks", data_dir);
     match std::fs::read_dir(&chunks_dir) {
         Ok(entries) => {
             for entry in entries {
@@ -293,13 +296,13 @@ mod tests {
 
     /// Write a fake chunk file (named by `hash`) with `len` bytes into the chunk store.
     fn write_chunk(data_dir: &str, hash: &str, len: usize) {
-        let chunks_dir = format!("{}/chunks", data_dir);
+        let chunks_dir = format!("{}/cas/chunks", data_dir);
         std::fs::create_dir_all(&chunks_dir).unwrap();
         std::fs::write(format!("{}/{}", chunks_dir, hash), vec![0u8; len]).unwrap();
     }
 
     fn chunk_exists(data_dir: &str, hash: &str) -> bool {
-        std::path::Path::new(&format!("{}/chunks/{}", data_dir, hash)).exists()
+        std::path::Path::new(&format!("{}/cas/chunks/{}", data_dir, hash)).exists()
     }
 
     #[test]

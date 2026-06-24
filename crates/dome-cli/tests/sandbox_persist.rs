@@ -86,7 +86,7 @@ fn sandbox_index_path(name: &str) -> String {
 /// Number of chunk files currently in the global CAS chunk store.
 fn chunk_count() -> usize {
     let home = std::env::var("HOME").unwrap_or_else(|_| "/tmp".to_string());
-    let chunks = format!("{}/.local/share/dome/chunks", home);
+    let chunks = format!("{}/.local/share/dome/cas/chunks", home);
     std::fs::read_dir(&chunks).map(|d| d.count()).unwrap_or(0)
 }
 
