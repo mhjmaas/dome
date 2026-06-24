@@ -68,6 +68,9 @@ pub(crate) fn run_allow() -> Result<()> {
         eprintln!("{}", diff.trim_end());
         eprintln!();
     }
+    // Offer to pin a stable `sandbox` name before recording trust, so the trust record (and thus
+    // auto-activation) pins to the final, possibly-just-pinned content.
+    let bytes = maybe_offer_pin(&project_dir, bytes);
     crate::trust::record_trust(&data_dir, &project_dir, &bytes)?;
     eprintln!(
         "dome: trusted {} — the shell hook will now auto-activate it (edits to dome.json \
@@ -114,11 +117,20 @@ fn drop_in(project_dir: &Path) -> Result<()> {
         std::fs::canonicalize(project_dir).unwrap_or_else(|_| project_dir.to_path_buf());
     let land = crate::vm::guest_landing_cwd(&project_canon, &host_cwd)
         .unwrap_or_else(|| crate::vm::GUEST_PROJECT_ROOT.to_string());
-    // chdir into the project so `dome.json` (and thus the sandbox name + project mount)
-    // resolves there, matching what `dome sandbox shell` does from the project root.
+    // Resolve the sandbox name with the collision-proof *auto-activation* policy: an explicit
+    // `sandbox` field wins, else `<slug>-<pathhash>` so two different directories with the same
+    // basename never silently share one VM. (Manual `dome sandbox shell` keeps the bare cwd-slug;
+    // only this auto-drop path hashes the path.) Computed from the canonical project dir before we
+    // chdir, then passed explicitly so it bypasses `run_sandbox`'s manual cwd-slug fallback.
+    let cfg = load_config(Some(
+        project_dir.join("dome.json").to_string_lossy().as_ref(),
+    ))?;
+    let name = crate::sandbox::auto_activation_name(&cfg, &project_canon)?;
+    // chdir into the project so `dome.json` (and thus the project mount) resolves there, matching
+    // what `dome sandbox shell` does from the project root.
     std::env::set_current_dir(project_dir)?;
     crate::sandbox::run_sandbox(
-        None,
+        Some(name),
         &crate::cli::VmArgs::default(),
         Vec::new(),
         None,
@@ -346,7 +358,7 @@ pub(crate) fn maybe_prompt_inline_trust() -> Result<()> {
     let cfg = load_config(Some(
         project_dir.join("dome.json").to_string_lossy().as_ref(),
     ))?;
-    let name = crate::sandbox::resolve_name(None, &cfg, &project_dir)
+    let name = crate::sandbox::auto_activation_name(&cfg, &project_dir)
         .unwrap_or_else(|_| project_dir.display().to_string());
 
     eprint!("dome: trust '{name}' and auto-activate on entry? [y/N] ");
@@ -354,6 +366,9 @@ pub(crate) fn maybe_prompt_inline_trust() -> Result<()> {
     let mut answer = String::new();
     std::io::stdin().read_line(&mut answer)?;
     if answer.trim().eq_ignore_ascii_case("y") {
+        // Offer to pin a stable name (no-op when one is already set) so the manual run that
+        // follows and future auto-activations all resolve to the same sandbox.
+        let bytes = maybe_offer_pin(&project_dir, bytes);
         crate::trust::record_trust(&data_dir, &project_dir, &bytes)?;
         eprintln!(
             "dome: trusted {} — future terminals will auto-activate it (edits to dome.json \
@@ -408,6 +423,97 @@ fn inline_trust_target(
     std::fs::canonicalize(&project_dir).ok()
 }
 
+/// After trust is granted for `project_dir`, offer to pin a stable `sandbox: "<slug>"` into its
+/// `dome.json` when it has none. On a `y`, the field is written and the new file bytes are
+/// returned so the caller records trust against the *pinned* content — which converges the manual
+/// cwd-slug and the auto-activation `<slug>-<pathhash>` onto one stable, user-chosen sandbox name.
+/// Returns the unchanged `current_bytes` whenever there is nothing to offer (an explicit name is
+/// already set), the session can't prompt (no TTY), the user declines, or the edit can't be safely
+/// applied. Never fails the surrounding command — pinning is a convenience, not a requirement.
+fn maybe_offer_pin(project_dir: &Path, current_bytes: Vec<u8>) -> Vec<u8> {
+    use std::io::{IsTerminal, Write};
+
+    // A pin is an interactive yes/no; a piped/non-interactive `dome allow` just records trust.
+    if !std::io::stdin().is_terminal() {
+        return current_bytes;
+    }
+    let Ok(text) = std::str::from_utf8(&current_bytes) else {
+        return current_bytes;
+    };
+    let Ok(cfg) = serde_json::from_str::<crate::config::DomeConfig>(text) else {
+        return current_bytes;
+    };
+    let Some(slug) = pin_offer_slug(&cfg, project_dir) else {
+        return current_bytes;
+    };
+    let Some(edited) = insert_sandbox_field(text, &slug) else {
+        return current_bytes;
+    };
+
+    eprint!(
+        "dome: pin a stable sandbox name \"{slug}\" into {}'s dome.json? \
+         (otherwise auto-activation uses a path-hashed name) [y/N] ",
+        project_dir.display()
+    );
+    std::io::stderr().flush().ok();
+    let mut answer = String::new();
+    if std::io::stdin().read_line(&mut answer).is_err() || !answer.trim().eq_ignore_ascii_case("y")
+    {
+        return current_bytes;
+    }
+    let dome_json = project_dir.join("dome.json");
+    if let Err(e) = std::fs::write(&dome_json, &edited) {
+        eprintln!(
+            "dome: could not write {}: {e} — leaving it unpinned.",
+            dome_json.display()
+        );
+        return current_bytes;
+    }
+    eprintln!("dome: pinned sandbox \"{slug}\" — manual `dome sandbox` and auto-activation now share one VM.");
+    edited.into_bytes()
+}
+
+/// The stable `sandbox` name to offer pinning into a project's `dome.json`, or `None` when no
+/// offer should be made. Returns the plain cwd-slug only for a project that has NOT already set
+/// an explicit `sandbox` field — a project with a name is already collision-free, so there is
+/// nothing to pin. Pure; the I/O wrapper [`maybe_offer_pin`] does the prompting and the write.
+fn pin_offer_slug(cfg: &crate::config::DomeConfig, project_dir: &Path) -> Option<String> {
+    if cfg.sandbox.as_deref().is_some_and(|s| !s.is_empty()) {
+        return None;
+    }
+    crate::sandbox::project_slug(project_dir)
+}
+
+/// Insert a top-level `"sandbox": "<slug>"` into the raw `dome.json` text, preserving the rest
+/// of the file (a textual edit rather than a parse-and-reserialize, so existing key order,
+/// indentation, and the user's formatting survive). Returns `None` when the text is not a JSON
+/// object we can safely edit — including when the result would not parse — so a malformed or
+/// non-object `dome.json` is left untouched rather than corrupted. The caller has already
+/// established (via [`pin_offer_slug`]) that there is no existing `sandbox` key.
+fn insert_sandbox_field(text: &str, slug: &str) -> Option<String> {
+    let open = text.find('{')?;
+    let close = text.rfind('}')?;
+    if close <= open {
+        return None;
+    }
+    let field = format!("\"sandbox\": \"{slug}\"");
+    // Empty object (only whitespace between the braces): write the sole field on its own line.
+    let inner = &text[open + 1..close];
+    let edited = if inner.trim().is_empty() {
+        format!("{}\n  {field}\n{}", &text[..=open], &text[close..])
+    } else {
+        // Non-empty: prepend the field (with a trailing comma) right after the opening brace, so
+        // it precedes the existing keys without disturbing them.
+        format!("{}\n  {field},{}", &text[..=open], &text[open + 1..])
+    };
+    // Never hand back something that would not parse: a defensive guard against an exotic layout
+    // the simple textual edit mishandles.
+    serde_json::from_str::<serde_json::Value>(&edited)
+        .ok()
+        .filter(|v| v.is_object())
+        .map(|_| edited)
+}
+
 /// Compute the informed-re-approval diff for `dome allow`: when `project_dir` was previously
 /// allowed but its `dome.json` has changed since (hash mismatch), return a human-readable diff
 /// of the approved content vs. the current `new_bytes`. Returns `None` when there is nothing to
@@ -435,6 +541,10 @@ mod tests {
 
     fn no_env(_: &str) -> Option<String> {
         None
+    }
+
+    fn load_config_str(s: &str) -> crate::config::DomeConfig {
+        serde_json::from_str(s).unwrap()
     }
 
     #[test]
@@ -574,6 +684,48 @@ mod tests {
             diff.contains("+   \"allow_net\": true"),
             "the diff names the newly added line; got:\n{diff}"
         );
+    }
+
+    #[test]
+    fn pin_offer_targets_a_project_with_no_sandbox_field() {
+        // A project that has not chosen a stable name is a pin candidate: suggest its cwd-slug.
+        let dir = tempfile::tempdir().unwrap();
+        let project = dir.path().join("api");
+        std::fs::create_dir(&project).unwrap();
+        let cfg = load_config_str("{}");
+        assert_eq!(pin_offer_slug(&cfg, &project).as_deref(), Some("api"));
+    }
+
+    #[test]
+    fn pin_offer_is_silent_when_a_sandbox_field_is_already_set() {
+        // An explicit name is already stable and collision-free — nothing to offer.
+        let dir = tempfile::tempdir().unwrap();
+        let project = dir.path().join("api");
+        std::fs::create_dir(&project).unwrap();
+        let cfg = load_config_str(r#"{"sandbox":"web"}"#);
+        assert!(pin_offer_slug(&cfg, &project).is_none());
+    }
+
+    #[test]
+    fn insert_sandbox_field_adds_the_key_to_an_empty_object() {
+        let out = insert_sandbox_field("{}\n", "api").expect("valid json out");
+        let v: serde_json::Value = serde_json::from_str(&out).unwrap();
+        assert_eq!(v["sandbox"], "api");
+    }
+
+    #[test]
+    fn insert_sandbox_field_preserves_existing_keys() {
+        let original = "{\n  \"allow_net\": true\n}\n";
+        let out = insert_sandbox_field(original, "api").expect("valid json out");
+        let v: serde_json::Value = serde_json::from_str(&out).unwrap();
+        assert_eq!(v["sandbox"], "api");
+        assert_eq!(v["allow_net"], true, "existing keys are kept");
+    }
+
+    #[test]
+    fn insert_sandbox_field_rejects_non_object_json() {
+        // A dome.json that is not a top-level object can't take a `sandbox` key safely.
+        assert!(insert_sandbox_field("[1, 2, 3]\n", "api").is_none());
     }
 
     #[test]
