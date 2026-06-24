@@ -276,10 +276,14 @@ pub(crate) enum Commands {
     },
 
     /// Print a shell hook for directory auto-activation. Install with, e.g.,
-    /// `eval "$(dome hook zsh)"` in your shell rc file.
+    /// `eval "$(dome hook zsh)"` in your shell rc file, or `dome hook --install`.
     Hook {
-        /// Shell to emit the hook for (currently: zsh)
-        shell: String,
+        /// Shell to emit the hook for (currently: zsh). Omit when using --install.
+        shell: Option<String>,
+        /// Append the hook line to your shell rc file (detected from $SHELL) instead of
+        /// printing it. Idempotent: re-running never duplicates the line.
+        #[arg(long)]
+        install: bool,
     },
 
     /// Trust the nearest project (its `dome.json`) so the shell hook auto-activates it.

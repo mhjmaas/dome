@@ -146,6 +146,9 @@ fn main() -> Result<()> {
             } else {
                 assets::download_os_image(&data_dir)?;
             }
+            // Surface directory auto-activation right after install, so the feature (inert until
+            // the rc line is added) is discoverable.
+            eprintln!("{}", hook::init_hook_hint());
         }
         Commands::Upgrade { latest_only } => {
             let data_dir = default_data_dir();
@@ -246,8 +249,17 @@ fn main() -> Result<()> {
                 process::exit(exit_code);
             }
         },
-        Commands::Hook { shell } => {
-            hook::run_hook(&shell)?;
+        Commands::Hook { shell, install } => {
+            if install {
+                hook::run_hook_install()?;
+            } else {
+                let shell = shell.ok_or_else(|| {
+                    anyhow::anyhow!(
+                        "specify a shell (e.g. `dome hook zsh`) or use `dome hook --install`"
+                    )
+                })?;
+                hook::run_hook(&shell)?;
+            }
         }
         Commands::Allow => {
             hook::run_allow()?;
@@ -282,6 +294,9 @@ fn main() -> Result<()> {
                 from,
                 rebuild,
             } => {
+                // If the shell hook isn't installed, show the one-time install tip at this
+                // natural moment (suppressed once installed, or after it's been shown once).
+                hook::maybe_print_hook_tip();
                 // Naturally running the sandbox by hand in an untrusted project offers the
                 // trust grant inline, so the developer never has to remember `dome allow`.
                 hook::maybe_prompt_inline_trust()?;
@@ -296,7 +311,8 @@ fn main() -> Result<()> {
                 rebuild,
                 command,
             } => {
-                // See `Shell` above: offer the inline trust grant on first manual use.
+                // See `Shell` above: the one-time install tip, then the inline trust grant.
+                hook::maybe_print_hook_tip();
                 hook::maybe_prompt_inline_trust()?;
                 let exit_code =
                     sandbox::run_sandbox(name, &vm, command, from.as_deref(), rebuild, None)?;
