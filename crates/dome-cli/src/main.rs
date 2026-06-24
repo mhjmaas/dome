@@ -282,6 +282,9 @@ fn main() -> Result<()> {
                 from,
                 rebuild,
             } => {
+                // Naturally running the sandbox by hand in an untrusted project offers the
+                // trust grant inline, so the developer never has to remember `dome allow`.
+                hook::maybe_prompt_inline_trust()?;
                 let exit_code =
                     sandbox::run_sandbox(name, &vm, Vec::new(), from.as_deref(), rebuild, None)?;
                 process::exit(exit_code);
@@ -293,6 +296,8 @@ fn main() -> Result<()> {
                 rebuild,
                 command,
             } => {
+                // See `Shell` above: offer the inline trust grant on first manual use.
+                hook::maybe_prompt_inline_trust()?;
                 let exit_code =
                     sandbox::run_sandbox(name, &vm, command, from.as_deref(), rebuild, None)?;
                 process::exit(exit_code);

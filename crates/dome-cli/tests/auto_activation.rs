@@ -10,10 +10,12 @@
 //! mapped subdirectory, and the drop-in returns exit code 0 (the signal the shell hook uses to
 //! suppress the exit→re-drop loop).
 
-use std::io::Write;
+use std::io::{Read, Write};
+use std::os::unix::io::FromRawFd;
+use std::os::unix::process::CommandExt;
 use std::path::Path;
 use std::process::{Command, Stdio};
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 fn dome_bin() -> String {
     std::env::var("DOME_BIN")
@@ -42,6 +44,7 @@ fn cleanup(name: &str) {
     let dir = format!("{}/.local/share/dome/sandboxes", home);
     let _ = std::fs::remove_file(format!("{}/{}.idx", dir, name));
     let _ = std::fs::remove_file(format!("{}/{}.lock", dir, name));
+    let _ = std::fs::remove_file(format!("{}/{}.config.json", dir, name));
 }
 
 /// Drive `dome __hook-activate <project>` (the hook's drop-in) from `cwd`, with `script` piped
@@ -68,6 +71,121 @@ fn hook_activate(cwd: &Path, project: &Path, script: &str) -> (String, i32) {
         String::from_utf8_lossy(&out.stdout).to_string(),
         out.status.code().unwrap_or(-1),
     )
+}
+
+/// Run `dome` under a pseudo-terminal so `stdin().is_terminal()` is true (the inline trust
+/// prompt only fires on an interactive TTY), feeding `input` to its stdin. Returns the combined
+/// pty output. Used to exercise the inline `[y/N]` grant on a manual `dome sandbox run`.
+fn dome_in_pty(cwd: &Path, args: &[&str], input: &str) -> String {
+    let mut master: libc::c_int = 0;
+    let mut slave: libc::c_int = 0;
+    let rc = unsafe {
+        libc::openpty(
+            &mut master,
+            &mut slave,
+            std::ptr::null_mut(),
+            std::ptr::null_mut(),
+            std::ptr::null_mut(),
+        )
+    };
+    assert_eq!(rc, 0, "openpty failed");
+
+    let mut cmd = Command::new(dome_bin());
+    cmd.args(args).current_dir(cwd);
+    // Scrub guards the host may set (CI runners export $CI), so the inline-offer guards behave
+    // as on a developer's machine rather than being suppressed by the test environment.
+    for guard in ["CI", "DOME_SANDBOX", "DOME_NO_AUTO"] {
+        cmd.env_remove(guard);
+    }
+    let slave_fd = slave;
+    unsafe {
+        cmd.stdin(Stdio::from_raw_fd(libc::dup(slave_fd)));
+        cmd.stdout(Stdio::from_raw_fd(libc::dup(slave_fd)));
+        cmd.stderr(Stdio::from_raw_fd(libc::dup(slave_fd)));
+        cmd.pre_exec(move || {
+            libc::setsid();
+            let _ = libc::ioctl(slave_fd, libc::TIOCSCTTY as _, 0);
+            Ok(())
+        });
+    }
+    let mut child = cmd.spawn().expect("spawn dome under pty");
+    unsafe {
+        libc::close(slave);
+    }
+
+    let mut writer = unsafe { std::fs::File::from_raw_fd(libc::dup(master)) };
+    writer.write_all(input.as_bytes()).ok();
+    writer.flush().ok();
+
+    let mut reader = unsafe { std::fs::File::from_raw_fd(master) };
+    let start = Instant::now();
+    let mut buf = [0u8; 4096];
+    let mut out = String::new();
+    loop {
+        match reader.read(&mut buf) {
+            Ok(0) | Err(_) => break,
+            Ok(n) => out.push_str(&String::from_utf8_lossy(&buf[..n])),
+        }
+        if start.elapsed() > Duration::from_secs(60) {
+            break;
+        }
+    }
+    let _ = child.wait();
+    out
+}
+
+/// Inline trust UX (#61): answering `y` to the prompt on a first manual `dome sandbox run` in an
+/// untrusted project records trust, so a later auto-activation drop-in fires (exit 0) without any
+/// further `dome allow`. Answering `n` records nothing, so the project stays untrusted (exit 10).
+#[test]
+#[ignore]
+fn inline_grant_on_manual_run_enables_auto_activation() {
+    let name = sandbox_name("inline");
+    cleanup(&name);
+
+    let tmp = tempfile::tempdir().expect("tempdir");
+    let project = tmp.path();
+    std::fs::write(
+        project.join("dome.json"),
+        format!("{{\"sandbox\":\"{name}\"}}"),
+    )
+    .unwrap();
+
+    // Untrusted up front: the auto-activation drop-in refuses (exit 10).
+    let (_out, code) = hook_activate(project, project, "exit\n");
+    assert_eq!(code, 10, "project must start untrusted");
+
+    // Answer `n`: the session runs once but trust is NOT recorded, so it stays untrusted.
+    // The name is passed explicitly (it is the first positional, so `run -- true` would make
+    // `true` the sandbox name) — `true` is the one-shot command run inside the sandbox.
+    let out = dome_in_pty(project, &["sandbox", "run", &name, "--", "true"], "n\n");
+    assert!(
+        out.contains("auto-activate on entry?"),
+        "the inline [y/N] prompt must appear in an untrusted dir; output:\n{out}"
+    );
+    let (_out, code) = hook_activate(project, project, "exit\n");
+    assert_eq!(code, 10, "answering n must record no trust; output:\n{out}");
+
+    // Answer `y`: trust is recorded keyed to dir + dome.json hash.
+    let out = dome_in_pty(project, &["sandbox", "run", &name, "--", "true"], "y\n");
+    assert!(
+        out.contains("auto-activate on entry?"),
+        "the prompt must still appear (still untrusted); output:\n{out}"
+    );
+
+    // A later auto-activation drop-in now fires (exit 0) with no `dome allow` in between.
+    let script = "echo SANDBOX=$DOME_SANDBOX\nexit\n";
+    let (stdout, code) = hook_activate(project, project, script);
+    assert_eq!(
+        code, 0,
+        "after answering y, auto-activation must drop in (exit 0); stdout:\n{stdout}"
+    );
+    assert!(
+        stdout.lines().any(|l| l == format!("SANDBOX={name}")),
+        "the drop-in must run inside the named guest; stdout:\n{stdout}"
+    );
+
+    cleanup(&name);
 }
 
 /// The full tracer bullet: untrusted → no drop-in; `dome allow` → trusted; drop-in lands in the

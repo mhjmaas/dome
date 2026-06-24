@@ -57,6 +57,17 @@ pub(crate) fn run_allow() -> Result<()> {
     })?;
     let bytes = std::fs::read(project_dir.join("dome.json"))?;
     let data_dir = dome_vm::default_data_dir();
+    // Informed re-approval: if this project was allowed before but its dome.json has changed
+    // since, show what changed before re-recording — so re-approval is a deliberate review of
+    // the edit, not a blind re-grant.
+    if let Some(diff) = reapproval_diff(&data_dir, &project_dir, &bytes) {
+        eprintln!(
+            "dome: {}'s dome.json has changed since you last allowed it. Review what changed:\n",
+            project_dir.display()
+        );
+        eprintln!("{}", diff.trim_end());
+        eprintln!();
+    }
     crate::trust::record_trust(&data_dir, &project_dir, &bytes)?;
     eprintln!(
         "dome: trusted {} — the shell hook will now auto-activate it (edits to dome.json \
@@ -256,12 +267,313 @@ pub(crate) fn decide(
     }
 }
 
+/// A minimal line-level diff of two texts, rendered with `- ` (removed), `+ ` (added), and
+/// `  ` (unchanged context) prefixes — enough for `dome allow` to show what changed in a
+/// `dome.json` before re-recording trust. Uses a standard longest-common-subsequence so a
+/// pure insertion shows as additions only (not a wholesale replace). Not a full unified diff
+/// (no hunk headers); the configs it diffs are small, so every line is shown.
+fn unified_line_diff(old: &str, new: &str) -> String {
+    let a: Vec<&str> = old.lines().collect();
+    let b: Vec<&str> = new.lines().collect();
+
+    // LCS length table over the two line sequences.
+    let mut lcs = vec![vec![0usize; b.len() + 1]; a.len() + 1];
+    for i in (0..a.len()).rev() {
+        for j in (0..b.len()).rev() {
+            lcs[i][j] = if a[i] == b[j] {
+                lcs[i + 1][j + 1] + 1
+            } else {
+                lcs[i + 1][j].max(lcs[i][j + 1])
+            };
+        }
+    }
+
+    // Walk the table, emitting context for common lines and -/+ for the rest.
+    let mut out = String::new();
+    let (mut i, mut j) = (0, 0);
+    while i < a.len() && j < b.len() {
+        if a[i] == b[j] {
+            out.push_str("  ");
+            out.push_str(a[i]);
+            out.push('\n');
+            i += 1;
+            j += 1;
+        } else if lcs[i + 1][j] >= lcs[i][j + 1] {
+            out.push_str("- ");
+            out.push_str(a[i]);
+            out.push('\n');
+            i += 1;
+        } else {
+            out.push_str("+ ");
+            out.push_str(b[j]);
+            out.push('\n');
+            j += 1;
+        }
+    }
+    for line in &a[i..] {
+        out.push_str("- ");
+        out.push_str(line);
+        out.push('\n');
+    }
+    for line in &b[j..] {
+        out.push_str("+ ");
+        out.push_str(line);
+        out.push('\n');
+    }
+    out
+}
+
+/// Offer an inline trust grant before a manual `dome sandbox shell`/`run` boots its VM: if the
+/// developer is in an untrusted project (and the environment allows a prompt — see
+/// [`inline_trust_target`]), ask `Trust '<name>' and auto-activate on entry? [y/N]`. A `y`
+/// records the same trust record the auto-hook checks, so future terminals drop in automatically;
+/// anything else runs this session once and records nothing. Never fails the command: a project
+/// with no `dome.json`, an already-trusted one, or a non-interactive session is a silent no-op.
+pub(crate) fn maybe_prompt_inline_trust() -> Result<()> {
+    use std::io::{IsTerminal, Write};
+
+    let data_dir = dome_vm::default_data_dir();
+    let cwd = std::env::current_dir()?;
+    let is_tty = std::io::stdin().is_terminal();
+    let Some(project_dir) = inline_trust_target(&data_dir, &cwd, |k| std::env::var(k).ok(), is_tty)
+    else {
+        return Ok(());
+    };
+
+    let bytes = std::fs::read(project_dir.join("dome.json"))?;
+    // Label the prompt with the sandbox name the project resolves to, matching what the hook
+    // would auto-activate.
+    let cfg = load_config(Some(
+        project_dir.join("dome.json").to_string_lossy().as_ref(),
+    ))?;
+    let name = crate::sandbox::resolve_name(None, &cfg, &project_dir)
+        .unwrap_or_else(|_| project_dir.display().to_string());
+
+    eprint!("dome: trust '{name}' and auto-activate on entry? [y/N] ");
+    std::io::stderr().flush().ok();
+    let mut answer = String::new();
+    std::io::stdin().read_line(&mut answer)?;
+    if answer.trim().eq_ignore_ascii_case("y") {
+        crate::trust::record_trust(&data_dir, &project_dir, &bytes)?;
+        eprintln!(
+            "dome: trusted {} — future terminals will auto-activate it (edits to dome.json \
+             re-lock until you run `dome allow` again).",
+            project_dir.display()
+        );
+    } else {
+        eprintln!(
+            "dome: not trusted — running this session once. Run `dome allow` (or answer y next \
+             time) to auto-activate on entry."
+        );
+    }
+    Ok(())
+}
+
+/// Decide whether a manual `dome sandbox shell`/`run` should offer an inline trust grant, and
+/// for which project directory. Returns the canonical project dir to offer trust for, or `None`
+/// when no prompt should appear. The offer is made only when, walking up from `cwd`, there is a
+/// `dome.json` whose project is untrusted, auto-activation is enabled for it, the session is an
+/// interactive TTY (`is_tty`), and no environment guard (`$CI`, inside a guest, `$DOME_NO_AUTO`)
+/// is set. So naturally running the sandbox by hand offers the grant — the developer never has
+/// to remember `dome allow` — while trusted dirs, non-projects, and non-interactive/CI sessions
+/// stay silent. Pure given the filesystem, the env lookup, and the TTY flag, so it is unit-tested
+/// without prompting.
+fn inline_trust_target(
+    data_dir: &str,
+    cwd: &Path,
+    getenv: impl Fn(&str) -> Option<String>,
+    is_tty: bool,
+) -> Option<std::path::PathBuf> {
+    // A prompt only makes sense on an interactive terminal that can answer it.
+    if !is_tty {
+        return None;
+    }
+    // The same guards that block auto-activation suppress the offer (don't nag in CI, never
+    // prompt inside a guest, honor the opt-out).
+    if activation_blocked(&getenv).is_some() {
+        return None;
+    }
+    let project_dir = crate::config::find_nearest_dome_json(cwd)?;
+    let config_path = project_dir.join("dome.json");
+    let bytes = std::fs::read(&config_path).ok()?;
+    let cfg = load_config(Some(config_path.to_string_lossy().as_ref())).ok()?;
+    // With auto-activation disabled, granting trust would buy nothing, so stay silent.
+    if cfg.activate() == ActivateMode::Off {
+        return None;
+    }
+    // Already trusted (dir + current content match): run with no prompt.
+    if crate::trust::is_trusted(data_dir, &project_dir, &bytes) {
+        return None;
+    }
+    std::fs::canonicalize(&project_dir).ok()
+}
+
+/// Compute the informed-re-approval diff for `dome allow`: when `project_dir` was previously
+/// allowed but its `dome.json` has changed since (hash mismatch), return a human-readable diff
+/// of the approved content vs. the current `new_bytes`. Returns `None` when there is nothing to
+/// re-approve — either the project was never allowed, or its content is unchanged (still
+/// trusted). A legacy record (approved before the content was stored) has no baseline to diff,
+/// so a note stands in for the old side rather than a misleading empty diff.
+fn reapproval_diff(data_dir: &str, project_dir: &Path, new_bytes: &[u8]) -> Option<String> {
+    let prior = crate::trust::prior_trust(data_dir, project_dir)?;
+    if prior.hash == crate::trust::config_hash(new_bytes) {
+        return None; // unchanged since approval — no diff to show
+    }
+    let new_text = String::from_utf8_lossy(new_bytes);
+    Some(match prior.config {
+        Some(old_text) => unified_line_diff(&old_text, &new_text),
+        None => format!(
+            "(the previous approval predates content recording, so the old dome.json cannot be \
+             shown — current content:)\n{new_text}"
+        ),
+    })
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
 
     fn no_env(_: &str) -> Option<String> {
         None
+    }
+
+    #[test]
+    fn line_diff_marks_removed_added_and_keeps_context() {
+        let old = "{\n  \"sandbox\": \"web\"\n}\n";
+        let new = "{\n  \"sandbox\": \"web\",\n  \"allow_net\": true\n}\n";
+        let diff = unified_line_diff(old, new);
+        // The unchanged opening/closing braces are shown as context (two-space prefix).
+        assert!(diff.contains("  {"), "context line kept; got:\n{diff}");
+        // The edited sandbox line is removed and its replacement added.
+        assert!(
+            diff.contains("-   \"sandbox\": \"web\""),
+            "old line marked removed; got:\n{diff}"
+        );
+        assert!(
+            diff.contains("+   \"sandbox\": \"web\","),
+            "new line marked added; got:\n{diff}"
+        );
+        // The brand-new line appears as an addition.
+        assert!(
+            diff.contains("+   \"allow_net\": true"),
+            "added line present; got:\n{diff}"
+        );
+        // Exactly one line was removed (only the changed sandbox line).
+        let removed = diff.lines().filter(|l| l.starts_with("- ")).count();
+        assert_eq!(
+            removed, 1,
+            "only the changed line is a removal; got:\n{diff}"
+        );
+    }
+
+    #[test]
+    fn line_diff_of_identical_input_has_no_markers() {
+        let diff = unified_line_diff("a\nb\n", "a\nb\n");
+        assert!(
+            !diff.contains("+ ") && !diff.contains("- "),
+            "identical content yields no add/remove markers; got:\n{diff}"
+        );
+    }
+
+    #[test]
+    fn reapproval_diff_is_none_for_a_never_allowed_project() {
+        let (project, data) = fixture(r#"{"sandbox":"web"}"#);
+        // No prior `dome allow`, so there is nothing to re-approve and no diff to show.
+        assert!(reapproval_diff(
+            data.path().to_str().unwrap(),
+            project.path(),
+            br#"{"sandbox":"web"}"#
+        )
+        .is_none());
+    }
+
+    #[test]
+    fn reapproval_diff_is_none_when_config_is_unchanged() {
+        let (project, data) = fixture(r#"{"sandbox":"web"}"#);
+        let dd = data.path().to_str().unwrap();
+        crate::trust::record_trust(dd, project.path(), br#"{"sandbox":"web"}"#).unwrap();
+        // Still trusted at the same content: re-running `dome allow` shows no diff.
+        assert!(reapproval_diff(dd, project.path(), br#"{"sandbox":"web"}"#).is_none());
+    }
+
+    #[test]
+    fn inline_offer_targets_an_untrusted_project_on_an_interactive_terminal() {
+        let (project, data) = fixture(r#"{"sandbox":"web"}"#);
+        let target =
+            inline_trust_target(data.path().to_str().unwrap(), project.path(), no_env, true);
+        assert_eq!(
+            target.as_deref(),
+            Some(std::fs::canonicalize(project.path()).unwrap().as_path()),
+            "running the sandbox by hand in an untrusted project offers the grant"
+        );
+    }
+
+    #[test]
+    fn inline_offer_is_silent_for_a_trusted_project() {
+        let (project, data) = fixture(r#"{"sandbox":"web"}"#);
+        let dd = data.path().to_str().unwrap();
+        crate::trust::record_trust(dd, project.path(), br#"{"sandbox":"web"}"#).unwrap();
+        // Already trusted → no prompt; the sandbox just runs.
+        assert!(inline_trust_target(dd, project.path(), no_env, true).is_none());
+    }
+
+    #[test]
+    fn inline_offer_is_silent_when_there_is_no_project() {
+        // A directory with no dome.json (and no parent with one) has nothing to trust.
+        let data = tempfile::tempdir().unwrap();
+        let empty = tempfile::tempdir().unwrap();
+        assert!(
+            inline_trust_target(data.path().to_str().unwrap(), empty.path(), no_env, true)
+                .is_none()
+        );
+    }
+
+    #[test]
+    fn inline_offer_is_silent_when_activation_is_off() {
+        let (project, data) = fixture(r#"{"activate":"off"}"#);
+        // activate:"off" means no auto-activation will ever happen, so offering trust is moot.
+        assert!(
+            inline_trust_target(data.path().to_str().unwrap(), project.path(), no_env, true)
+                .is_none()
+        );
+    }
+
+    #[test]
+    fn inline_offer_is_silent_without_a_tty() {
+        let (project, data) = fixture(r#"{"sandbox":"web"}"#);
+        // A piped/non-interactive `dome sandbox run` cannot answer a prompt; never block on one.
+        assert!(
+            inline_trust_target(data.path().to_str().unwrap(), project.path(), no_env, false)
+                .is_none()
+        );
+    }
+
+    #[test]
+    fn inline_offer_is_silent_when_a_guard_fires() {
+        let (project, data) = fixture(r#"{"sandbox":"web"}"#);
+        // $CI / inside-a-guest / opt-out: the same guards that block auto-activation also
+        // suppress the inline offer (e.g. don't nag in CI).
+        let target = inline_trust_target(
+            data.path().to_str().unwrap(),
+            project.path(),
+            |k| (k == "CI").then(|| "true".to_string()),
+            true,
+        );
+        assert!(target.is_none());
+    }
+
+    #[test]
+    fn reapproval_diff_shows_what_changed_since_approval() {
+        let (project, data) = fixture(r#"{"sandbox":"web"}"#);
+        let dd = data.path().to_str().unwrap();
+        crate::trust::record_trust(dd, project.path(), b"{\n  \"sandbox\": \"web\"\n}\n").unwrap();
+        // The developer edited dome.json since approval; `dome allow` must show the diff.
+        let edited = b"{\n  \"sandbox\": \"web\",\n  \"allow_net\": true\n}\n";
+        let diff = reapproval_diff(dd, project.path(), edited).expect("a changed config diffs");
+        assert!(
+            diff.contains("+   \"allow_net\": true"),
+            "the diff names the newly added line; got:\n{diff}"
+        );
     }
 
     #[test]
