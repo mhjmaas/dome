@@ -133,8 +133,28 @@ DPKGEOF
 
             chroot /mnt/rootfs apt-get update -qq
             chroot /mnt/rootfs apt-get install -y -qq --no-install-recommends \
-                ca-certificates curl git iproute2 \
+                bash ca-certificates curl git iproute2 \
                 openssh-client jq less procps xz-utils libgomp1 libatomic1 > /dev/null 2>&1
+
+            # Default guest profile: a real HOME and a sandbox-labeled prompt, so dropping
+            # into a sandbox lands you in a familiar shell that visibly says which sandbox
+            # you are inside. Sourced by `bash -l` via /etc/profile -> /etc/profile.d/*.sh.
+            mkdir -p /mnt/rootfs/etc/profile.d
+            cat > /mnt/rootfs/etc/profile.d/dome.sh << '\''DOMEPROFILE'\''
+# Managed by dome. A real HOME and a sandbox-labeled prompt so it is always visible
+# that commands run inside the dome sandbox, not on the host. DOME_SANDBOX is injected
+# by the worker for every guest session.
+# The guest runs as root; the init environment leaves HOME unset or bare "/", so give
+# the shell a real home rather than landing on "/".
+if [ -z "${HOME:-}" ] || [ "${HOME}" = "/" ]; then
+    export HOME=/root
+fi
+if [ -n "${DOME_SANDBOX:-}" ]; then
+    PS1="[sandbox:${DOME_SANDBOX}] \w \$ "
+else
+    PS1="[sandbox] \w \$ "
+fi
+DOMEPROFILE
 
             rm -rf /mnt/rootfs/usr/share/doc/* /mnt/rootfs/usr/share/man/* /mnt/rootfs/usr/share/info/*
             find /mnt/rootfs/usr/share/locale -mindepth 1 -maxdepth 1 ! -name "en*" -exec rm -rf {} + 2>/dev/null || true
@@ -178,8 +198,28 @@ DPKGEOF
 
     sudo chroot "$MOUNT_DIR" apt-get update -qq
     sudo chroot "$MOUNT_DIR" apt-get install -y -qq --no-install-recommends \
-        ca-certificates curl git iproute2 \
+        bash ca-certificates curl git iproute2 \
         openssh-client jq less procps xz-utils libgomp1 libatomic1 > /dev/null 2>&1
+
+    # Default guest profile: a real HOME and a sandbox-labeled prompt, so dropping into a
+    # sandbox lands you in a familiar shell that visibly says which sandbox you are inside.
+    # Sourced by `bash -l` via /etc/profile -> /etc/profile.d/*.sh.
+    sudo mkdir -p "${MOUNT_DIR}/etc/profile.d"
+    cat <<'DOMEPROFILE' | sudo tee "${MOUNT_DIR}/etc/profile.d/dome.sh" > /dev/null
+# Managed by dome. A real HOME and a sandbox-labeled prompt so it is always visible
+# that commands run inside the dome sandbox, not on the host. DOME_SANDBOX is injected
+# by the worker for every guest session.
+# The guest runs as root; the init environment leaves HOME unset or bare "/", so give
+# the shell a real home rather than landing on "/".
+if [ -z "${HOME:-}" ] || [ "${HOME}" = "/" ]; then
+    export HOME=/root
+fi
+if [ -n "${DOME_SANDBOX:-}" ]; then
+    PS1="[sandbox:${DOME_SANDBOX}] \w \$ "
+else
+    PS1="[sandbox] \w \$ "
+fi
+DOMEPROFILE
 
     sudo rm -rf "${MOUNT_DIR}/usr/share/doc/"* "${MOUNT_DIR}/usr/share/man/"* "${MOUNT_DIR}/usr/share/info/"*
     sudo find "${MOUNT_DIR}/usr/share/locale" -mindepth 1 -maxdepth 1 ! -name "en*" -exec rm -rf {} + 2>/dev/null || true
