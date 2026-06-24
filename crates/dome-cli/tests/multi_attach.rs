@@ -46,11 +46,7 @@ fn ls_cols(name: &str) -> Option<Vec<String>> {
         .expect("failed to spawn dome");
     let text = String::from_utf8_lossy(&out.stdout);
     text.lines()
-        .map(|l| {
-            l.split_whitespace()
-                .map(str::to_string)
-                .collect::<Vec<_>>()
-        })
+        .map(|l| l.split_whitespace().map(str::to_string).collect::<Vec<_>>())
         .find(|cols| cols.first().map(String::as_str) == Some(name))
 }
 
