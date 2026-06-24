@@ -645,11 +645,50 @@ fn list_conflict(
     }
 }
 
+/// Warning shown when a network allow-list is configured but networking is
+/// disabled. The allow-list is then inert: the egress proxy is never started, so
+/// the guest has no DNS resolver and every lookup fails with `EAI_AGAIN`. This
+/// is an easy footgun — declaring `network.allow` reads as "I want the network"
+/// but does not by itself enable it. Returns `None` when there is nothing to warn about.
+pub(crate) fn network_disabled_warning(allow_net: bool, allow: &[String]) -> Option<String> {
+    if allow_net || allow.is_empty() {
+        return None;
+    }
+    let plural = if allow.len() == 1 { "y" } else { "ies" };
+    Some(format!(
+        "network allow-list has {} entr{plural} but networking is disabled \
+         (allow_net=false); the allow-list is ignored and DNS in the sandbox \
+         will fail with EAI_AGAIN. Enable it with \"allow_net\": true in dome.json \
+         (or --allow-net), then restart the sandbox.",
+        allow.len()
+    ))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
     use crate::config::{NetworkEntry, ProvisionEntry, SecretEntry};
     use std::collections::HashMap;
+
+    #[test]
+    fn warns_when_allowlist_set_but_networking_disabled() {
+        let allow = vec!["registry.npmjs.org".to_string(), "github.com".to_string()];
+        let warning = network_disabled_warning(false, &allow)
+            .expect("should warn: allow entries are inert with networking off");
+        // Names the real switch so the fix is obvious.
+        assert!(warning.contains("allow_net"));
+    }
+
+    #[test]
+    fn no_warning_when_networking_enabled() {
+        let allow = vec!["registry.npmjs.org".to_string()];
+        assert!(network_disabled_warning(true, &allow).is_none());
+    }
+
+    #[test]
+    fn no_warning_when_allowlist_empty() {
+        assert!(network_disabled_warning(false, &[]).is_none());
+    }
 
     fn vm(mut f: impl FnMut(&mut VmArgs)) -> VmArgs {
         let mut v = VmArgs::default();
