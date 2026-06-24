@@ -372,7 +372,9 @@ __dome_hook() {{
   # the developer leaves the project and comes back.
   [[ "$__dome_suppressed_root" == "$found" ]] && return 0
 
-  "${{DOME_HOOK_CMD:-'{cmd}'}}" __hook-activate "$found"
+  local __dome_cmd="$DOME_HOOK_CMD"
+  [[ -z "$__dome_cmd" ]] && __dome_cmd='{cmd}'
+  "$__dome_cmd" __hook-activate "$found"
   local rc=$?
   # Suppress re-entry for this project until the developer leaves and returns (cleared above
   # when the walk finds no project). Set for every outcome so we never re-invoke `dome` on a
@@ -444,7 +446,9 @@ __dome_hook() {{
   # the developer leaves the project and comes back.
   [[ "$__dome_suppressed_root" == "$found" ]] && return 0
 
-  "${{DOME_HOOK_CMD:-'{cmd}'}}" __hook-activate "$found"
+  local __dome_cmd="$DOME_HOOK_CMD"
+  [[ -z "$__dome_cmd" ]] && __dome_cmd='{cmd}'
+  "$__dome_cmd" __hook-activate "$found"
   local rc=$?
   # Suppress re-entry for this project until the developer leaves and returns.
   __dome_suppressed_root="$found"
@@ -1285,6 +1289,29 @@ mod tests {
         // in shell-level tests).
         let script = emit_zsh_hook("/opt/dome");
         assert!(script.contains("DOME_HOOK_CMD"));
+    }
+
+    #[test]
+    fn emitted_hooks_never_inline_the_baked_path_in_a_default_expansion() {
+        // Regression: `"${DOME_HOOK_CMD:-'<path>'}"` does NOT strip the single quotes in zsh or
+        // bash (no quote removal in a `:-` default within double quotes), so an unset
+        // DOME_HOOK_CMD made the hook exec the literal `'<path>'` → command-not-found. Every test
+        // sets DOME_HOOK_CMD, which masked it. The baked path must be assigned to a variable
+        // first, then invoked. Guard all three emitters against the broken form regressing.
+        for script in [
+            emit_zsh_hook("/opt/dome"),
+            emit_bash_hook("/opt/dome"),
+            emit_fish_hook("/opt/dome"),
+        ] {
+            assert!(
+                !script.contains(":-'/opt/dome'") && !script.contains(":-/opt/dome"),
+                "hook inlines the baked path in a default expansion (breaks when \
+                 DOME_HOOK_CMD is unset):\n{script}"
+            );
+            // The path is still present (as the assigned fallback) and reached via the subcommand.
+            assert!(script.contains("/opt/dome"));
+            assert!(script.contains("__hook-activate"));
+        }
     }
 
     #[test]
