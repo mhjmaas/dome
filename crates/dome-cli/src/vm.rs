@@ -710,6 +710,23 @@ pub(crate) fn path_within_cwd(path: &std::path::Path) -> bool {
     }
 }
 
+/// The guest directory a drop-in should land at for a developer whose host cwd is `host_cwd`
+/// within a project rooted at `project_root`: `GUEST_PROJECT_ROOT + (host_cwd − project_root)`,
+/// matching the project-root auto-mount. Returns `None` when `host_cwd` is the project root
+/// itself (the login shell already lands there) or lies outside it (no mapped guest path — the
+/// guest falls back to the project root). Pure path arithmetic, so it is unit-testable without
+/// a hypervisor; both inputs are expected already-canonical (the worker canonicalizes them).
+pub(crate) fn guest_landing_cwd(
+    project_root: &std::path::Path,
+    host_cwd: &std::path::Path,
+) -> Option<String> {
+    let rel = host_cwd.strip_prefix(project_root).ok()?;
+    if rel.as_os_str().is_empty() {
+        return None;
+    }
+    Some(format!("{}/{}", GUEST_PROJECT_ROOT, rel.to_string_lossy()))
+}
+
 pub(crate) fn with_project_root_mount(
     mounts: &[String],
     project_root: &std::path::Path,
@@ -884,6 +901,31 @@ mod tests {
         let mc = parse_mount_parts("/some/host", "/workspace", None).unwrap();
         assert!(mc.read_only);
         assert_eq!(mc.guest_path, "/workspace");
+    }
+
+    #[test]
+    fn guest_landing_at_project_root_needs_no_cd() {
+        // Entering at the project root itself lands at GUEST_PROJECT_ROOT — no explicit cd.
+        let root = std::path::Path::new("/home/dev/proj");
+        assert_eq!(guest_landing_cwd(root, root), None);
+    }
+
+    #[test]
+    fn guest_landing_maps_a_subdir_under_the_project_root() {
+        let root = std::path::Path::new("/home/dev/proj");
+        let cwd = std::path::Path::new("/home/dev/proj/src/api");
+        assert_eq!(
+            guest_landing_cwd(root, cwd),
+            Some("/workspace/src/api".to_string())
+        );
+    }
+
+    #[test]
+    fn guest_landing_is_none_when_cwd_is_outside_the_project() {
+        // A host cwd not under the project root has no mapped guest path → fall back to root.
+        let root = std::path::Path::new("/home/dev/proj");
+        let cwd = std::path::Path::new("/tmp/elsewhere");
+        assert_eq!(guest_landing_cwd(root, cwd), None);
     }
 
     #[test]

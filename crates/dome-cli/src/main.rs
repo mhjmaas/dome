@@ -4,6 +4,7 @@ mod cli;
 mod config;
 mod daemon;
 mod gc;
+mod hook;
 mod lock;
 mod provision;
 mod retention;
@@ -11,6 +12,7 @@ mod sandbox;
 mod sandbox_config;
 mod session;
 mod stdio;
+mod trust;
 mod vm;
 mod worker;
 
@@ -244,6 +246,16 @@ fn main() -> Result<()> {
                 process::exit(exit_code);
             }
         },
+        Commands::Hook { shell } => {
+            hook::run_hook(&shell)?;
+        }
+        Commands::Allow => {
+            hook::run_allow()?;
+        }
+        Commands::HookActivate { project_dir } => {
+            let exit_code = hook::run_hook_activate(&project_dir)?;
+            process::exit(exit_code);
+        }
         Commands::Checkpoint { action } => match action {
             CheckpointCommands::Create {
                 name,
@@ -271,7 +283,7 @@ fn main() -> Result<()> {
                 rebuild,
             } => {
                 let exit_code =
-                    sandbox::run_sandbox(name, &vm, Vec::new(), from.as_deref(), rebuild)?;
+                    sandbox::run_sandbox(name, &vm, Vec::new(), from.as_deref(), rebuild, None)?;
                 process::exit(exit_code);
             }
             SandboxCommands::Run {
@@ -281,7 +293,8 @@ fn main() -> Result<()> {
                 rebuild,
                 command,
             } => {
-                let exit_code = sandbox::run_sandbox(name, &vm, command, from.as_deref(), rebuild)?;
+                let exit_code =
+                    sandbox::run_sandbox(name, &vm, command, from.as_deref(), rebuild, None)?;
                 process::exit(exit_code);
             }
             SandboxCommands::Create {

@@ -28,6 +28,28 @@ pub(crate) struct DomeConfig {
     /// base remains. Off by default: sandboxes are pinned forever and old bases are
     /// reclaimed by `dome prune` once unreferenced.
     pub latest_only: Option<bool>,
+    /// Directory auto-activation policy for the shell hook (`dome hook zsh`). `shell`
+    /// (the default when omitted) drops you into the sandbox on `cd`; `off` disables
+    /// auto-activation entirely (manual `dome sandbox shell` still works).
+    pub activate: Option<ActivateMode>,
+}
+
+/// What the directory auto-activation hook does when it enters a trusted project.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub(crate) enum ActivateMode {
+    /// Drop into the sandbox shell. The default when `activate` is omitted.
+    Shell,
+    /// Do nothing automatically; manual `dome sandbox shell` still works.
+    Off,
+}
+
+impl DomeConfig {
+    /// The effective auto-activation policy: the explicit `activate` field, else the
+    /// default (`shell`). An omitted field auto-drops so the hook works out of the box.
+    pub(crate) fn activate(&self) -> ActivateMode {
+        self.activate.unwrap_or(ActivateMode::Shell)
+    }
 }
 
 /// A secret to inject via the proxy.
@@ -118,6 +140,24 @@ pub(crate) fn project_root(config_flag: Option<&str>) -> Option<std::path::PathB
     canonical.parent().map(|p| p.to_path_buf())
 }
 
+/// Walk up from `start` to the nearest ancestor directory containing a `dome.json`,
+/// returning that directory canonicalized. Nearest/deepest wins: a `dome.json` in `start`
+/// itself shadows one further up. This is the authoritative Rust counterpart to the hook's
+/// pure-shell walk — `dome allow` and `dome __hook-activate` use it so the trust record and
+/// the drop-in always agree on which project the cwd belongs to. Returns `None` when no
+/// `dome.json` exists from `start` up to the filesystem root.
+pub(crate) fn find_nearest_dome_json(start: &std::path::Path) -> Option<std::path::PathBuf> {
+    let mut dir = std::fs::canonicalize(start).ok()?;
+    loop {
+        if dir.join("dome.json").is_file() {
+            return Some(dir);
+        }
+        if !dir.pop() {
+            return None;
+        }
+    }
+}
+
 pub(crate) fn load_config(config_flag: Option<&str>) -> Result<DomeConfig> {
     let path = config_path(config_flag);
 
@@ -140,6 +180,69 @@ pub(crate) fn load_config(config_flag: Option<&str>) -> Result<DomeConfig> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn activate_defaults_to_shell_when_omitted() {
+        // No `activate` key → auto-activation drops in (the default).
+        let cfg: DomeConfig = serde_json::from_str("{}").unwrap();
+        assert_eq!(cfg.activate(), ActivateMode::Shell);
+    }
+
+    #[test]
+    fn activate_off_disables_auto_activation() {
+        let cfg: DomeConfig = serde_json::from_str(r#"{"activate":"off"}"#).unwrap();
+        assert_eq!(cfg.activate(), ActivateMode::Off);
+    }
+
+    #[test]
+    fn activate_shell_is_explicit_drop_in() {
+        let cfg: DomeConfig = serde_json::from_str(r#"{"activate":"shell"}"#).unwrap();
+        assert_eq!(cfg.activate(), ActivateMode::Shell);
+    }
+
+    #[test]
+    fn unknown_activate_value_is_a_parse_error() {
+        // A typo like `"on"` must fail loudly rather than silently auto-activating.
+        assert!(serde_json::from_str::<DomeConfig>(r#"{"activate":"on"}"#).is_err());
+    }
+
+    #[test]
+    fn walk_up_finds_dome_json_in_the_start_dir() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(dir.path().join("dome.json"), "{}").unwrap();
+        let found = find_nearest_dome_json(dir.path()).unwrap();
+        assert_eq!(found, std::fs::canonicalize(dir.path()).unwrap());
+    }
+
+    #[test]
+    fn walk_up_finds_dome_json_in_an_ancestor() {
+        // A subdirectory with no dome.json resolves to the nearest ancestor that has one.
+        let root = tempfile::tempdir().unwrap();
+        std::fs::write(root.path().join("dome.json"), "{}").unwrap();
+        let sub = root.path().join("src").join("nested");
+        std::fs::create_dir_all(&sub).unwrap();
+        let found = find_nearest_dome_json(&sub).unwrap();
+        assert_eq!(found, std::fs::canonicalize(root.path()).unwrap());
+    }
+
+    #[test]
+    fn walk_up_picks_the_nearest_deepest_dome_json() {
+        // dome.json at both root and an inner dir: the inner (deepest/nearest) one wins.
+        let root = tempfile::tempdir().unwrap();
+        std::fs::write(root.path().join("dome.json"), "{}").unwrap();
+        let inner = root.path().join("inner");
+        std::fs::create_dir_all(&inner).unwrap();
+        std::fs::write(inner.join("dome.json"), "{}").unwrap();
+        let found = find_nearest_dome_json(&inner).unwrap();
+        assert_eq!(found, std::fs::canonicalize(&inner).unwrap());
+    }
+
+    #[test]
+    fn walk_up_returns_none_when_no_dome_json_anywhere() {
+        // A temp dir under the system temp root has no dome.json up the chain to "/".
+        let dir = tempfile::tempdir().unwrap();
+        assert!(find_nearest_dome_json(dir.path()).is_none());
+    }
 
     #[test]
     fn project_root_is_the_dir_containing_an_explicit_dome_json() {

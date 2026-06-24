@@ -275,6 +275,26 @@ pub(crate) enum Commands {
         action: ProvisionCommands,
     },
 
+    /// Print a shell hook for directory auto-activation. Install with, e.g.,
+    /// `eval "$(dome hook zsh)"` in your shell rc file.
+    Hook {
+        /// Shell to emit the hook for (currently: zsh)
+        shell: String,
+    },
+
+    /// Trust the nearest project (its `dome.json`) so the shell hook auto-activates it.
+    /// Records trust keyed to the directory + a hash of the whole `dome.json`; any later
+    /// edit re-locks it until you run `dome allow` again.
+    Allow,
+
+    /// Internal: the shell hook's per-directory drop-in (re-exec target; not for direct
+    /// use). Decides trust/activation for a found project dir and drops into its sandbox.
+    #[command(name = "__hook-activate", hide = true)]
+    HookActivate {
+        /// The project directory the hook's walk found (contains the `dome.json`).
+        project_dir: String,
+    },
+
     /// Internal: run as the domed supervisor (re-exec target; not for direct use)
     #[command(name = "__domed", hide = true)]
     Domed,

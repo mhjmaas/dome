@@ -157,6 +157,13 @@ pub(crate) struct BootSpec {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub provision_seed: Option<String>,
     pub cwd: String,
+    /// Guest directory the first interactive drop-in should land at — the mapped subdirectory
+    /// the developer `cd`'d into (`GUEST_PROJECT_ROOT + (host_cwd − project_root)`). Set by the
+    /// auto-activation drop-in; absent for a plain `dome sandbox shell` (lands at the project
+    /// root). Injected into the guest session env as `DOME_LAND_CWD`, which the login profile
+    /// `cd`s into, falling back to the project root if the path is not mounted.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub land_cwd: Option<String>,
     pub vm_args: VmArgs,
 }
 
@@ -167,6 +174,7 @@ impl BootSpec {
         from: Option<&str>,
         provision_seed: Option<&str>,
         cwd: &Path,
+        land_cwd: Option<&str>,
         vm_args: &VmArgs,
     ) -> Result<Self> {
         Ok(Self {
@@ -174,6 +182,7 @@ impl BootSpec {
             from: from.map(|s| s.to_string()),
             provision_seed: provision_seed.map(|s| s.to_string()),
             cwd: cwd.to_string_lossy().to_string(),
+            land_cwd: land_cwd.map(|s| s.to_string()),
             // VmArgs is cheap, plain data; serialize via its serde derives by cloning
             // through JSON so we don't have to thread a borrow through the wire types.
             vm_args: serde_json::from_value(serde_json::to_value(vm_args)?)?,
@@ -672,6 +681,12 @@ fn boot_and_serve(name: &str, data_dir: &str) -> Result<()> {
     // name (the source of truth), so the prompt always matches the sandbox you attached to.
     let mut env = booted.env;
     env.insert("DOME_SANDBOX".to_string(), name.to_string());
+    // Directory auto-activation: land the developer at the subdirectory they `cd`'d into,
+    // mapped into the guest under the project mount. The login profile (`/etc/profile.d/dome.sh`)
+    // `cd`s into DOME_LAND_CWD when set, falling back to the project root if it is not mounted.
+    if let Some(land) = &boot.land_cwd {
+        env.insert("DOME_LAND_CWD".to_string(), land.clone());
+    }
     let sandbox = Arc::new(booted.sandbox);
     // Clone the CAS backend for the worker (and its background flusher) so they can save
     // independently of the main thread, which keeps the non-`Sync` NBD handle.
@@ -1313,13 +1328,21 @@ mod tests {
             mount: vec!["./src:/work".to_string()],
             ..Default::default()
         };
-        let spec =
-            BootSpec::new("web", Some("base"), None, Path::new("/home/dev/proj"), &vm).unwrap();
+        let spec = BootSpec::new(
+            "web",
+            Some("base"),
+            None,
+            Path::new("/home/dev/proj"),
+            Some("/workspace/src"),
+            &vm,
+        )
+        .unwrap();
         let value = spec.to_value().unwrap();
         let back: BootSpec = serde_json::from_value(value).unwrap();
         assert_eq!(back.name, "web");
         assert_eq!(back.from.as_deref(), Some("base"));
         assert_eq!(back.cwd, "/home/dev/proj");
+        assert_eq!(back.land_cwd.as_deref(), Some("/workspace/src"));
         assert_eq!(back.vm_args.memory, Some(4096));
         assert!(back.vm_args.allow_net);
         assert_eq!(back.vm_args.mount, vec!["./src:/work".to_string()]);
