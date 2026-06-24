@@ -667,7 +667,11 @@ fn boot_and_serve(name: &str, data_dir: &str) -> Result<()> {
     // on shutdown, and the rest held in `booted` (partially moved, never dropped early)
     // so the VM's support services stay up for its whole lifetime.
     let nbd_handle = booted.nbd_handle;
-    let env = booted.env;
+    // Expose the running sandbox's name to every guest session so `/etc/profile.d/dome.sh`
+    // can render the sandbox-labeled prompt (`[sandbox:<name>] …`). This is the host-side
+    // name (the source of truth), so the prompt always matches the sandbox you attached to.
+    let mut env = booted.env;
+    env.insert("DOME_SANDBOX".to_string(), name.to_string());
     let sandbox = Arc::new(booted.sandbox);
     // Clone the CAS backend for the worker (and its background flusher) so they can save
     // independently of the main thread, which keeps the non-`Sync` NBD handle.

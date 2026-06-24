@@ -40,13 +40,15 @@ pub(crate) fn run_sandbox(
     let name = resolve_name(name_arg.as_deref(), &cfg, &cwd)?;
     dome_vm::validate_checkpoint_name(&name).map_err(|e| anyhow::anyhow!(e))?;
 
-    // Command resolution mirrors `dome run`: CLI args > config > default /bin/sh.
+    // Command resolution mirrors `dome run`: CLI args > config > default interactive shell.
+    // The default drop-in is a `bash` login shell so it sources `/etc/profile.d/dome.sh`
+    // (sandbox-labeled prompt + HOME) rather than landing on the bare dash `#`.
     let command = if !command.is_empty() {
         command
     } else if let Some(cfg_cmd) = cfg.command.clone() {
         cfg_cmd
     } else {
-        vec!["/bin/sh".to_string()]
+        vec!["bash".to_string(), "-l".to_string()]
     };
 
     // A TTY on stdin means an interactive PTY session (raw mode, resize, signals);
