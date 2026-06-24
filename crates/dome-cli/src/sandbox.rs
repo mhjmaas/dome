@@ -31,6 +31,7 @@ pub(crate) fn run_sandbox(
     vm_args: &VmArgs,
     command: Vec<String>,
     from: Option<&str>,
+    rebuild: bool,
 ) -> Result<i32> {
     reject_direct_storage()?;
 
@@ -80,12 +81,24 @@ pub(crate) fn run_sandbox(
                 resolved.disk_size.unwrap_or(4096),
                 vm_args,
                 &crate::provision::VmStepRunner,
+                rebuild,
             )?,
             None => None,
         }
     } else {
         None
     };
+
+    // `--rebuild` forces a fresh layer build, which only matters while seeding a brand-new
+    // sandbox. An existing sandbox is already materialized from its own disk and is never
+    // re-seeded, so say the flag had no effect rather than letting the user assume it did.
+    if rebuild && Path::new(&index_path).exists() {
+        eprintln!(
+            "dome: --rebuild is ignored for an existing sandbox; it only forces a fresh \
+             provision when creating one. To rebuild from a clean toolchain, recreate it: \
+             `dome sandbox rm {name}` then re-run with --rebuild.",
+        );
+    }
 
     // The boot spec is consumed by the worker only on a cold boot; it captures exactly
     // what this invocation would have booted (resolved name, seed, cwd, and VM flags).
@@ -243,6 +256,7 @@ pub(crate) fn create_sandbox(
     name_arg: Option<String>,
     vm_args: &VmArgs,
     from: Option<&str>,
+    rebuild: bool,
 ) -> Result<()> {
     reject_direct_storage()?;
 
@@ -311,6 +325,7 @@ pub(crate) fn create_sandbox(
                     disk_size_mb,
                     vm_args,
                     &crate::provision::VmStepRunner,
+                    rebuild,
                 )?,
                 None => None,
             };

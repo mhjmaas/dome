@@ -142,16 +142,25 @@ fn sweep_bases(data_dir: &str, base_refs: &HashSet<String>, stats: &mut SweepSta
 }
 
 /// Collect every chunk hash and pinned base image referenced by any live index. Walks
-/// both `sandboxes/` and `checkpoints/`, following each index's parent chain so a
+/// `sandboxes/`, `checkpoints/`, and `provision/`, following each index's parent chain so a
 /// chained checkpoint's ancestors are marked too. A corrupt or unreadable index does
 /// not abort the sweep — it is skipped with a warning, so one bad file never strands
 /// the rest of the store as unreclaimable (and never risks deleting live chunks on the
 /// basis of an index we failed to read).
+///
+/// `provision/` is included to exempt the provision cache from orphan reclamation: a
+/// sandbox seeded from a layer **flattens** it (copies the index with no parent pointer
+/// back to the layer), so following references alone would leave the layer's chunks
+/// unreferenced the moment no seeded sandbox happens to share them — and the next sweep
+/// would reclaim chunks a still-cached `<hash>.idx` depends on. Marking the layer indexes
+/// keeps their chunks alive independently of any sandbox. Their `.failed` debug disks use a
+/// different extension and are intentionally *not* marked, so `dome prune` still reclaims
+/// them.
 fn collect_referenced(data_dir: &str) -> Result<(HashSet<String>, HashSet<String>)> {
     let mut chunk_refs = HashSet::new();
     let mut base_refs = HashSet::new();
 
-    for sub in ["sandboxes", "checkpoints"] {
+    for sub in ["sandboxes", "checkpoints", "provision"] {
         let dir = format!("{}/{}", data_dir, sub);
         let entries = match std::fs::read_dir(&dir) {
             Ok(entries) => entries,
@@ -446,6 +455,62 @@ mod tests {
         let (chunks, _bases) = collect_referenced(data_dir).unwrap();
         assert!(chunks.contains("chunk-a"), "chunk from A must be collected");
         assert!(chunks.contains("chunk-b"), "chunk from B must be collected");
+    }
+
+    #[test]
+    fn sweep_keeps_chunks_a_cached_provision_layer_references() {
+        // GC exemption (#69): a provisioned layer that no sandbox currently seeds from must
+        // keep its chunks. A seeded sandbox flattens the layer (no parent pointer back to it),
+        // so without marking provision/ the layer's chunks would look orphaned and be swept —
+        // stranding a still-cached `<hash>.idx` over dead chunks. Marking provision/ keeps the
+        // chunk alive even with no sandbox referencing it; the `.idx` itself is never swept.
+        let tmp = tempfile::tempdir().unwrap();
+        let data_dir = tmp.path().to_str().unwrap();
+        std::fs::create_dir_all(format!("{}/provision", data_dir)).unwrap();
+
+        // A provision layer references "provchunk"; no sandbox or checkpoint references it.
+        write_chunk(data_dir, "provchunk", 64 * 1024);
+        let layer = format!("{}/provision/abc123.idx", data_dir);
+        write_index(&layer, &[(0, "provchunk")], None, None);
+
+        let stats = sweep(data_dir).unwrap();
+
+        assert!(
+            chunk_exists(data_dir, "provchunk"),
+            "a cached provision layer's chunk must survive the sweep"
+        );
+        assert!(
+            std::path::Path::new(&layer).exists(),
+            "the layer index itself is never swept (only chunks/bases are)"
+        );
+        assert_eq!(stats.chunks_removed, 0);
+    }
+
+    #[test]
+    fn sweep_reclaims_chunks_of_a_failed_provision_disk() {
+        // The flip side of the exemption: a `.failed` debug disk uses a different extension
+        // and is intentionally NOT marked, so its chunks remain reclaimable — `dome prune`
+        // removes the `.failed` file, then the sweep reclaims its now-orphaned chunks.
+        let tmp = tempfile::tempdir().unwrap();
+        let data_dir = tmp.path().to_str().unwrap();
+        std::fs::create_dir_all(format!("{}/provision", data_dir)).unwrap();
+
+        write_chunk(data_dir, "failedchunk", 64 * 1024);
+        // A `.failed` index (extension is not "idx", so collect_referenced skips it).
+        write_index(
+            &format!("{}/provision/abc123.failed", data_dir),
+            &[(0, "failedchunk")],
+            None,
+            None,
+        );
+
+        let stats = sweep(data_dir).unwrap();
+
+        assert!(
+            !chunk_exists(data_dir, "failedchunk"),
+            "a failed debug disk's chunks are not exempt and must be reclaimed"
+        );
+        assert_eq!(stats.chunks_removed, 1);
     }
 
     #[test]

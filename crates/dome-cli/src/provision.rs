@@ -143,6 +143,12 @@ pub(crate) fn failed_layer_path(data_dir: &str, hash: &str) -> PathBuf {
 /// and atomically renames it into `{data_dir}/provision/<hash>.idx`; concurrent creations block
 /// on the lock then cache-hit, so exactly one build runs and a reader never observes a partial
 /// `.idx`. A cached spec returns instantly with no lock, no network, and no rebuild.
+///
+/// When `rebuild` is set, the cache is bypassed on both the fast path and the post-lock
+/// re-check: the layer is built fresh and atomically replaces any layer already on disk for
+/// this exact hash (the rename overwrites in place), so `--rebuild` forces a clean toolchain
+/// even when a cached one would otherwise be served. The build still runs under the per-hash
+/// lock, so a concurrent plain creation never observes a partial `.idx`.
 pub(crate) fn ensure_layer(
     data_dir: &str,
     version: &str,
@@ -150,6 +156,7 @@ pub(crate) fn ensure_layer(
     disk_size_mb: u64,
     env: &VmArgs,
     runner: &dyn StepRunner,
+    rebuild: bool,
 ) -> Result<Option<String>> {
     if spec.steps.is_empty() {
         return Ok(None);
@@ -158,8 +165,9 @@ pub(crate) fn ensure_layer(
     let hash = cache_key(version, &spec.steps, &spec.allow, &spec.secrets);
     let idx_path = layer_path(data_dir, &hash);
 
-    // Fast path: a published layer is served instantly, without taking the lock.
-    if idx_path.exists() {
+    // Fast path: a published layer is served instantly, without taking the lock. `--rebuild`
+    // skips it so the layer is always rebuilt fresh.
+    if !rebuild && idx_path.exists() {
         return Ok(Some(path_string(&idx_path)?));
     }
 
@@ -172,7 +180,8 @@ pub(crate) fn ensure_layer(
     let _lock = HashLock::acquire(&dir.join(format!("{hash}.lock")))?;
 
     // Re-check under the lock: a concurrent builder may have published while we blocked.
-    if idx_path.exists() {
+    // `--rebuild` ignores this too — it always rebuilds, then overwrites the cached layer.
+    if !rebuild && idx_path.exists() {
         return Ok(Some(path_string(&idx_path)?));
     }
 
@@ -184,7 +193,11 @@ pub(crate) fn ensure_layer(
     let failed = path_string(&failed_path)?;
     let _ = std::fs::remove_file(&tmp_path);
 
-    eprintln!("dome: provisioning (first run for this spec)…");
+    if rebuild {
+        eprintln!("dome: re-provisioning (--rebuild: forcing a fresh build of this spec)…");
+    } else {
+        eprintln!("dome: provisioning (first run for this spec)…");
+    }
     let build = runner.build(spec, disk_size_mb, env, &tmp, Some(&failed));
     if let Err(e) = build {
         let _ = std::fs::remove_file(&tmp_path);
@@ -212,7 +225,12 @@ pub(crate) fn ensure_layer(
     // stale debug disk can't linger (and its chunks become reclaimable by `dome prune`).
     let _ = std::fs::remove_file(&failed_path);
     eprintln!(
-        "dome: provisioned, cached ({}…)",
+        "dome: {}, cached ({}…)",
+        if rebuild {
+            "re-provisioned"
+        } else {
+            "provisioned"
+        },
         &hash[..hash.len().min(12)]
     );
     Ok(Some(path_string(&idx_path)?))
@@ -325,6 +343,159 @@ pub(crate) fn prune_failed_layers(data_dir: &str) -> Result<usize> {
                 .with_context(|| format!("removing preserved disk {}", path.display()))?;
             removed += 1;
         }
+    }
+    Ok(removed)
+}
+
+/// The OS base version a layer is pinned to, parsed from the versioned base image its index
+/// falls back to (`rootfs-<version>.ext4`). The layer's cache key folds in the CLI VERSION the
+/// layer was built against — which equals this base version at steady state — so this is how a
+/// later release recognises a layer keyed against a superseded base. `None` when the index
+/// records no pinned base (corrupt) or a non-standard one (e.g. an explicit `--rootfs`), in
+/// which case the layer's version can't be determined and reclamation leaves it alone.
+fn layer_base_version(idx: &dome_store::ChunkIndex) -> Option<String> {
+    idx.fallback_path.as_deref().and_then(|p| {
+        let file = Path::new(p).file_name().and_then(|s| s.to_str())?;
+        file.strip_prefix("rootfs-")
+            .and_then(|s| s.strip_suffix(".ext4"))
+            .map(|s| s.to_string())
+    })
+}
+
+/// Iterate the published layer indexes (`<hash>.idx`) under `{data_dir}/provision`, yielding
+/// `(hash, path)` for each. Skips the per-process build temp (`<hash>.<pid>.tmp.idx`, whose
+/// stem carries dots a real hex hash never does) so an in-flight build is never mistaken for a
+/// published layer. A missing dir yields nothing.
+fn published_layers(data_dir: &str) -> Result<Vec<(String, PathBuf)>> {
+    let dir = provision_dir(data_dir);
+    let entries = match std::fs::read_dir(&dir) {
+        Ok(e) => e,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(Vec::new()),
+        Err(e) => return Err(e).with_context(|| format!("reading {}", dir.display())),
+    };
+    let mut out = Vec::new();
+    for entry in entries.flatten() {
+        let path = entry.path();
+        if path.extension().and_then(|e| e.to_str()) != Some("idx") {
+            continue;
+        }
+        let Some(stem) = path.file_stem().and_then(|s| s.to_str()) else {
+            continue;
+        };
+        if stem.contains('.') {
+            continue; // a build temp, not a published layer
+        }
+        out.push((stem.to_string(), path));
+    }
+    Ok(out)
+}
+
+/// List the cached provisioned layers with their delta size, pinned OS base, staleness, and
+/// age — the dedicated view that keeps these hidden checkpoints off `dome checkpoint list`
+/// while still making the cache inspectable. A layer is **stale** when its base version no
+/// longer matches the installed OS: its hash can never cache-hit again, so it is dead weight
+/// that `dome upgrade` / `dome prune` will reclaim.
+pub(crate) fn list() -> Result<()> {
+    let data_dir = dome_vm::default_data_dir();
+    let current = crate::assets::installed_version(&data_dir);
+
+    let mut layers: Vec<(String, u64, String, bool, std::time::SystemTime)> = Vec::new();
+    for (hash, path) in published_layers(&data_dir)? {
+        let Some(path_str) = path.to_str() else {
+            continue;
+        };
+        let idx = match dome_store::ChunkIndex::load(path_str) {
+            Ok(idx) => idx,
+            Err(e) => {
+                eprintln!(
+                    "dome: skipping unreadable provisioned layer '{}': {:#}",
+                    hash, e
+                );
+                continue;
+            }
+        };
+        // CAS delta size: non-ZERO chunks × 64 KiB, matching `checkpoint list` / `sandbox ls`.
+        let non_zero = (0..idx.num_chunks())
+            .filter(|&i| idx.get_hash(i).map(|h| h != "ZERO").unwrap_or(false))
+            .count();
+        let size_bytes = (non_zero as u64) * 64 * 1024;
+        let base = layer_base_version(&idx).unwrap_or_else(|| "?".to_string());
+        // Stale iff we know the installed version and this layer's base differs from it.
+        let stale = current.as_deref().map(|c| c != base).unwrap_or(false);
+        let mtime = std::fs::metadata(&path).and_then(|m| m.modified())?;
+        layers.push((hash, size_bytes, base, stale, mtime));
+    }
+
+    if layers.is_empty() {
+        eprintln!("No provisioned layers found.");
+        return Ok(());
+    }
+
+    layers.sort_by_key(|(_, _, _, _, t)| *t);
+
+    let header = ["HASH", "SIZE", "BASE", "STATUS", "CREATED"];
+    let rows: Vec<Vec<String>> = layers
+        .iter()
+        .map(|(hash, size, base, stale, mtime)| {
+            vec![
+                hash[..hash.len().min(12)].to_string(),
+                crate::checkpoint::format_cas_size(*size),
+                base.clone(),
+                if *stale { "stale" } else { "current" }.to_string(),
+                crate::checkpoint::format_age(*mtime),
+            ]
+        })
+        .collect();
+
+    print!("{}", crate::checkpoint::render_table(&header, &rows));
+    Ok(())
+}
+
+/// Reclaim every published layer whose pinned OS base no longer matches `current_version`: a
+/// stale layer's hash folds in a superseded base identity, so it can never cache-hit again and
+/// is pure dead weight. Only the `.idx` is removed here (fast, like `sandbox rm`); the now-
+/// orphaned chunks are swept by the CAS mark-and-sweep that `dome prune` runs next. A layer
+/// whose base version can't be determined is left untouched (never reclaim on a guess).
+/// Returns how many layers were removed. Called by `dome upgrade` and `dome prune`.
+pub(crate) fn reclaim_stale_layers(data_dir: &str, current_version: &str) -> Result<usize> {
+    let mut removed = 0;
+    for (hash, path) in published_layers(data_dir)? {
+        let Some(path_str) = path.to_str() else {
+            continue;
+        };
+        let idx = match dome_store::ChunkIndex::load(path_str) {
+            Ok(idx) => idx,
+            Err(e) => {
+                eprintln!(
+                    "dome: skipping unreadable provisioned layer '{}': {:#}",
+                    hash, e
+                );
+                continue;
+            }
+        };
+        match layer_base_version(&idx) {
+            Some(base) if base != current_version => {
+                std::fs::remove_file(&path).with_context(|| {
+                    format!("removing stale provisioned layer {}", path.display())
+                })?;
+                removed += 1;
+            }
+            _ => {}
+        }
+    }
+    Ok(removed)
+}
+
+/// Reclaim **every** published layer wholesale, regardless of base version — the force-clear
+/// the `--provision` flag on `dome prune` selects when a user wants a clean cache (every layer
+/// rebuilds on its next creation). Like [`reclaim_stale_layers`], this removes only the `.idx`;
+/// the orphaned chunks are swept by the CAS sweep that follows. Returns the count removed.
+pub(crate) fn prune_all_layers(data_dir: &str) -> Result<usize> {
+    let mut removed = 0;
+    for (_hash, path) in published_layers(data_dir)? {
+        std::fs::remove_file(&path)
+            .with_context(|| format!("removing provisioned layer {}", path.display()))?;
+        removed += 1;
     }
     Ok(removed)
 }
@@ -548,6 +719,7 @@ mod tests {
             4096,
             &VmArgs::default(),
             &runner,
+            false,
         )
         .unwrap();
         assert!(layer.is_none(), "a spec with no steps provisions nothing");
@@ -566,7 +738,7 @@ mod tests {
         let s = spec(&["apt-get install -y nodejs"], &["deb.debian.org"]);
 
         // First creation: cold build + publish.
-        let first = ensure_layer(data_dir, "v", &s, 4096, &VmArgs::default(), &runner)
+        let first = ensure_layer(data_dir, "v", &s, 4096, &VmArgs::default(), &runner, false)
             .unwrap()
             .expect("a spec with steps yields a layer");
         assert_eq!(calls.load(Ordering::SeqCst), 1, "cold build ran once");
@@ -582,7 +754,7 @@ mod tests {
         assert!(leftovers.is_empty(), "no temp file survives a publish");
 
         // Second creation on the same spec: cache hit, no rebuild.
-        let second = ensure_layer(data_dir, "v", &s, 4096, &VmArgs::default(), &runner)
+        let second = ensure_layer(data_dir, "v", &s, 4096, &VmArgs::default(), &runner, false)
             .unwrap()
             .unwrap();
         assert_eq!(second, first, "the same spec resolves to the same layer");
@@ -610,6 +782,7 @@ mod tests {
             4096,
             &VmArgs::default(),
             &runner,
+            false,
         )
         .unwrap()
         .unwrap();
@@ -620,6 +793,7 @@ mod tests {
             4096,
             &VmArgs::default(),
             &runner,
+            false,
         )
         .unwrap()
         .unwrap();
@@ -670,7 +844,7 @@ mod tests {
                 let s = s.clone();
                 std::thread::spawn(move || {
                     let runner = SlowRunner { calls };
-                    ensure_layer(&data_dir, "v", &s, 4096, &VmArgs::default(), &runner)
+                    ensure_layer(&data_dir, "v", &s, 4096, &VmArgs::default(), &runner, false)
                         .unwrap()
                         .unwrap()
                 })
@@ -706,6 +880,7 @@ mod tests {
             4096,
             &VmArgs::default(),
             &runner,
+            false,
         )
         .unwrap()
         .unwrap();
@@ -727,7 +902,7 @@ mod tests {
         };
         let s = spec(&["apt-get install nope"], &[]);
 
-        let err = ensure_layer(data_dir, "v", &s, 4096, &VmArgs::default(), &runner)
+        let err = ensure_layer(data_dir, "v", &s, 4096, &VmArgs::default(), &runner, false)
             .expect_err("a failed build must propagate the error");
         // The failure surfaces the failing step's command + exit code (carried in the error).
         let msg = format!("{err:#}");
@@ -772,7 +947,7 @@ mod tests {
         let fail = FailingRunner {
             calls: Arc::new(AtomicUsize::new(0)),
         };
-        ensure_layer(data_dir, "v", &s, 4096, &VmArgs::default(), &fail).unwrap_err();
+        ensure_layer(data_dir, "v", &s, 4096, &VmArgs::default(), &fail, false).unwrap_err();
         assert!(failed_layer_path(data_dir, &hash).exists());
 
         // Then: succeed → success layer published, stale `.failed` removed.
@@ -780,7 +955,7 @@ mod tests {
             calls: Arc::new(AtomicUsize::new(0)),
             contents: "clean-layer",
         };
-        let layer = ensure_layer(data_dir, "v", &s, 4096, &VmArgs::default(), &ok)
+        let layer = ensure_layer(data_dir, "v", &s, 4096, &VmArgs::default(), &ok, false)
             .unwrap()
             .unwrap();
         assert!(Path::new(&layer).exists(), "the clean layer is published");
@@ -845,6 +1020,196 @@ mod tests {
         assert_eq!(
             resolve_failed_layer(data_dir, Some("abc")).unwrap().0,
             "abc123"
+        );
+    }
+
+    /// Write a published layer index (`<hash>.idx`) pinned to the given OS base version, so
+    /// the lifecycle helpers (list/reclaim/prune) can be driven over a temp data_dir without a
+    /// hypervisor. `base` of `None` writes a layer with no pinned base (version undeterminable).
+    fn write_layer(data_dir: &str, hash: &str, base: Option<&str>) {
+        let dir = provision_dir(data_dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let mut idx = dome_store::ChunkIndex::new(64 * 1024 * 1024);
+        idx.set_hash(0, "chunk".to_string());
+        idx.fallback_path = base.map(|v| format!("{}/rootfs-{}.ext4", data_dir, v));
+        idx.save(dir.join(format!("{hash}.idx")).to_str().unwrap())
+            .unwrap();
+    }
+
+    #[test]
+    fn rebuild_forces_a_fresh_build_overwriting_the_cached_layer() {
+        // `--rebuild` (#69): a cached layer is normally served without rebuilding, but with
+        // rebuild=true the build runs again and the new bytes atomically replace the cached
+        // layer *in place* (same hash path), so a stale toolchain can be force-refreshed.
+        let tmp = tempfile::tempdir().unwrap();
+        let data_dir = tmp.path().to_str().unwrap();
+        let s = spec(&["install toolchain"], &[]);
+
+        let calls = Arc::new(AtomicUsize::new(0));
+        let v1 = FakeRunner {
+            calls: calls.clone(),
+            contents: "toolchain-v1",
+        };
+        let first = ensure_layer(data_dir, "v", &s, 4096, &VmArgs::default(), &v1, false)
+            .unwrap()
+            .unwrap();
+        assert_eq!(calls.load(Ordering::SeqCst), 1, "cold build ran once");
+        assert_eq!(std::fs::read_to_string(&first).unwrap(), "toolchain-v1");
+
+        // Without --rebuild, the cached layer is served and the build does NOT run again.
+        let v_cached = FakeRunner {
+            calls: calls.clone(),
+            contents: "should-not-be-written",
+        };
+        let cached = ensure_layer(
+            data_dir,
+            "v",
+            &s,
+            4096,
+            &VmArgs::default(),
+            &v_cached,
+            false,
+        )
+        .unwrap()
+        .unwrap();
+        assert_eq!(cached, first, "a cache hit resolves to the same path");
+        assert_eq!(calls.load(Ordering::SeqCst), 1, "no rebuild on a plain hit");
+        assert_eq!(std::fs::read_to_string(&cached).unwrap(), "toolchain-v1");
+
+        // With --rebuild, the build runs again and overwrites the layer in place.
+        let v2 = FakeRunner {
+            calls: calls.clone(),
+            contents: "toolchain-v2",
+        };
+        let rebuilt = ensure_layer(data_dir, "v", &s, 4096, &VmArgs::default(), &v2, true)
+            .unwrap()
+            .unwrap();
+        assert_eq!(
+            rebuilt, first,
+            "--rebuild overwrites the SAME hash path in place"
+        );
+        assert_eq!(
+            calls.load(Ordering::SeqCst),
+            2,
+            "--rebuild forces a fresh build"
+        );
+        assert_eq!(
+            std::fs::read_to_string(&rebuilt).unwrap(),
+            "toolchain-v2",
+            "the cached layer now holds the freshly built bytes"
+        );
+        // No temp file survives the in-place overwrite.
+        let leftovers: Vec<_> = std::fs::read_dir(provision_dir(data_dir).as_path())
+            .unwrap()
+            .filter_map(|e| e.ok())
+            .filter(|e| e.file_name().to_string_lossy().contains(".tmp."))
+            .collect();
+        assert!(
+            leftovers.is_empty(),
+            "no temp file survives a --rebuild publish"
+        );
+    }
+
+    #[test]
+    fn layer_base_version_parses_the_pinned_rootfs_and_handles_unknowns() {
+        let mut idx = dome_store::ChunkIndex::new(64 * 1024 * 1024);
+        // A standard versioned base resolves to its version.
+        idx.fallback_path = Some("/data/rootfs-1.2.3.ext4".to_string());
+        assert_eq!(layer_base_version(&idx), Some("1.2.3".to_string()));
+        // No pinned base → undeterminable (None), so reclamation leaves it alone.
+        idx.fallback_path = None;
+        assert_eq!(layer_base_version(&idx), None);
+        // A non-standard base path (e.g. an explicit --rootfs) is undeterminable too.
+        idx.fallback_path = Some("/data/custom.ext4".to_string());
+        assert_eq!(layer_base_version(&idx), None);
+    }
+
+    #[test]
+    fn reclaim_stale_layers_removes_only_version_mismatched_layers() {
+        // `dome upgrade` / `dome prune` reclaim (#69): a layer pinned to a base version other
+        // than the installed one can never cache-hit again, so it is reclaimed; the matching
+        // layer survives, and a layer whose version is undeterminable is never reclaimed on a
+        // guess.
+        let tmp = tempfile::tempdir().unwrap();
+        let data_dir = tmp.path().to_str().unwrap();
+        write_layer(data_dir, "stale111", Some("1.0.0"));
+        write_layer(data_dir, "current2", Some("2.0.0"));
+        write_layer(data_dir, "unknown3", None);
+
+        let removed = reclaim_stale_layers(data_dir, "2.0.0").unwrap();
+        assert_eq!(removed, 1, "only the version-mismatched layer is reclaimed");
+        assert!(
+            !layer_path(data_dir, "stale111").exists(),
+            "the stale layer is gone"
+        );
+        assert!(
+            layer_path(data_dir, "current2").exists(),
+            "the current-version layer survives"
+        );
+        assert!(
+            layer_path(data_dir, "unknown3").exists(),
+            "a layer with no determinable base version is never reclaimed on a guess"
+        );
+
+        // Idempotent: re-running against the same version reclaims nothing more.
+        assert_eq!(reclaim_stale_layers(data_dir, "2.0.0").unwrap(), 0);
+        // A missing provision dir is not an error.
+        let empty = tempfile::tempdir().unwrap();
+        assert_eq!(
+            reclaim_stale_layers(empty.path().to_str().unwrap(), "2.0.0").unwrap(),
+            0
+        );
+    }
+
+    #[test]
+    fn prune_all_layers_clears_every_published_layer_but_skips_temps_and_failed() {
+        // `dome prune --provision` wholesale-clears the cache regardless of version, but must
+        // not touch an in-flight build temp (`<hash>.<pid>.tmp.idx`) or a `.failed` debug disk
+        // (reclaimed separately by prune_failed_layers).
+        let tmp = tempfile::tempdir().unwrap();
+        let data_dir = tmp.path().to_str().unwrap();
+        write_layer(data_dir, "aaaa1111", Some("1.0.0"));
+        write_layer(data_dir, "bbbb2222", Some("2.0.0"));
+        let dir = provision_dir(data_dir);
+        // An in-flight build temp and a parked failure disk must survive a wholesale clear.
+        std::fs::write(dir.join("cccc3333.99999.tmp.idx"), "building").unwrap();
+        std::fs::write(dir.join("dddd4444.failed"), "halfbuilt").unwrap();
+
+        let removed = prune_all_layers(data_dir).unwrap();
+        assert_eq!(removed, 2, "both published layers are cleared");
+        assert!(!layer_path(data_dir, "aaaa1111").exists());
+        assert!(!layer_path(data_dir, "bbbb2222").exists());
+        assert!(
+            dir.join("cccc3333.99999.tmp.idx").exists(),
+            "an in-flight build temp is not mistaken for a published layer"
+        );
+        assert!(
+            dir.join("dddd4444.failed").exists(),
+            "a .failed debug disk is left for prune_failed_layers"
+        );
+
+        // Idempotent: nothing published remains (the temp and .failed are not published layers).
+        assert_eq!(prune_all_layers(data_dir).unwrap(), 0);
+    }
+
+    #[test]
+    fn published_layers_skips_build_temps() {
+        // The cache view and reclamation must enumerate only real published layers, never an
+        // in-flight `<hash>.<pid>.tmp.idx` (whose stem carries dots a hex hash never does).
+        let tmp = tempfile::tempdir().unwrap();
+        let data_dir = tmp.path().to_str().unwrap();
+        write_layer(data_dir, "feedface", Some("1.0.0"));
+        let dir = provision_dir(data_dir);
+        std::fs::write(dir.join("feedface.12345.tmp.idx"), "building").unwrap();
+        std::fs::write(dir.join("feedface.lock"), "").unwrap();
+        std::fs::write(dir.join("feedface.failed"), "x").unwrap();
+
+        let found = published_layers(data_dir).unwrap();
+        let hashes: Vec<&str> = found.iter().map(|(h, _)| h.as_str()).collect();
+        assert_eq!(
+            hashes,
+            vec!["feedface"],
+            "only the published layer is listed"
         );
     }
 }

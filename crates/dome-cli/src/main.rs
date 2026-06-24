@@ -38,6 +38,7 @@ fn main() -> Result<()> {
         Commands::Run {
             vm,
             from,
+            rebuild,
             console,
             stdio,
             command,
@@ -72,6 +73,7 @@ fn main() -> Result<()> {
                     resolved.disk_size.unwrap_or(4096),
                     &vm,
                     &provision::VmStepRunner,
+                    rebuild,
                 )?,
                 _ => None,
             };
@@ -119,6 +121,18 @@ fn main() -> Result<()> {
 
             // Upgrade first; it reports the version it moved to (None if already latest).
             if let Some(new_version) = assets::upgrade(&data_dir)? {
+                // A provisioned layer's hash folds in the base OS identity, so every layer
+                // built against the superseded version can never cache-hit again — reclaim
+                // them unconditionally (they are pure cache, unlike a sandbox's work). Their
+                // orphaned chunks are swept by the next `dome prune`.
+                let stale = provision::reclaim_stale_layers(&data_dir, &new_version)?;
+                if stale > 0 {
+                    eprintln!(
+                        "dome: reclaimed {} provisioned layer(s) stale against {}",
+                        stale, new_version
+                    );
+                }
+
                 // Apply the opt-in latest-only retention against the version just
                 // installed. Pin-forever + GC is the default, so this is a no-op unless
                 // explicitly enabled.
@@ -132,7 +146,7 @@ fn main() -> Result<()> {
                 }
             }
         }
-        Commands::Prune => {
+        Commands::Prune { provision } => {
             let data_dir = default_data_dir();
 
             // 1. Reclaim instance directories left by crashed ephemeral VMs.
@@ -144,7 +158,7 @@ fn main() -> Result<()> {
             }
 
             // 2. Reclaim preserved half-provisioned ("debug") disks left by failed provision
-            // builds. Their now-unreferenced chunks are swept in step 3.
+            // builds. Their now-unreferenced chunks are swept in step 4.
             let failed = provision::prune_failed_layers(&data_dir)?;
             if failed > 0 {
                 eprintln!(
@@ -153,8 +167,33 @@ fn main() -> Result<()> {
                 );
             }
 
-            // 3. Mark-and-sweep the CAS store: reclaim chunks and superseded base images
-            // no live sandbox or checkpoint references (deferred from `sandbox rm`).
+            // 3. Reclaim cached provisioned layers. By default this is stale-only: layers
+            // whose pinned OS base no longer matches the installed version (they can never
+            // cache-hit again). `--provision` force-clears the whole cache. The removed
+            // layers' now-orphaned chunks are reclaimed by the sweep in step 4.
+            let layers = if provision {
+                provision::prune_all_layers(&data_dir)?
+            } else {
+                match assets::installed_version(&data_dir) {
+                    Some(v) => provision::reclaim_stale_layers(&data_dir, &v)?,
+                    None => 0,
+                }
+            };
+            if layers > 0 {
+                eprintln!(
+                    "dome: reclaimed {} provisioned layer(s){}",
+                    layers,
+                    if provision {
+                        " (full cache cleared)"
+                    } else {
+                        " stale against the installed OS"
+                    }
+                );
+            }
+
+            // 4. Mark-and-sweep the CAS store: reclaim chunks and superseded base images
+            // no live sandbox, checkpoint, or cached provision layer references (deferred
+            // from `sandbox rm`).
             let stats = gc::sweep(&data_dir)?;
             if stats.chunks_removed == 0 && stats.bases_removed == 0 {
                 eprintln!("dome: no unreferenced chunks or base images to reclaim");
@@ -168,6 +207,7 @@ fn main() -> Result<()> {
             }
         }
         Commands::Provision { action } => match action {
+            ProvisionCommands::List => provision::list()?,
             ProvisionCommands::Debug { hash, vm } => {
                 let exit_code = provision::debug_shell(hash.as_deref(), &vm)?;
                 process::exit(exit_code);
@@ -193,21 +233,33 @@ fn main() -> Result<()> {
             }
         },
         Commands::Sandbox { action } => match action {
-            SandboxCommands::Shell { name, vm, from } => {
-                let exit_code = sandbox::run_sandbox(name, &vm, Vec::new(), from.as_deref())?;
+            SandboxCommands::Shell {
+                name,
+                vm,
+                from,
+                rebuild,
+            } => {
+                let exit_code =
+                    sandbox::run_sandbox(name, &vm, Vec::new(), from.as_deref(), rebuild)?;
                 process::exit(exit_code);
             }
             SandboxCommands::Run {
                 name,
                 vm,
                 from,
+                rebuild,
                 command,
             } => {
-                let exit_code = sandbox::run_sandbox(name, &vm, command, from.as_deref())?;
+                let exit_code = sandbox::run_sandbox(name, &vm, command, from.as_deref(), rebuild)?;
                 process::exit(exit_code);
             }
-            SandboxCommands::Create { name, vm, from } => {
-                sandbox::create_sandbox(name, &vm, from.as_deref())?;
+            SandboxCommands::Create {
+                name,
+                vm,
+                from,
+                rebuild,
+            } => {
+                sandbox::create_sandbox(name, &vm, from.as_deref(), rebuild)?;
             }
             SandboxCommands::Config { name, reload, vm } => {
                 sandbox::config_sandbox(name, &vm, reload)?;
