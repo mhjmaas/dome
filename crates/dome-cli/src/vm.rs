@@ -470,9 +470,11 @@ pub(crate) fn run_command(prepared: &PreparedVm, command: &[String]) -> Result<R
 /// Run a project's provisioning steps in a one-shot build VM and save the resulting disk
 /// state as the provisioned layer index at `out_index`.
 ///
-/// The build boots from the bare base (project dir NOT mounted), with networking on and
-/// narrowed by `spec.effective_allow()` — `spec.allow` plus each secret's auto-whitelisted
-/// hosts (empty allow = all allowed). Provision secrets are injected via the egress proxy: a
+/// The build boots from the bare base — or, when `seed` is set (a `--from` composition), from
+/// that seed's CAS index so the steps layer on top of the seeded disk — with the project dir
+/// NOT mounted, networking on and narrowed by `spec.effective_allow()` — `spec.allow` plus each
+/// secret's auto-whitelisted hosts (empty allow = all allowed). Provision secrets are injected
+/// via the egress proxy: a
 /// step sees only a placeholder and the proxy substitutes the real value on egress to a matched
 /// host, so the value never touches the guest. Steps run as **root**, **sequentially**,
 /// **stop-on-first-failure**, each via its own `sh -c` so `cd`/`export` don't cross steps. A
@@ -487,7 +489,21 @@ pub(crate) fn build_provision_layer(
     env: &VmArgs,
     out_index: &str,
     failed_index: Option<&str>,
+    seed: Option<&str>,
 ) -> Result<()> {
+    // When composing on a `--from` seed, the build's disk is the seed's clone, so its size is
+    // pinned to the seed's chunk count: the index encodes a fixed chunk count, so booting it at
+    // a differing size would corrupt the filesystem (same invariant the seed/debug paths honor).
+    let disk_size_mb = match seed {
+        Some(seed_index) => {
+            dome_store::ChunkIndex::load(seed_index)
+                .with_context(|| format!("loading provision seed index {seed_index}"))?
+                .disk_size()
+                / (1024 * 1024)
+        }
+        None => disk_size_mb,
+    };
+
     // Build-VM shape: default cpus/memory, the requested disk size, networking on and narrowed
     // by the provision-time allow-list (with each secret's hosts auto-whitelisted). Provision
     // secrets ride the same proxy MITM path as runtime secrets: the guest steps see only a
@@ -504,7 +520,9 @@ pub(crate) fn build_provision_layer(
         ..Default::default()
     };
 
-    let prepared = prepare_vm(&cfg, env, None, None, None)?;
+    // Ride the `--from` seed as a provision seed (an absolute CAS index path) so the steps run
+    // on top of its disk state; with no seed the build starts from the bare base.
+    let prepared = prepare_vm(&cfg, env, None, seed, None)?;
     let booted = boot_vm(&prepared)?;
 
     eprintln!("dome: ── provisioning toolchain (cold build) ──");

@@ -39,10 +39,14 @@ use crate::sandbox_config::{ProvisionSpec, ResolvedConfig, SecretSpec};
 /// steps; the allow-list is framed the same way, so the key is **sensitive to `allow`** too.
 /// Each secret's *mapping* (`name + from + hosts`) joins the key — so re-pointing a secret to a
 /// different env var or host rebuilds — but the secret **value never enters the key** (it isn't
-/// even available here: a [`SecretSpec`] carries the mapping only). (Seed identity for `--from`
-/// composition is #E.)
+/// even available here: a [`SecretSpec`] carries the mapping only).
+///
+/// `identity` is the base the layer composes on: at steady state the CLI VERSION (the bare base
+/// image is version-pinned), or — when a creation seeds `--from <checkpoint/sandbox>` — the
+/// seed's content identity from [`seed_identity`]. Either way it pins the layer to the disk it
+/// was built on top of, so changing the base (a new release, or a different seed) rebuilds.
 pub(crate) fn cache_key(
-    version: &str,
+    identity: &str,
     steps: &[String],
     allow: &[String],
     secrets: &[SecretSpec],
@@ -50,8 +54,8 @@ pub(crate) fn cache_key(
     let mut hasher = Sha256::new();
     // Length-prefix every field so no concatenation of inputs can collide with another
     // (e.g. steps ["ab","c"] must not hash the same as ["a","bc"]).
-    hasher.update((version.len() as u64).to_le_bytes());
-    hasher.update(version.as_bytes());
+    hasher.update((identity.len() as u64).to_le_bytes());
+    hasher.update(identity.as_bytes());
     hasher.update(b"steps");
     hasher.update((steps.len() as u64).to_le_bytes());
     for s in steps {
@@ -82,12 +86,42 @@ pub(crate) fn cache_key(
     format!("{:x}", hasher.finalize())
 }
 
+/// Compute the content identity of a `--from` seed index — the stable fingerprint of the disk
+/// state provisioning will compose on top of. Used in place of the CLI VERSION base identity in
+/// [`cache_key`] when a creation seeds `--from`: the same seed + spec resolves to the same hash
+/// (cache hit), and a different seed changes the hash (rebuild on top of the new content).
+///
+/// The parent chain is flattened first so the identity reflects the *resolved* content rather
+/// than which parent index a chunk happens to live in (so two seeds with identical content but
+/// different chain shapes share a hash). The fingerprint covers the pinned base
+/// (`fallback_path`, which decides what never-written chunks resolve to) and every chunk hash in
+/// order — never any chunk *data*, so it stays cheap. Returned prefixed so a seed identity can
+/// never collide with a bare VERSION string in the key's identity slot.
+pub(crate) fn seed_identity(seed_index: &str) -> Result<String> {
+    let flat = dome_store::ChunkIndex::flatten_chain(seed_index)
+        .with_context(|| format!("fingerprinting seed index {seed_index}"))?;
+    let mut hasher = Sha256::new();
+    let fallback = flat.fallback_path.as_deref().unwrap_or("");
+    hasher.update((fallback.len() as u64).to_le_bytes());
+    hasher.update(fallback.as_bytes());
+    let n = flat.num_chunks();
+    hasher.update((n as u64).to_le_bytes());
+    for i in 0..n {
+        let h = flat.get_hash(i).unwrap_or("ZERO");
+        hasher.update((h.len() as u64).to_le_bytes());
+        hasher.update(h.as_bytes());
+    }
+    Ok(format!("seed:{:x}", hasher.finalize()))
+}
+
 /// Runs the provisioning steps and writes the resulting CAS index to `out_index`. Injected so
 /// the orchestration (key/lookup/lock/publish) is testable without a hypervisor.
 pub(crate) trait StepRunner {
     /// Build a provisioned layer: run `spec.steps` (as root, sequentially, stop-on-first-
     /// failure, each via `sh -c`, project dir NOT mounted, network narrowed by `spec.allow`)
-    /// starting from the bare base, and write the resulting CAS index to `out_index`.
+    /// and write the resulting CAS index to `out_index`. The steps start from the bare base, or
+    /// — when `seed` is set (a `--from` composition) — from that seed's CAS index, so the
+    /// toolchain is layered on top of the seeded disk rather than a fresh one.
     ///
     /// On failure, the half-provisioned disk is saved to `failed_index` (when set) so the
     /// developer can shell into it without re-running steps; nothing is ever written to
@@ -99,6 +133,7 @@ pub(crate) trait StepRunner {
         env: &VmArgs,
         out_index: &str,
         failed_index: Option<&str>,
+        seed: Option<&str>,
     ) -> Result<()>;
 }
 
@@ -113,8 +148,9 @@ impl StepRunner for VmStepRunner {
         env: &VmArgs,
         out_index: &str,
         failed_index: Option<&str>,
+        seed: Option<&str>,
     ) -> Result<()> {
-        crate::vm::build_provision_layer(spec, disk_size_mb, env, out_index, failed_index)
+        crate::vm::build_provision_layer(spec, disk_size_mb, env, out_index, failed_index, seed)
     }
 }
 
@@ -149,6 +185,12 @@ pub(crate) fn failed_layer_path(data_dir: &str, hash: &str) -> PathBuf {
 /// this exact hash (the rename overwrites in place), so `--rebuild` forces a clean toolchain
 /// even when a cached one would otherwise be served. The build still runs under the per-hash
 /// lock, so a concurrent plain creation never observes a partial `.idx`.
+///
+/// When `seed` is set (a `--from` composition), the layer's cache key swaps the CLI VERSION
+/// base identity for the seed's content identity ([`seed_identity`]) and the build runs the
+/// steps on top of that seed's disk rather than the bare base — so the same seed + spec
+/// cache-hits and a changed seed rebuilds.
+#[allow(clippy::too_many_arguments)] // cohesive build inputs; bundling them would not aid clarity
 pub(crate) fn ensure_layer(
     data_dir: &str,
     version: &str,
@@ -157,12 +199,19 @@ pub(crate) fn ensure_layer(
     env: &VmArgs,
     runner: &dyn StepRunner,
     rebuild: bool,
+    seed: Option<&str>,
 ) -> Result<Option<String>> {
     if spec.steps.is_empty() {
         return Ok(None);
     }
 
-    let hash = cache_key(version, &spec.steps, &spec.allow, &spec.secrets);
+    // Base identity: the seed's content fingerprint when composing `--from`, else the CLI
+    // VERSION. Everything else about the key (steps, allow, secrets) is identical either way.
+    let identity = match seed {
+        Some(seed_index) => seed_identity(seed_index)?,
+        None => version.to_string(),
+    };
+    let hash = cache_key(&identity, &spec.steps, &spec.allow, &spec.secrets);
     let idx_path = layer_path(data_dir, &hash);
 
     // Fast path: a published layer is served instantly, without taking the lock. `--rebuild`
@@ -198,7 +247,7 @@ pub(crate) fn ensure_layer(
     } else {
         eprintln!("dome: provisioning (first run for this spec)…");
     }
-    let build = runner.build(spec, disk_size_mb, env, &tmp, Some(&failed));
+    let build = runner.build(spec, disk_size_mb, env, &tmp, Some(&failed), seed);
     if let Err(e) = build {
         let _ = std::fs::remove_file(&tmp_path);
         // The build parks the half-provisioned disk at `<hash>.failed` on failure. If it's
@@ -672,6 +721,7 @@ mod tests {
             _env: &VmArgs,
             out_index: &str,
             _failed_index: Option<&str>,
+            _seed: Option<&str>,
         ) -> Result<()> {
             self.calls.fetch_add(1, Ordering::SeqCst);
             std::fs::write(out_index, self.contents).unwrap();
@@ -693,6 +743,7 @@ mod tests {
             _env: &VmArgs,
             _out_index: &str,
             failed_index: Option<&str>,
+            _seed: Option<&str>,
         ) -> Result<()> {
             self.calls.fetch_add(1, Ordering::SeqCst);
             if let Some(failed) = failed_index {
@@ -720,6 +771,7 @@ mod tests {
             &VmArgs::default(),
             &runner,
             false,
+            None,
         )
         .unwrap();
         assert!(layer.is_none(), "a spec with no steps provisions nothing");
@@ -738,9 +790,18 @@ mod tests {
         let s = spec(&["apt-get install -y nodejs"], &["deb.debian.org"]);
 
         // First creation: cold build + publish.
-        let first = ensure_layer(data_dir, "v", &s, 4096, &VmArgs::default(), &runner, false)
-            .unwrap()
-            .expect("a spec with steps yields a layer");
+        let first = ensure_layer(
+            data_dir,
+            "v",
+            &s,
+            4096,
+            &VmArgs::default(),
+            &runner,
+            false,
+            None,
+        )
+        .unwrap()
+        .expect("a spec with steps yields a layer");
         assert_eq!(calls.load(Ordering::SeqCst), 1, "cold build ran once");
         assert!(Path::new(&first).exists(), "the layer was published");
         // Published atomically into the per-hash path (no temp left behind).
@@ -754,9 +815,18 @@ mod tests {
         assert!(leftovers.is_empty(), "no temp file survives a publish");
 
         // Second creation on the same spec: cache hit, no rebuild.
-        let second = ensure_layer(data_dir, "v", &s, 4096, &VmArgs::default(), &runner, false)
-            .unwrap()
-            .unwrap();
+        let second = ensure_layer(
+            data_dir,
+            "v",
+            &s,
+            4096,
+            &VmArgs::default(),
+            &runner,
+            false,
+            None,
+        )
+        .unwrap()
+        .unwrap();
         assert_eq!(second, first, "the same spec resolves to the same layer");
         assert_eq!(
             calls.load(Ordering::SeqCst),
@@ -783,6 +853,7 @@ mod tests {
             &VmArgs::default(),
             &runner,
             false,
+            None,
         )
         .unwrap()
         .unwrap();
@@ -794,6 +865,7 @@ mod tests {
             &VmArgs::default(),
             &runner,
             false,
+            None,
         )
         .unwrap()
         .unwrap();
@@ -820,6 +892,7 @@ mod tests {
             _env: &VmArgs,
             out_index: &str,
             _failed_index: Option<&str>,
+            _seed: Option<&str>,
         ) -> Result<()> {
             self.calls.fetch_add(1, Ordering::SeqCst);
             std::thread::sleep(std::time::Duration::from_millis(80));
@@ -844,9 +917,18 @@ mod tests {
                 let s = s.clone();
                 std::thread::spawn(move || {
                     let runner = SlowRunner { calls };
-                    ensure_layer(&data_dir, "v", &s, 4096, &VmArgs::default(), &runner, false)
-                        .unwrap()
-                        .unwrap()
+                    ensure_layer(
+                        &data_dir,
+                        "v",
+                        &s,
+                        4096,
+                        &VmArgs::default(),
+                        &runner,
+                        false,
+                        None,
+                    )
+                    .unwrap()
+                    .unwrap()
                 })
             })
             .collect();
@@ -881,6 +963,7 @@ mod tests {
             &VmArgs::default(),
             &runner,
             false,
+            None,
         )
         .unwrap()
         .unwrap();
@@ -902,8 +985,17 @@ mod tests {
         };
         let s = spec(&["apt-get install nope"], &[]);
 
-        let err = ensure_layer(data_dir, "v", &s, 4096, &VmArgs::default(), &runner, false)
-            .expect_err("a failed build must propagate the error");
+        let err = ensure_layer(
+            data_dir,
+            "v",
+            &s,
+            4096,
+            &VmArgs::default(),
+            &runner,
+            false,
+            None,
+        )
+        .expect_err("a failed build must propagate the error");
         // The failure surfaces the failing step's command + exit code (carried in the error).
         let msg = format!("{err:#}");
         assert!(
@@ -947,7 +1039,17 @@ mod tests {
         let fail = FailingRunner {
             calls: Arc::new(AtomicUsize::new(0)),
         };
-        ensure_layer(data_dir, "v", &s, 4096, &VmArgs::default(), &fail, false).unwrap_err();
+        ensure_layer(
+            data_dir,
+            "v",
+            &s,
+            4096,
+            &VmArgs::default(),
+            &fail,
+            false,
+            None,
+        )
+        .unwrap_err();
         assert!(failed_layer_path(data_dir, &hash).exists());
 
         // Then: succeed → success layer published, stale `.failed` removed.
@@ -955,9 +1057,18 @@ mod tests {
             calls: Arc::new(AtomicUsize::new(0)),
             contents: "clean-layer",
         };
-        let layer = ensure_layer(data_dir, "v", &s, 4096, &VmArgs::default(), &ok, false)
-            .unwrap()
-            .unwrap();
+        let layer = ensure_layer(
+            data_dir,
+            "v",
+            &s,
+            4096,
+            &VmArgs::default(),
+            &ok,
+            false,
+            None,
+        )
+        .unwrap()
+        .unwrap();
         assert!(Path::new(&layer).exists(), "the clean layer is published");
         assert!(
             !failed_layer_path(data_dir, &hash).exists(),
@@ -1050,9 +1161,18 @@ mod tests {
             calls: calls.clone(),
             contents: "toolchain-v1",
         };
-        let first = ensure_layer(data_dir, "v", &s, 4096, &VmArgs::default(), &v1, false)
-            .unwrap()
-            .unwrap();
+        let first = ensure_layer(
+            data_dir,
+            "v",
+            &s,
+            4096,
+            &VmArgs::default(),
+            &v1,
+            false,
+            None,
+        )
+        .unwrap()
+        .unwrap();
         assert_eq!(calls.load(Ordering::SeqCst), 1, "cold build ran once");
         assert_eq!(std::fs::read_to_string(&first).unwrap(), "toolchain-v1");
 
@@ -1069,6 +1189,7 @@ mod tests {
             &VmArgs::default(),
             &v_cached,
             false,
+            None,
         )
         .unwrap()
         .unwrap();
@@ -1081,7 +1202,7 @@ mod tests {
             calls: calls.clone(),
             contents: "toolchain-v2",
         };
-        let rebuilt = ensure_layer(data_dir, "v", &s, 4096, &VmArgs::default(), &v2, true)
+        let rebuilt = ensure_layer(data_dir, "v", &s, 4096, &VmArgs::default(), &v2, true, None)
             .unwrap()
             .unwrap();
         assert_eq!(
@@ -1210,6 +1331,198 @@ mod tests {
             hashes,
             vec!["feedface"],
             "only the published layer is listed"
+        );
+    }
+
+    /// Write a self-contained (depth-1) seed index at `path` with the given chunk hashes and
+    /// pinned base, so the `--from` composition helpers (#70) can be driven without a hypervisor.
+    fn write_seed_index(path: &str, chunks: &[(usize, &str)], base: Option<&str>) {
+        let mut idx = dome_store::ChunkIndex::new(64 * 1024 * 1024);
+        for (i, h) in chunks {
+            idx.set_hash(*i, h.to_string());
+        }
+        idx.fallback_path = base.map(|s| s.to_string());
+        idx.save(path).unwrap();
+    }
+
+    #[test]
+    fn seed_identity_fingerprints_resolved_content() {
+        // The seed identity (#70) is a stable fingerprint of the seed's resolved content: the
+        // same content yields the same identity, and changing any chunk OR the pinned base
+        // (which decides what never-written chunks resolve to) changes it.
+        let tmp = tempfile::tempdir().unwrap();
+        let a = tmp.path().join("a.idx");
+        let a = a.to_str().unwrap();
+        let b = tmp.path().join("b.idx");
+        let b = b.to_str().unwrap();
+
+        write_seed_index(a, &[(0, "h0"), (1, "h1")], Some("/data/rootfs-1.0.0.ext4"));
+        write_seed_index(b, &[(0, "h0"), (1, "h1")], Some("/data/rootfs-1.0.0.ext4"));
+        assert_eq!(
+            seed_identity(a).unwrap(),
+            seed_identity(b).unwrap(),
+            "identical content yields an identical identity"
+        );
+        assert!(
+            seed_identity(a).unwrap().starts_with("seed:"),
+            "a seed identity is prefixed so it can't collide with a bare VERSION string"
+        );
+
+        // A changed chunk changes the identity.
+        write_seed_index(
+            b,
+            &[(0, "h0"), (1, "DIFFERENT")],
+            Some("/data/rootfs-1.0.0.ext4"),
+        );
+        assert_ne!(seed_identity(a).unwrap(), seed_identity(b).unwrap());
+
+        // A changed pinned base changes the identity too.
+        write_seed_index(b, &[(0, "h0"), (1, "h1")], Some("/data/rootfs-2.0.0.ext4"));
+        assert_ne!(seed_identity(a).unwrap(), seed_identity(b).unwrap());
+    }
+
+    #[test]
+    fn cache_key_swaps_base_identity_for_the_seed() {
+        // With `--from`, the layer keys against the seed's content identity in place of the CLI
+        // VERSION — so a seeded build and a bare-base build of the same spec never collide.
+        let tmp = tempfile::tempdir().unwrap();
+        let seed = tmp.path().join("seed.idx");
+        let seed = seed.to_str().unwrap();
+        write_seed_index(seed, &[(0, "c0")], Some("/data/rootfs-1.0.0.ext4"));
+
+        let steps = ["install".to_string()];
+        let version_key = cache_key("0.6.3", &steps, &[], &[]);
+        let seed_key = cache_key(&seed_identity(seed).unwrap(), &steps, &[], &[]);
+        assert_ne!(
+            version_key, seed_key,
+            "a --from seed keys against the seed content, not the CLI VERSION"
+        );
+    }
+
+    /// A runner that records the `seed` it was handed (the composition seam) and writes a
+    /// sentinel layer, so the `--from` orchestration can be driven without a hypervisor.
+    struct SeedRecordingRunner {
+        calls: Arc<AtomicUsize>,
+        seen: Arc<std::sync::Mutex<Vec<Option<String>>>>,
+        contents: &'static str,
+    }
+
+    impl StepRunner for SeedRecordingRunner {
+        fn build(
+            &self,
+            _spec: &ProvisionSpec,
+            _disk_size_mb: u64,
+            _env: &VmArgs,
+            out_index: &str,
+            _failed_index: Option<&str>,
+            seed: Option<&str>,
+        ) -> Result<()> {
+            self.calls.fetch_add(1, Ordering::SeqCst);
+            self.seen.lock().unwrap().push(seed.map(|s| s.to_string()));
+            std::fs::write(out_index, self.contents).unwrap();
+            Ok(())
+        }
+    }
+
+    #[test]
+    fn composing_on_a_seed_hits_on_same_seed_and_rebuilds_on_a_changed_seed() {
+        // The #70 acceptance criteria end-to-end through `ensure_layer`: composing `--from` a
+        // seed threads the seed to the build, same-seed-same-spec cache-hits, a changed seed
+        // rebuilds, and a seeded layer is keyed apart from the bare-base build.
+        let tmp = tempfile::tempdir().unwrap();
+        let data_dir = tmp.path().to_str().unwrap();
+        let seed1 = tmp.path().join("seed1.idx");
+        let seed1 = seed1.to_str().unwrap();
+        write_seed_index(seed1, &[(0, "c0")], Some("/data/rootfs-1.0.0.ext4"));
+
+        let calls = Arc::new(AtomicUsize::new(0));
+        let seen = Arc::new(std::sync::Mutex::new(Vec::<Option<String>>::new()));
+        let runner = SeedRecordingRunner {
+            calls: calls.clone(),
+            seen: seen.clone(),
+            contents: "composed-layer",
+        };
+        let s = spec(&["install"], &[]);
+
+        // Cold build composing on seed1: the build runs once and is handed the seed.
+        let first = ensure_layer(
+            data_dir,
+            "v",
+            &s,
+            4096,
+            &VmArgs::default(),
+            &runner,
+            false,
+            Some(seed1),
+        )
+        .unwrap()
+        .unwrap();
+        assert_eq!(
+            calls.load(Ordering::SeqCst),
+            1,
+            "cold composed build ran once"
+        );
+        assert_eq!(
+            seen.lock().unwrap().last().unwrap().as_deref(),
+            Some(seed1),
+            "the seed is threaded to the build so steps compose on top of it"
+        );
+
+        // Same seed + spec → cache hit, no rebuild.
+        let again = ensure_layer(
+            data_dir,
+            "v",
+            &s,
+            4096,
+            &VmArgs::default(),
+            &runner,
+            false,
+            Some(seed1),
+        )
+        .unwrap()
+        .unwrap();
+        assert_eq!(again, first, "same seed + spec resolves to the same layer");
+        assert_eq!(
+            calls.load(Ordering::SeqCst),
+            1,
+            "same seed + spec must not rebuild"
+        );
+
+        // A seed with different content → different hash → rebuild.
+        let seed2 = tmp.path().join("seed2.idx");
+        let seed2 = seed2.to_str().unwrap();
+        write_seed_index(seed2, &[(0, "DIFFERENT")], Some("/data/rootfs-1.0.0.ext4"));
+        let other = ensure_layer(
+            data_dir,
+            "v",
+            &s,
+            4096,
+            &VmArgs::default(),
+            &runner,
+            false,
+            Some(seed2),
+        )
+        .unwrap()
+        .unwrap();
+        assert_ne!(other, first, "a changed seed resolves to a different layer");
+        assert_eq!(calls.load(Ordering::SeqCst), 2, "a changed seed rebuilds");
+
+        // Composing on a seed is keyed apart from the bare-base (no-seed) build of the same spec.
+        let bare = ensure_layer(
+            data_dir,
+            "v",
+            &s,
+            4096,
+            &VmArgs::default(),
+            &runner,
+            false,
+            None,
+        )
+        .unwrap()
+        .unwrap();
+        assert_ne!(
+            bare, first,
+            "a seeded layer is keyed differently from a bare-base layer"
         );
     }
 }

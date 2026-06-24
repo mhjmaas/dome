@@ -61,26 +61,41 @@ fn main() -> Result<()> {
                 &vm,
             )?;
 
-            // Declarative provisioning: when the project declares a `provision` block and no
-            // explicit `--from` was given, resolve (building once if uncached) the cached
-            // toolchain layer and seed this ephemeral run from it. `--from` composition with a
-            // provisioned layer is a later slice, so an explicit seed wins here.
-            let provision_seed = match (from.as_deref(), &resolved.provision) {
-                (None, Some(spec)) => provision::ensure_layer(
-                    &default_data_dir(),
-                    assets::CURRENT_VERSION,
-                    spec,
-                    resolved.disk_size.unwrap_or(4096),
-                    &vm,
-                    &provision::VmStepRunner,
-                    rebuild,
-                )?,
-                _ => None,
+            // Declarative provisioning: when the project declares a `provision` block, resolve
+            // (building once if uncached) the cached toolchain layer and seed this ephemeral run
+            // from it. With `--from`, provisioning *composes* on top of that seed: the steps run
+            // over the seeded checkpoint and the layer's cache key reflects the seed's content
+            // (not the CLI VERSION). The composed layer fully incorporates the seed, so it
+            // becomes the effective seed and the original `--from` is dropped for the boot below.
+            let (effective_from, provision_seed) = match (from.as_deref(), &resolved.provision) {
+                (_, Some(spec)) => {
+                    let seed_idx = match from.as_deref() {
+                        Some(name) => Some(resolve_run_seed_index(name, &default_data_dir())?),
+                        None => None,
+                    };
+                    let layer = provision::ensure_layer(
+                        &default_data_dir(),
+                        assets::CURRENT_VERSION,
+                        spec,
+                        resolved.disk_size.unwrap_or(4096),
+                        &vm,
+                        &provision::VmStepRunner,
+                        rebuild,
+                        seed_idx.as_deref(),
+                    )?;
+                    // A composed layer subsumes the seed; ride the layer, drop the raw `--from`.
+                    // If no layer was built (an empty-steps spec), keep the raw `--from` seed.
+                    match layer {
+                        Some(l) => (None, Some(l)),
+                        None => (from.as_deref(), None),
+                    }
+                }
+                (from, None) => (from, None),
             };
             let prepared = vm::prepare_vm(
                 &resolved,
                 &vm,
-                from.as_deref(),
+                effective_from,
                 provision_seed.as_deref(),
                 None,
             )?;
@@ -335,4 +350,25 @@ fn run_console(prepared: &vm::PreparedVm) -> Result<i32> {
     }
 
     Ok(exit_code)
+}
+
+/// Resolve a `dome run --from <name>` seed to the CAS index path provisioning should compose on
+/// top of. `dome run` seeds from checkpoints (the same source [`vm::prepare_vm`] resolves), so a
+/// CAS checkpoint index is required: a legacy `.ext4` checkpoint has no chunk index to layer on,
+/// and a missing one is a clear error rather than a silent fall-back to the bare base.
+fn resolve_run_seed_index(name: &str, data_dir: &str) -> Result<String> {
+    dome_vm::validate_checkpoint_name(name).map_err(|e| anyhow::anyhow!(e))?;
+    let idx_path = format!("{}/checkpoints/{}.idx", data_dir, name);
+    if std::path::Path::new(&idx_path).exists() {
+        return Ok(idx_path);
+    }
+    if std::path::Path::new(&format!("{}/checkpoints/{}.ext4", data_dir, name)).exists() {
+        anyhow::bail!(
+            "checkpoint '{}' is a legacy .ext4 image with no CAS index; provisioning can only \
+             compose on top of a CAS checkpoint. Recreate the checkpoint, or run without a \
+             `provision` block.",
+            name
+        );
+    }
+    anyhow::bail!("Checkpoint '{}' not found", name)
 }
