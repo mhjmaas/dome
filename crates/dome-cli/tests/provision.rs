@@ -457,12 +457,58 @@ fn provision_composes_on_top_of_a_seeded_checkpoint() {
         "provisioning must layer its marker on top of the seed; stdout: {out}"
     );
 
+    // 5. Regression: the composed layer must be SELF-CONTAINED, not chained to the seed it was
+    //    built `--from`. Delete the seed checkpoint, then `dome prune`: the cached
+    //    provision/<hash>.idx must not dangle. A chained layer (the bug) would record
+    //    parent_path = <seed index>; once the seed is gone, prune's mark phase would fail to
+    //    load that parent and skip the layer with a "skipping unreadable index" warning,
+    //    stranding the layer's own chunks. A flattened (parent-less) layer prunes cleanly.
+    let del = Command::new(dome_bin())
+        .args(["checkpoint", "delete", &ckpt])
+        .output()
+        .expect("failed to spawn dome checkpoint delete");
+    assert!(
+        del.status.success(),
+        "deleting the seed checkpoint should succeed; stderr: {}",
+        String::from_utf8_lossy(&del.stderr)
+    );
+    let prune = Command::new(dome_bin())
+        .arg("prune")
+        .output()
+        .expect("failed to spawn dome prune");
+    let prune_err = String::from_utf8_lossy(&prune.stderr);
+    assert!(
+        prune.status.success(),
+        "prune should succeed after the seed is gone; stderr: {prune_err}"
+    );
+    assert!(
+        !prune_err.contains("skipping unreadable index"),
+        "the composed layer must be self-contained: prune found a dangling parent after the \
+         seed checkpoint was deleted; stderr: {prune_err}"
+    );
+    // The composed sandbox (which flattened the layer at seed time) still runs after the prune.
+    let after = Command::new(dome_bin())
+        .current_dir(project.path())
+        .args([
+            "sandbox",
+            "run",
+            &sandbox,
+            "--",
+            "sh",
+            "-c",
+            &format!("cat /opt/{seed_marker} /opt/{prov_marker}"),
+        ])
+        .output()
+        .expect("failed to spawn dome sandbox run after prune");
+    assert!(
+        after.status.success() && String::from_utf8_lossy(&after.stdout).contains("seedok"),
+        "the composed sandbox must still run after the seed is deleted and pruned; stderr: {}",
+        String::from_utf8_lossy(&after.stderr)
+    );
+
     // Best-effort cleanup.
     let _ = Command::new(dome_bin())
         .args(["sandbox", "rm", &sandbox])
-        .output();
-    let _ = Command::new(dome_bin())
-        .args(["checkpoint", "delete", &ckpt])
         .output();
 }
 

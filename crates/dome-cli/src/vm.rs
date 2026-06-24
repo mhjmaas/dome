@@ -562,6 +562,15 @@ pub(crate) fn build_provision_layer(
     // failure — if a debug path was given — to that path so the developer can shell into the
     // half-provisioned disk without re-running steps. Nothing partial is ever written to
     // `out_index`, so the success hash is never published from a failed build.
+    //
+    // Both saves FLATTEN the chain into a self-contained, parent-less index (`save_sandbox`),
+    // never a chained checkpoint (`save_checkpoint`). A provisioned layer is a standalone cache
+    // entry that must outlive the seed it was composed on: when building `--from` a checkpoint or
+    // sandbox, a chained save would record `parent_path = <seed index>`, so deleting that seed
+    // later would dangle the cached layer (a broken parent breaks `dome prune`'s mark phase and
+    // strands the layer's own chunks for reclamation). Flattening copies hash *references*, not
+    // chunk data — CAS still dedups by content hash — so this is self-containment at no storage
+    // cost. A bare (non-composed) build has no parent, so flattening is a no-op for it.
     let BootedVm {
         sandbox,
         proxy_handle,
@@ -576,7 +585,7 @@ pub(crate) fn build_provision_layer(
     let result = match failure {
         Some(e) => {
             if let (Some(failed), Some(h)) = (failed_index, &nbd_handle) {
-                match h.save_checkpoint(failed) {
+                match h.save_sandbox(failed) {
                     Ok(_) => eprintln!("dome: preserved the half-provisioned disk for debugging"),
                     Err(se) => eprintln!(
                         "dome: warning: could not preserve the debug disk ({}): {:#}",
@@ -588,7 +597,7 @@ pub(crate) fn build_provision_layer(
         }
         None => match &nbd_handle {
             Some(h) => h
-                .save_checkpoint(out_index)
+                .save_sandbox(out_index)
                 .context("saving provisioned layer"),
             None => Err(anyhow::anyhow!(
                 "provisioning requires CAS storage; DOME_STORAGE=direct is not supported"
