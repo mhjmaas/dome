@@ -52,6 +52,23 @@ check:
 clippy:
     cargo clippy --workspace
 
+# Run the hypervisor-free unit + control-protocol tests (no VM, no codesign).
+test:
+    cargo test -p dome-cli
+
+# Run the #[ignore]d real-VM integration tests. Needs macOS Virtualization.framework and a
+# codesigned binary. Pass a substring to run a subset: `just test-vm runtime_mounts` runs one
+# test; bare `just test-vm` runs them all.
+test-vm filter="": build-guest build-cli
+    # Build all test harnesses first. We can't sign target/debug/dome in place: every `cargo
+    # test` re-hardlinks it from the cached deps/ artifact, reverting any signature. So sign a
+    # private COPY that cargo never manages, and point the tests at it via DOME_BIN. A spawned
+    # worker inherits the signature too (it re-execs current_exe, i.e. this signed copy).
+    cargo test -p dome-cli --tests --no-run
+    cp -f {{ binary }} {{ binary }}-signed
+    codesign --entitlements dome.entitlements --force -s - {{ binary }}-signed
+    DOME_BIN={{ justfile_directory() }}/{{ binary }}-signed cargo test -p dome-cli --tests --no-fail-fast -- --ignored {{ filter }}
+
 # Install the binary to ~/.local/bin with codesign
 install: build-guest
     cargo build -p dome-cli --release

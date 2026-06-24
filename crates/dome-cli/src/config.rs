@@ -105,6 +105,19 @@ pub(crate) fn config_path(config_flag: Option<&str>) -> std::path::PathBuf {
     }
 }
 
+/// The project root: the canonical directory containing the `dome.json` in use, or `None`
+/// when no `dome.json` is present (an absent default `./dome.json` is not an error — `dome run`
+/// still boots; there is simply no project to mount). The RUNTIME guest auto-mounts this
+/// directory at [`crate::vm::GUEST_PROJECT_ROOT`]; the provision BUILD phase deliberately does
+/// not (see [`crate::vm::build_provision_layer`]). Resolves relative to the current working
+/// directory, matching [`config_path`] — callers that need it rooted elsewhere (the worker)
+/// `set_current_dir` to the originating cwd first.
+pub(crate) fn project_root(config_flag: Option<&str>) -> Option<std::path::PathBuf> {
+    let path = config_path(config_flag);
+    let canonical = std::fs::canonicalize(&path).ok()?;
+    canonical.parent().map(|p| p.to_path_buf())
+}
+
 pub(crate) fn load_config(config_flag: Option<&str>) -> Result<DomeConfig> {
     let path = config_path(config_flag);
 
@@ -121,5 +134,31 @@ pub(crate) fn load_config(config_flag: Option<&str>) -> Result<DomeConfig> {
             Ok(DomeConfig::default())
         }
         Err(e) => bail!("Failed to read {}: {}", path.display(), e),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn project_root_is_the_dir_containing_an_explicit_dome_json() {
+        // With an explicit (existing) --config, the project root is that file's directory —
+        // the dir the runtime auto-mounts into the guest at GUEST_PROJECT_ROOT.
+        let dir = tempfile::tempdir().expect("tempdir");
+        let dome_json = dir.path().join("dome.json");
+        std::fs::write(&dome_json, "{}").expect("write dome.json");
+
+        let root = project_root(Some(dome_json.to_str().unwrap())).expect("root present");
+        // Canonicalize the expected dir too: tempdir() may sit under a symlinked /tmp.
+        assert_eq!(root, std::fs::canonicalize(dir.path()).unwrap());
+    }
+
+    #[test]
+    fn project_root_is_none_when_dome_json_is_absent() {
+        // No dome.json → no project to mount (a plain `dome run` in a bare dir is unaffected).
+        let dir = tempfile::tempdir().expect("tempdir");
+        let missing = dir.path().join("dome.json");
+        assert!(project_root(Some(missing.to_str().unwrap())).is_none());
     }
 }
