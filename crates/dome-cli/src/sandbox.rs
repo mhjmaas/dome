@@ -6,6 +6,7 @@
 use std::path::{Path, PathBuf};
 
 use anyhow::{bail, Context, Result};
+use sha2::{Digest, Sha256};
 
 use std::io::IsTerminal;
 
@@ -792,6 +793,47 @@ pub(crate) fn resolve_name(explicit: Option<&str>, cfg: &DomeConfig, cwd: &Path)
     Ok(slug)
 }
 
+/// The plain cwd-slug for a directory: its basename slugified, or `None` when the basename
+/// yields an empty slug (e.g. a directory named entirely of punctuation, or the filesystem
+/// root). This is the manual-`dome sandbox` fallback name and the stable name the pin offer
+/// suggests writing into `dome.json`.
+pub(crate) fn project_slug(dir: &Path) -> Option<String> {
+    let base = dir.file_name().and_then(|s| s.to_str())?;
+    let slug = slugify(base);
+    (!slug.is_empty()).then_some(slug)
+}
+
+/// The sandbox name for *auto-activation*: the explicit `sandbox` field if set, otherwise a
+/// collision-proof `<slug>-<pathhash>` derived from the project's absolute path. Unlike the
+/// manual [`resolve_name`] fallback (a bare cwd-slug), this never lets two different directories
+/// with the same basename silently share one VM — `~/work/acme/api` and `~/personal/api` slug to
+/// the same `api` but hash to different suffixes. A directory whose basename has no slug (root,
+/// all-punctuation) falls back to `dome-<pathhash>` rather than failing the drop-in.
+pub(crate) fn auto_activation_name(cfg: &DomeConfig, project_dir: &Path) -> Result<String> {
+    if let Some(name) = cfg.sandbox.as_deref() {
+        if !name.is_empty() {
+            return Ok(name.to_string());
+        }
+    }
+    let hash = short_path_hash(project_dir);
+    Ok(match project_slug(project_dir) {
+        Some(slug) => format!("{slug}-{hash}"),
+        None => format!("dome-{hash}"),
+    })
+}
+
+/// The first 8 hex chars of the sha256 of `dir`'s canonical absolute path — a short, stable,
+/// filesystem-safe discriminator that differs for any two distinct directories. Canonicalized
+/// so the same project always hashes identically regardless of how the cwd reached it (symlinks,
+/// `..`), falling back to the given path if it cannot be canonicalized.
+fn short_path_hash(dir: &Path) -> String {
+    let canonical = std::fs::canonicalize(dir).unwrap_or_else(|_| dir.to_path_buf());
+    let mut hasher = Sha256::new();
+    hasher.update(canonical.to_string_lossy().as_bytes());
+    let hex = format!("{:x}", hasher.finalize());
+    hex[..8].to_string()
+}
+
 /// Lowercase, replace runs of non-alphanumeric characters with a single '-', and
 /// trim leading/trailing '-'.
 fn slugify(s: &str) -> String {
@@ -1181,6 +1223,59 @@ mod tests {
         assert_eq!(slugify("--weird__name!!"), "weird-name");
         assert_eq!(slugify("CamelCase"), "camelcase");
         assert_eq!(slugify("a.b.c"), "a-b-c");
+    }
+
+    #[test]
+    fn auto_activation_name_appends_a_path_hash_to_the_slug() {
+        // With no `sandbox` field, auto-activation collision-proofs the bare cwd-slug by
+        // suffixing a short hash of the project's absolute path: `<slug>-<hash>`.
+        let dir = tempfile::tempdir().unwrap();
+        let project = dir.path().join("api");
+        std::fs::create_dir(&project).unwrap();
+        let name = auto_activation_name(&cfg_with(None), &project).unwrap();
+        let (slug, hash) = name.split_once('-').expect("name is slug-hash");
+        assert_eq!(slug, "api");
+        assert_eq!(hash.len(), 8, "8 hex chars of path hash; got {name}");
+        assert!(hash.chars().all(|c| c.is_ascii_hexdigit()));
+    }
+
+    #[test]
+    fn auto_activation_name_respects_an_explicit_sandbox_field() {
+        // The explicit `sandbox` field always wins — even under auto-activation — so a project
+        // that has chosen a stable name never gets a path-hash suffix.
+        let dir = tempfile::tempdir().unwrap();
+        let project = dir.path().join("api");
+        std::fs::create_dir(&project).unwrap();
+        let name = auto_activation_name(&cfg_with(Some("web")), &project).unwrap();
+        assert_eq!(name, "web");
+    }
+
+    #[test]
+    fn auto_activation_name_distinguishes_same_basename_different_paths() {
+        // Two different directories that slug to the same basename ("api") must resolve to
+        // DIFFERENT sandbox names, so they never silently share one VM (the core hazard #62 fixes).
+        let a = tempfile::tempdir().unwrap();
+        let b = tempfile::tempdir().unwrap();
+        let api_a = a.path().join("api");
+        let api_b = b.path().join("api");
+        std::fs::create_dir(&api_a).unwrap();
+        std::fs::create_dir(&api_b).unwrap();
+        let name_a = auto_activation_name(&cfg_with(None), &api_a).unwrap();
+        let name_b = auto_activation_name(&cfg_with(None), &api_b).unwrap();
+        assert!(name_a.starts_with("api-") && name_b.starts_with("api-"));
+        assert_ne!(
+            name_a, name_b,
+            "same basename, different paths → different names"
+        );
+    }
+
+    #[test]
+    fn project_slug_derives_the_plain_cwd_slug() {
+        // The pin offer suggests this plain slug as the stable `sandbox` name.
+        assert_eq!(
+            project_slug(Path::new("/Users/dev/My Project")).as_deref(),
+            Some("my-project")
+        );
     }
 
     #[test]

@@ -188,6 +188,98 @@ fn inline_grant_on_manual_run_enables_auto_activation() {
     cleanup(&name);
 }
 
+/// Collision-proof naming (#62): a project with NO `sandbox` field auto-activates into a
+/// `<slug>-<pathhash>` sandbox (not the bare cwd-slug), so two same-basename directories never
+/// silently share one VM. Drives the real drop-in and reads `$DOME_SANDBOX` from inside the guest.
+#[test]
+#[ignore]
+fn auto_activation_derives_a_pathhash_sandbox_name() {
+    let tmp = tempfile::tempdir().expect("tempdir");
+    // Basename "api" → the slug is a known prefix; the hash suffix is derived from the abs path.
+    let project = tmp.path().join("api");
+    std::fs::create_dir(&project).unwrap();
+    std::fs::write(project.join("dome.json"), "{}").unwrap();
+
+    // Trust it via a piped (non-interactive) `dome allow`: no pin prompt fires, and trust is
+    // recorded against the bare `{}` so auto-activation derives the path-hashed name.
+    let allow = dome_in(&project, &["allow"]);
+    assert!(
+        allow.status.success(),
+        "dome allow failed: {}",
+        String::from_utf8_lossy(&allow.stderr)
+    );
+
+    // Auto-activate: the drop-in boots the guest; the guest reports the resolved DOME_SANDBOX.
+    let (stdout, code) = hook_activate(&project, &project, "echo SANDBOX=$DOME_SANDBOX\nexit\n");
+    let name = stdout
+        .lines()
+        .find_map(|l| l.strip_prefix("SANDBOX="))
+        .map(str::to_string);
+    // Always reclaim whatever VM we booted, even if an assertion below fails.
+    if let Some(ref n) = name {
+        cleanup(n);
+    }
+
+    assert_eq!(
+        code, 0,
+        "a trusted drop-in must drop in (exit 0); stdout:\n{stdout}"
+    );
+    let name = name.expect("the guest must print its DOME_SANDBOX");
+    let (slug, hash) = name.split_once('-').expect("the name is <slug>-<hash>");
+    assert_eq!(
+        slug, "api",
+        "the slug prefix is the cwd basename; got {name}"
+    );
+    assert_eq!(hash.len(), 8, "8 hex chars of path hash; got {name}");
+    assert!(
+        hash.chars().all(|c| c.is_ascii_hexdigit()),
+        "the suffix is a hex path hash; got {name}"
+    );
+}
+
+/// Offer-to-pin (#62): `dome allow` under a TTY on a project with no `sandbox` field offers to
+/// pin a stable name. Accepting writes `sandbox: "<slug>"` into the dome.json, and a later
+/// auto-activation then uses that plain pinned name (no path-hash) — manual and auto converge.
+#[test]
+#[ignore]
+fn pin_offer_writes_a_stable_name_and_converges_auto_activation() {
+    // A unique basename per test process: the pinned name equals the slug, so this keeps reruns
+    // from colliding on one sandbox.
+    let base = format!("pin{}", std::process::id());
+    cleanup(&base);
+
+    let tmp = tempfile::tempdir().expect("tempdir");
+    let project = tmp.path().join(&base);
+    std::fs::create_dir(&project).unwrap();
+    std::fs::write(project.join("dome.json"), "{}\n").unwrap();
+
+    // `dome allow` under a pty, answering `y` to the pin offer.
+    let out = dome_in_pty(&project, &["allow"], "y\n");
+    assert!(
+        out.contains("pin a stable sandbox name"),
+        "the pin offer must appear on a TTY for an unpinned project; output:\n{out}"
+    );
+
+    // The dome.json now carries the pinned `sandbox` field.
+    let written = std::fs::read_to_string(project.join("dome.json")).unwrap();
+    assert!(
+        written.contains(&format!("\"sandbox\": \"{base}\"")),
+        "dome.json must be pinned with the stable name; got:\n{written}"
+    );
+
+    // Auto-activation now resolves to the plain pinned name (no hash suffix).
+    let (stdout, code) = hook_activate(&project, &project, "echo SANDBOX=$DOME_SANDBOX\nexit\n");
+    cleanup(&base);
+    assert_eq!(
+        code, 0,
+        "the pinned, trusted project must drop in; stdout:\n{stdout}"
+    );
+    assert!(
+        stdout.lines().any(|l| l == format!("SANDBOX={base}")),
+        "auto-activation must use the pinned name (no path-hash); stdout:\n{stdout}"
+    );
+}
+
 /// The full tracer bullet: untrusted → no drop-in; `dome allow` → trusted; drop-in lands in the
 /// guest at the mapped SUBDIRECTORY and returns the "dropped-in" exit code.
 #[test]
