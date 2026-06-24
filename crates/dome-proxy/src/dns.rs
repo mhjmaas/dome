@@ -1,13 +1,73 @@
+use std::collections::HashMap;
 use std::net::{Ipv4Addr, UdpSocket};
+use std::sync::{Arc, Mutex};
+use std::time::{Duration, Instant};
 
 use simple_dns::Packet;
 use smoltcp::wire::IpEndpoint;
 use tokio::sync::mpsc;
-use tracing::debug;
+use tracing::{debug, warn};
 
 use crate::config::ProxyConfig;
 use crate::stack::StackCommand;
 use crate::AllowedIps;
+
+/// Shared handle to the host-side DNS answer cache.
+pub type SharedDnsCache = Arc<DnsCache>;
+
+struct CacheEntry {
+    ips: Vec<Ipv4Addr>,
+    expires_at: Instant,
+}
+
+/// A short-TTL cache of resolved A records, keyed by domain name.
+///
+/// Without it, a large `pnpm install` re-resolves the same handful of hosts
+/// (e.g. `registry.npmjs.org`) hundreds of times, multiplying load on both the
+/// upstream resolver and the small in-VM DNS socket buffers. Time is passed in
+/// rather than read internally so the eviction logic is deterministically
+/// testable.
+pub struct DnsCache {
+    entries: Mutex<HashMap<String, CacheEntry>>,
+}
+
+impl Default for DnsCache {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+impl DnsCache {
+    pub fn new() -> Self {
+        DnsCache {
+            entries: Mutex::new(HashMap::new()),
+        }
+    }
+
+    /// Return the cached IPs for `name` if present and not yet expired.
+    fn get(&self, name: &str, now: Instant) -> Option<Vec<Ipv4Addr>> {
+        let entries = self.entries.lock().expect("dns cache lock poisoned");
+        let entry = entries.get(name)?;
+        if entry.expires_at > now {
+            Some(entry.ips.clone())
+        } else {
+            None
+        }
+    }
+
+    /// Cache `ips` for `name` for `ttl_secs`. A zero TTL is not stored (nothing
+    /// to gain, and it keeps the "do not cache" DNS semantics intact).
+    fn insert(&self, name: &str, ips: Vec<Ipv4Addr>, ttl_secs: u32, now: Instant) {
+        if ttl_secs == 0 || ips.is_empty() {
+            return;
+        }
+        let expires_at = now + Duration::from_secs(u64::from(ttl_secs));
+        self.entries
+            .lock()
+            .expect("dns cache lock poisoned")
+            .insert(name.to_string(), CacheEntry { ips, expires_at });
+    }
+}
 
 /// Handle a DNS query from the guest.
 ///
@@ -20,12 +80,19 @@ pub async fn handle_dns_query(
     cmd_tx: mpsc::UnboundedSender<StackCommand>,
     config: &ProxyConfig,
     allowed_ips: &AllowedIps,
+    cache: &SharedDnsCache,
 ) {
-    let response = match resolve_query(&payload, config, allowed_ips).await {
+    let response = match resolve_query(&payload, config, allowed_ips, cache).await {
         Ok(resp) => resp,
         Err(e) => {
-            debug!("DNS resolution failed: {e}");
-            return;
+            // Don't drop the reply: an unanswered query makes the guest resolver
+            // time out and surface a misleading EAI_AGAIN on whatever operation
+            // was in flight. Send SERVFAIL so it fails fast and clearly instead.
+            warn!("DNS resolution failed, returning SERVFAIL: {e}");
+            match build_servfail_response(&payload) {
+                Ok(resp) => resp,
+                Err(_) => return,
+            }
         }
     };
 
@@ -35,10 +102,18 @@ pub async fn handle_dns_query(
     });
 }
 
+/// TTL (seconds) advertised on answers served from the cache. Kept short so the
+/// guest re-queries soon, which re-pins the IPs and re-checks the allowlist.
+const CACHE_HIT_TTL: u32 = 30;
+/// Upper bound (seconds) on how long an answer is held in the cache, regardless
+/// of the upstream TTL, so the sandbox never pins a long-stale IP.
+const MAX_CACHE_TTL: u32 = 300;
+
 async fn resolve_query(
     query_bytes: &[u8],
     config: &ProxyConfig,
     allowed_ips: &AllowedIps,
+    cache: &SharedDnsCache,
 ) -> anyhow::Result<Vec<u8>> {
     let query = Packet::parse(query_bytes)?;
 
@@ -70,8 +145,22 @@ async fn resolve_query(
     debug!("DNS query: {domain}");
 
     if !config.is_domain_allowed(domain) {
-        debug!("DNS blocked: {domain}");
+        // User-visible: this is the single most useful line for diagnosing a
+        // too-strict allowlist — name the domain that needs adding.
+        warn!("DNS blocked (not in network.allow): {domain}");
         return build_refused_response(query_bytes);
+    }
+
+    // Serve from cache when fresh — a large install re-resolves the same hosts
+    // hundreds of times, and each uncached lookup competes for the small in-VM
+    // DNS socket buffers.
+    let now = Instant::now();
+    if let Some(ips) = cache.get(domain, now) {
+        debug!("DNS cache hit: {domain}");
+        if config.network.has_allowlist() {
+            pin_ips(&ips, allowed_ips);
+        }
+        return build_a_response_multi(query_bytes, &ips, CACHE_HIT_TTL);
     }
 
     // Resolve on the host by forwarding to system resolver
@@ -86,40 +175,156 @@ async fn resolve_query(
         pin_resolved_ips(&response_bytes, allowed_ips);
     }
 
+    // Cache the answer (bounded TTL) for subsequent lookups of the same host.
+    if let Some((ips, ttl)) = extract_a_records(&response_bytes) {
+        cache.insert(domain, ips, ttl.min(MAX_CACHE_TTL), now);
+    }
+
     Ok(response_bytes)
+}
+
+/// Extract the A-record IPs and the minimum TTL from a DNS response.
+/// Returns None if the response has no A records.
+fn extract_a_records(response: &[u8]) -> Option<(Vec<Ipv4Addr>, u32)> {
+    let packet = Packet::parse(response).ok()?;
+    let mut ips = Vec::new();
+    let mut min_ttl = u32::MAX;
+    for answer in &packet.answers {
+        if let simple_dns::rdata::RData::A(a) = &answer.rdata {
+            ips.push(Ipv4Addr::from(a.address));
+            min_ttl = min_ttl.min(answer.ttl);
+        }
+    }
+    if ips.is_empty() {
+        None
+    } else {
+        Some((ips, min_ttl))
+    }
 }
 
 /// Extract A record IPs from a DNS response and add them to the allowed set.
 fn pin_resolved_ips(response: &[u8], allowed_ips: &AllowedIps) {
-    let packet = match Packet::parse(response) {
-        Ok(p) => p,
-        Err(_) => return,
-    };
-
-    let mut ips = Vec::new();
-    for answer in &packet.answers {
-        if let simple_dns::rdata::RData::A(a) = &answer.rdata {
-            ips.push(Ipv4Addr::from(a.address));
-        }
-    }
-
-    if !ips.is_empty() {
-        let mut cache = allowed_ips.write().expect("allowed_ips lock poisoned");
-        for ip in &ips {
-            debug!("DNS pin: {ip}");
-            cache.put(*ip, ());
-        }
+    if let Some((ips, _)) = extract_a_records(response) {
+        pin_ips(&ips, allowed_ips);
     }
 }
 
-/// Forward a raw DNS query to the system resolver and return the raw response.
+/// Add resolved IPs to the allowed set so the proxy permits direct connections
+/// to them. Called for both freshly-resolved and cache-served answers.
+fn pin_ips(ips: &[Ipv4Addr], allowed_ips: &AllowedIps) {
+    if ips.is_empty() {
+        return;
+    }
+    let mut cache = allowed_ips.write().expect("allowed_ips lock poisoned");
+    for ip in ips {
+        debug!("DNS pin: {ip}");
+        cache.put(*ip, ());
+    }
+}
+
+/// Parse `/etc/resolv.conf` contents into the list of IPv4 nameservers, in
+/// file order. IPv6 nameservers are skipped because the guest network stack is
+/// IPv4-only. Comments and non-`nameserver` directives are ignored.
+fn parse_resolv_conf(contents: &str) -> Vec<Ipv4Addr> {
+    let mut servers = Vec::new();
+    for line in contents.lines() {
+        let line = line.trim();
+        if line.starts_with('#') || line.starts_with(';') {
+            continue;
+        }
+        let mut parts = line.split_whitespace();
+        if parts.next() != Some("nameserver") {
+            continue;
+        }
+        if let Some(addr) = parts.next() {
+            if let Ok(ip) = addr.parse::<Ipv4Addr>() {
+                servers.push(ip);
+            }
+        }
+    }
+    servers
+}
+
+/// The nameservers to query, in priority order: those from the host's
+/// `/etc/resolv.conf`, then a public fallback so resolution still works if the
+/// host file is empty/unreadable.
+fn resolver_addresses() -> Vec<Ipv4Addr> {
+    const FALLBACK: Ipv4Addr = Ipv4Addr::new(8, 8, 8, 8);
+    let mut servers = std::fs::read_to_string("/etc/resolv.conf")
+        .map(|c| parse_resolv_conf(&c))
+        .unwrap_or_default();
+    if !servers.contains(&FALLBACK) {
+        servers.push(FALLBACK);
+    }
+    servers
+}
+
+/// Forward a raw DNS query to the host's resolvers and return the raw response.
+///
+/// Tries each resolver in turn, with a couple of UDP attempts each, because a
+/// single dropped UDP datagram (common when a large `pnpm install` fans out
+/// hundreds of concurrent lookups) would otherwise stall the whole 5s timeout.
+/// If a UDP answer comes back truncated (TC=1) it is re-fetched over TCP.
 fn forward_to_system_resolver(query: &[u8]) -> anyhow::Result<Vec<u8>> {
+    const UDP_ATTEMPTS: usize = 2;
+    let mut last_err: Option<anyhow::Error> = None;
+
+    for server in resolver_addresses() {
+        for _ in 0..UDP_ATTEMPTS {
+            match query_udp(query, server) {
+                Ok(resp) if is_truncated(&resp) => {
+                    // Truncated UDP answer — retry the whole thing over TCP.
+                    match query_tcp(query, server) {
+                        Ok(tcp_resp) => return Ok(tcp_resp),
+                        Err(e) => last_err = Some(e),
+                    }
+                }
+                Ok(resp) => return Ok(resp),
+                Err(e) => last_err = Some(e),
+            }
+        }
+    }
+
+    Err(last_err.unwrap_or_else(|| anyhow::anyhow!("no resolvers available")))
+}
+
+/// Returns true if a DNS response has the TC (truncation) flag set.
+fn is_truncated(response: &[u8]) -> bool {
+    // Header byte 2, bit 1 (0x02) is the TC flag.
+    response.len() >= 3 && response[2] & 0x02 != 0
+}
+
+/// Send a single UDP query to `server:53` and return the raw response.
+fn query_udp(query: &[u8], server: Ipv4Addr) -> anyhow::Result<Vec<u8>> {
     let sock = UdpSocket::bind("0.0.0.0:0")?;
-    sock.set_read_timeout(Some(std::time::Duration::from_secs(5)))?;
-    sock.send_to(query, "8.8.8.8:53")?;
+    sock.set_read_timeout(Some(std::time::Duration::from_secs(2)))?;
+    sock.send_to(query, (server, 53))?;
     let mut buf = [0u8; 4096];
     let n = sock.recv(&mut buf)?;
     Ok(buf[..n].to_vec())
+}
+
+/// Send a query to `server:53` over TCP (RFC 1035 §4.2.2: 2-byte length prefix)
+/// and return the raw DNS message (length prefix stripped).
+fn query_tcp(query: &[u8], server: Ipv4Addr) -> anyhow::Result<Vec<u8>> {
+    use std::io::{Read, Write};
+    let mut stream = std::net::TcpStream::connect_timeout(
+        &std::net::SocketAddr::from((server, 53)),
+        std::time::Duration::from_secs(2),
+    )?;
+    stream.set_read_timeout(Some(std::time::Duration::from_secs(3)))?;
+    stream.set_write_timeout(Some(std::time::Duration::from_secs(3)))?;
+
+    let len = u16::try_from(query.len())?.to_be_bytes();
+    stream.write_all(&len)?;
+    stream.write_all(query)?;
+
+    let mut len_buf = [0u8; 2];
+    stream.read_exact(&mut len_buf)?;
+    let resp_len = u16::from_be_bytes(len_buf) as usize;
+    let mut resp = vec![0u8; resp_len];
+    stream.read_exact(&mut resp)?;
+    Ok(resp)
 }
 
 /// Build a DNS response with the given RCODE and no answer records.
@@ -161,8 +366,45 @@ fn build_a_response(query_bytes: &[u8], addr: Ipv4Addr) -> anyhow::Result<Vec<u8
     Ok(reply.build_bytes_vec()?)
 }
 
+/// Build a NOERROR A-record response listing all `addrs`, echoing the query's
+/// id and question. Used to serve answers straight from the DNS cache.
+fn build_a_response_multi(
+    query_bytes: &[u8],
+    addrs: &[Ipv4Addr],
+    ttl: u32,
+) -> anyhow::Result<Vec<u8>> {
+    use simple_dns::{rdata, ResourceRecord, CLASS};
+
+    let query = Packet::parse(query_bytes)?;
+    let qname = query
+        .questions
+        .first()
+        .ok_or_else(|| anyhow::anyhow!("empty DNS query"))?
+        .qname
+        .clone();
+
+    let mut reply = query.into_reply();
+    for addr in addrs {
+        reply.answers.push(ResourceRecord::new(
+            qname.clone(),
+            CLASS::IN,
+            ttl,
+            rdata::RData::A(rdata::A::from(*addr)),
+        ));
+    }
+
+    Ok(reply.build_bytes_vec()?)
+}
+
 fn build_refused_response(query_bytes: &[u8]) -> anyhow::Result<Vec<u8>> {
     build_response_with_rcode(query_bytes, 5)
+}
+
+/// Build a SERVFAIL (RCODE 2) response. Sent when upstream resolution fails so
+/// the guest resolver gets an immediate, well-formed failure instead of timing
+/// out into a misleading `EAI_AGAIN` on whatever operation was in flight.
+fn build_servfail_response(query_bytes: &[u8]) -> anyhow::Result<Vec<u8>> {
+    build_response_with_rcode(query_bytes, 2)
 }
 
 #[cfg(test)]
@@ -187,6 +429,177 @@ mod tests {
             false,
         ));
         packet.build_bytes_vec().unwrap()
+    }
+
+    #[test]
+    fn parse_resolv_conf_extracts_ipv4_nameservers_in_order() {
+        let contents = "\
+# a comment
+nameserver 1.1.1.1
+search example.com
+nameserver 8.8.4.4
+options edns0
+nameserver 2001:4860:4860::8888
+  nameserver   9.9.9.9
+";
+        let servers = parse_resolv_conf(contents);
+        // IPv4 nameservers, in file order; IPv6 skipped (stack is IPv4-only);
+        // leading/trailing whitespace tolerated.
+        assert_eq!(
+            servers,
+            vec![
+                Ipv4Addr::new(1, 1, 1, 1),
+                Ipv4Addr::new(8, 8, 4, 4),
+                Ipv4Addr::new(9, 9, 9, 9),
+            ]
+        );
+    }
+
+    #[test]
+    fn extract_a_records_returns_ips_and_min_ttl() {
+        use simple_dns::{rdata, Name, ResourceRecord, CLASS};
+        let query = build_a_query("registry.npmjs.org");
+        let mut reply = Packet::parse(&query).unwrap().into_reply();
+        reply.answers.push(ResourceRecord::new(
+            Name::new_unchecked("registry.npmjs.org"),
+            CLASS::IN,
+            300,
+            rdata::RData::A(rdata::A::from(Ipv4Addr::new(1, 1, 1, 1))),
+        ));
+        reply.answers.push(ResourceRecord::new(
+            Name::new_unchecked("registry.npmjs.org"),
+            CLASS::IN,
+            60,
+            rdata::RData::A(rdata::A::from(Ipv4Addr::new(2, 2, 2, 2))),
+        ));
+        let bytes = reply.build_bytes_vec().unwrap();
+
+        let (ips, ttl) = extract_a_records(&bytes).unwrap();
+        assert_eq!(
+            ips,
+            vec![Ipv4Addr::new(1, 1, 1, 1), Ipv4Addr::new(2, 2, 2, 2)]
+        );
+        // Min TTL across the records, so the cache never serves a record past
+        // its individual lifetime.
+        assert_eq!(ttl, 60);
+    }
+
+    #[test]
+    fn extract_a_records_none_when_no_a_records() {
+        let query = build_a_query("example.com");
+        let empty = build_empty_response(&query).unwrap();
+        assert!(extract_a_records(&empty).is_none());
+    }
+
+    #[test]
+    fn build_a_response_multi_echoes_query_and_lists_all_ips() {
+        let query = build_a_query("registry.npmjs.org");
+        let ips = vec![
+            Ipv4Addr::new(104, 16, 0, 1),
+            Ipv4Addr::new(104, 16, 0, 2),
+            Ipv4Addr::new(104, 16, 0, 3),
+        ];
+        let resp = build_a_response_multi(&query, &ips, 42).unwrap();
+
+        let packet = Packet::parse(&resp).unwrap();
+        assert_eq!(packet.rcode(), simple_dns::RCODE::NoError);
+        // Same id as the query so the guest resolver matches the answer.
+        assert_eq!(&resp[0..2], &query[0..2]);
+
+        let mut got: Vec<Ipv4Addr> = packet
+            .answers
+            .iter()
+            .filter_map(|a| match &a.rdata {
+                simple_dns::rdata::RData::A(x) => Some(Ipv4Addr::from(x.address)),
+                _ => None,
+            })
+            .collect();
+        got.sort();
+        let mut want = ips.clone();
+        want.sort();
+        assert_eq!(got, want);
+        assert!(packet.answers.iter().all(|a| a.ttl == 42));
+    }
+
+    #[test]
+    fn dns_cache_miss_on_empty() {
+        let cache = DnsCache::new();
+        let now = std::time::Instant::now();
+        assert!(cache.get("registry.npmjs.org", now).is_none());
+    }
+
+    #[test]
+    fn dns_cache_hit_before_ttl_expires() {
+        let cache = DnsCache::new();
+        let now = std::time::Instant::now();
+        let ips = vec![Ipv4Addr::new(104, 16, 0, 1), Ipv4Addr::new(104, 16, 0, 2)];
+        cache.insert("registry.npmjs.org", ips.clone(), 60, now);
+
+        // Still fresh one second later.
+        let later = now + std::time::Duration::from_secs(1);
+        assert_eq!(cache.get("registry.npmjs.org", later), Some(ips));
+    }
+
+    #[test]
+    fn dns_cache_miss_after_ttl_expires() {
+        let cache = DnsCache::new();
+        let now = std::time::Instant::now();
+        cache.insert(
+            "registry.npmjs.org",
+            vec![Ipv4Addr::new(1, 2, 3, 4)],
+            30,
+            now,
+        );
+
+        let after = now + std::time::Duration::from_secs(31);
+        assert!(cache.get("registry.npmjs.org", after).is_none());
+    }
+
+    #[test]
+    fn dns_cache_zero_ttl_is_never_stored() {
+        let cache = DnsCache::new();
+        let now = std::time::Instant::now();
+        cache.insert(
+            "registry.npmjs.org",
+            vec![Ipv4Addr::new(1, 2, 3, 4)],
+            0,
+            now,
+        );
+        assert!(cache.get("registry.npmjs.org", now).is_none());
+    }
+
+    #[test]
+    fn is_truncated_detects_tc_flag() {
+        let query = build_a_query("example.com");
+        // A normal A response is not truncated.
+        let resp = build_a_response(&query, Ipv4Addr::new(1, 2, 3, 4)).unwrap();
+        assert!(!is_truncated(&resp));
+
+        // Set the TC bit (header byte 2, 0x02).
+        let mut truncated = resp.clone();
+        truncated[2] |= 0x02;
+        assert!(is_truncated(&truncated));
+
+        // Too-short buffers are never "truncated".
+        assert!(!is_truncated(&[0x00, 0x01]));
+    }
+
+    #[test]
+    fn parse_resolv_conf_empty_when_no_nameservers() {
+        assert!(parse_resolv_conf("# nothing here\nsearch lan\n").is_empty());
+    }
+
+    #[test]
+    fn build_servfail_sets_server_failure_rcode() {
+        let query = build_a_query("registry.npmjs.org");
+        let resp = build_servfail_response(&query).unwrap();
+
+        let packet = Packet::parse(&resp).unwrap();
+        assert_eq!(packet.rcode(), simple_dns::RCODE::ServerFailure);
+        // The reply must echo the query id so the guest resolver matches it.
+        assert_eq!(&resp[0..2], &query[0..2]);
+        // QR bit set => it is a response, not a query.
+        assert_eq!(resp[2] & 0x80, 0x80);
     }
 
     #[test]

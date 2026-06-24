@@ -32,6 +32,7 @@ pub struct ProxyEngine {
     ca: Arc<tokio::sync::Mutex<CertificateAuthority>>,
     upstream_ssl: SslConnector,
     allowed_ips: AllowedIps,
+    dns_cache: crate::dns::SharedDnsCache,
 }
 
 impl ProxyEngine {
@@ -42,6 +43,7 @@ impl ProxyEngine {
         ca: CertificateAuthority,
         placeholders: HashMap<String, String>,
         allowed_ips: AllowedIps,
+        dns_cache: crate::dns::SharedDnsCache,
     ) -> Self {
         // BoringSSL upstream connector — Chrome's TLS stack so Cloudflare
         // doesn't reject our MITM connections based on JA3/JA4 fingerprint.
@@ -58,6 +60,7 @@ impl ProxyEngine {
             ca: Arc::new(tokio::sync::Mutex::new(ca)),
             upstream_ssl,
             allowed_ips,
+            dns_cache,
         }
     }
 
@@ -83,8 +86,17 @@ impl ProxyEngine {
                     let cmd_tx = self.cmd_tx.clone();
                     let config = self.config.clone();
                     let allowed_ips = self.allowed_ips.clone();
+                    let dns_cache = self.dns_cache.clone();
                     tokio::spawn(async move {
-                        dns::handle_dns_query(src, payload, cmd_tx, &config, &allowed_ips).await;
+                        dns::handle_dns_query(
+                            src,
+                            payload,
+                            cmd_tx,
+                            &config,
+                            &allowed_ips,
+                            &dns_cache,
+                        )
+                        .await;
                     });
                 }
             }

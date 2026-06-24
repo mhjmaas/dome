@@ -24,6 +24,13 @@ const GATEWAY_MAC: EthernetAddress = EthernetAddress([0x02, 0x00, 0x00, 0x00, 0x
 const TCP_RX_BUF_SIZE: usize = 65536;
 const TCP_TX_BUF_SIZE: usize = 65536;
 
+/// DNS UDP socket buffer sizing. A large `pnpm install` fans out hundreds of
+/// concurrent lookups; the previous 16-slot / 4 KB buffers overflowed under
+/// that burst, dropping DNS packets and surfacing as misleading `EAI_AGAIN`.
+/// Size generously for the burst — these are small relative to TCP buffers.
+const DNS_PACKET_SLOTS: usize = 256;
+const DNS_BUF_BYTES: usize = 64 * 1024;
+
 /// A new TCP connection from the guest, ready to be proxied.
 pub struct TcpConnection {
     pub id: ConnectionId,
@@ -104,8 +111,14 @@ impl NetworkStack {
         let mut sockets = SocketSet::new(vec![]);
 
         // DNS socket: listen on gateway IP, port 53
-        let udp_rx = udp::PacketBuffer::new(vec![udp::PacketMetadata::EMPTY; 16], vec![0u8; 4096]);
-        let udp_tx = udp::PacketBuffer::new(vec![udp::PacketMetadata::EMPTY; 16], vec![0u8; 4096]);
+        let udp_rx = udp::PacketBuffer::new(
+            vec![udp::PacketMetadata::EMPTY; DNS_PACKET_SLOTS],
+            vec![0u8; DNS_BUF_BYTES],
+        );
+        let udp_tx = udp::PacketBuffer::new(
+            vec![udp::PacketMetadata::EMPTY; DNS_PACKET_SLOTS],
+            vec![0u8; DNS_BUF_BYTES],
+        );
         let mut dns_socket = UdpSocket::new(udp_rx, udp_tx);
         dns_socket
             .bind(IpListenEndpoint {
