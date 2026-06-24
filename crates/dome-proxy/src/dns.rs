@@ -1,8 +1,9 @@
-use std::collections::HashMap;
 use std::net::{Ipv4Addr, UdpSocket};
+use std::num::NonZeroUsize;
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
+use lru::LruCache;
 use simple_dns::Packet;
 use smoltcp::wire::IpEndpoint;
 use tokio::sync::mpsc;
@@ -20,15 +21,22 @@ struct CacheEntry {
     expires_at: Instant,
 }
 
-/// A short-TTL cache of resolved A records, keyed by domain name.
+/// Default cap on the number of distinct domains held in the DNS cache. Bounds
+/// host memory even when a wildcard allowlist entry lets a hostile guest resolve
+/// unlimited distinct subdomains. LRU eviction keeps actively-used hosts warm.
+const DNS_CACHE_CAPACITY: usize = 4096;
+
+/// A short-TTL, bounded cache of resolved A records, keyed by domain name.
 ///
 /// Without it, a large `pnpm install` re-resolves the same handful of hosts
 /// (e.g. `registry.npmjs.org`) hundreds of times, multiplying load on both the
-/// upstream resolver and the small in-VM DNS socket buffers. Time is passed in
-/// rather than read internally so the eviction logic is deterministically
-/// testable.
+/// upstream resolver and the small in-VM DNS socket buffers.
+///
+/// Bounded via LRU so a guest cannot grow it without limit (e.g. by resolving
+/// endless subdomains of a wildcard-allowed domain). Time is passed in rather
+/// than read internally so the eviction logic is deterministically testable.
 pub struct DnsCache {
-    entries: Mutex<HashMap<String, CacheEntry>>,
+    entries: Mutex<LruCache<String, CacheEntry>>,
 }
 
 impl Default for DnsCache {
@@ -39,19 +47,27 @@ impl Default for DnsCache {
 
 impl DnsCache {
     pub fn new() -> Self {
+        Self::with_capacity(DNS_CACHE_CAPACITY)
+    }
+
+    fn with_capacity(capacity: usize) -> Self {
+        let cap = NonZeroUsize::new(capacity).expect("dns cache capacity must be non-zero");
         DnsCache {
-            entries: Mutex::new(HashMap::new()),
+            entries: Mutex::new(LruCache::new(cap)),
         }
     }
 
-    /// Return the cached IPs for `name` if present and not yet expired.
+    /// Return the cached IPs for `name` if present and not yet expired. A hit
+    /// bumps the entry's recency; an expired entry is dropped so its slot frees.
     fn get(&self, name: &str, now: Instant) -> Option<Vec<Ipv4Addr>> {
-        let entries = self.entries.lock().expect("dns cache lock poisoned");
-        let entry = entries.get(name)?;
-        if entry.expires_at > now {
-            Some(entry.ips.clone())
-        } else {
-            None
+        let mut entries = self.entries.lock().expect("dns cache lock poisoned");
+        match entries.get(name) {
+            Some(entry) if entry.expires_at > now => Some(entry.ips.clone()),
+            Some(_) => {
+                entries.pop(name);
+                None
+            }
+            None => None,
         }
     }
 
@@ -65,8 +81,24 @@ impl DnsCache {
         self.entries
             .lock()
             .expect("dns cache lock poisoned")
-            .insert(name.to_string(), CacheEntry { ips, expires_at });
+            .put(name.to_string(), CacheEntry { ips, expires_at });
     }
+
+    /// Number of entries currently held (test-only visibility into bounding).
+    #[cfg(test)]
+    fn len(&self) -> usize {
+        self.entries.lock().expect("dns cache lock poisoned").len()
+    }
+}
+
+/// Render a guest-supplied domain safe to log: DNS labels can carry arbitrary
+/// bytes, so strip control characters (which could forge extra log lines) and
+/// cap the length to keep one query from flooding the host log.
+fn sanitize_for_log(name: &str) -> String {
+    name.chars()
+        .take(256)
+        .map(|c| if c.is_control() { '?' } else { c })
+        .collect()
 }
 
 /// Handle a DNS query from the guest.
@@ -146,8 +178,12 @@ async fn resolve_query(
 
     if !config.is_domain_allowed(domain) {
         // User-visible: this is the single most useful line for diagnosing a
-        // too-strict allowlist — name the domain that needs adding.
-        warn!("DNS blocked (not in network.allow): {domain}");
+        // too-strict allowlist — name the domain that needs adding. Sanitize
+        // first: the name is guest-controlled and could otherwise forge logs.
+        warn!(
+            "DNS blocked (not in network.allow): {}",
+            sanitize_for_log(domain)
+        );
         return build_refused_response(query_bytes);
     }
 
@@ -566,6 +602,70 @@ nameserver 2001:4860:4860::8888
             now,
         );
         assert!(cache.get("registry.npmjs.org", now).is_none());
+    }
+
+    #[test]
+    fn sanitize_for_log_strips_control_characters() {
+        // A crafted DNS name with embedded CR/LF must not be able to forge a
+        // second log line on the host.
+        let forged = "evil.com\r\n2026-01-01 ERROR fake log line";
+        let safe = sanitize_for_log(forged);
+        assert!(!safe.contains('\n'));
+        assert!(!safe.contains('\r'));
+        assert!(safe.starts_with("evil.com"));
+    }
+
+    #[test]
+    fn sanitize_for_log_truncates_overlong_input() {
+        let long = "a".repeat(1000);
+        assert!(sanitize_for_log(&long).len() <= 256);
+    }
+
+    #[test]
+    fn dns_cache_is_bounded_by_capacity() {
+        // A wildcard allowlist entry lets a hostile guest resolve unlimited
+        // distinct subdomains; the cache must not grow without bound.
+        let cache = DnsCache::with_capacity(2);
+        let now = std::time::Instant::now();
+        cache.insert("a.example.com", vec![Ipv4Addr::new(1, 1, 1, 1)], 60, now);
+        cache.insert("b.example.com", vec![Ipv4Addr::new(2, 2, 2, 2)], 60, now);
+        cache.insert("c.example.com", vec![Ipv4Addr::new(3, 3, 3, 3)], 60, now);
+
+        assert_eq!(cache.len(), 2);
+        // Oldest (least-recently-used) was evicted.
+        assert!(cache.get("a.example.com", now).is_none());
+        assert!(cache.get("b.example.com", now).is_some());
+        assert!(cache.get("c.example.com", now).is_some());
+    }
+
+    #[test]
+    fn dns_cache_get_keeps_active_entry_warm() {
+        let cache = DnsCache::with_capacity(2);
+        let now = std::time::Instant::now();
+        cache.insert("a.example.com", vec![Ipv4Addr::new(1, 1, 1, 1)], 60, now);
+        cache.insert("b.example.com", vec![Ipv4Addr::new(2, 2, 2, 2)], 60, now);
+
+        // Touch "a" so it becomes most-recently-used, then overflow.
+        assert!(cache.get("a.example.com", now).is_some());
+        cache.insert("c.example.com", vec![Ipv4Addr::new(3, 3, 3, 3)], 60, now);
+
+        // "b" was the least-recently-used and is evicted; "a" survives.
+        assert!(cache.get("a.example.com", now).is_some());
+        assert!(cache.get("b.example.com", now).is_none());
+        assert!(cache.get("c.example.com", now).is_some());
+    }
+
+    #[test]
+    fn dns_cache_get_purges_expired_entry() {
+        let cache = DnsCache::with_capacity(8);
+        let now = std::time::Instant::now();
+        cache.insert("a.example.com", vec![Ipv4Addr::new(1, 1, 1, 1)], 30, now);
+        assert_eq!(cache.len(), 1);
+
+        // Reading past expiry both misses and frees the slot.
+        let after = now + std::time::Duration::from_secs(31);
+        assert!(cache.get("a.example.com", after).is_none());
+        assert_eq!(cache.len(), 0);
     }
 
     #[test]
