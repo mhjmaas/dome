@@ -86,6 +86,16 @@ pub(crate) fn cache_key(
     format!("{:x}", hasher.finalize())
 }
 
+/// Hash of spec *content* alone — the short label used to describe provision drift in a
+/// warning (see `sandbox::provision_drift`). It calls [`cache_key`] with an empty identity, so
+/// it deliberately omits the base identity ([`cache_key`]'s first argument): drift must track a
+/// changed spec, not a changed CLI VERSION, so an unchanged spec never reports drift merely
+/// because dome was upgraded. The empty identity also makes this label impossible to confuse
+/// with any real layer key (those always carry a non-empty VERSION or `seed:` identity).
+pub(crate) fn spec_hash(spec: &ProvisionSpec) -> String {
+    cache_key("", &spec.steps, &spec.allow, &spec.secrets)
+}
+
 /// Compute the content identity of a `--from` seed index — the stable fingerprint of the disk
 /// state provisioning will compose on top of. Used in place of the CLI VERSION base identity in
 /// [`cache_key`] when a creation seeds `--from`: the same seed + spec resolves to the same hash
@@ -606,6 +616,48 @@ mod tests {
             from: from.to_string(),
             hosts: hosts.iter().map(|s| s.to_string()).collect(),
         }
+    }
+
+    #[test]
+    fn spec_hash_is_content_only_and_ignores_the_base_identity() {
+        // The drift label hashes spec *content* alone — it must be stable across CLI version
+        // bumps (the real cache key folds in VERSION; this one must not), so an unchanged spec
+        // never reports drift just because dome was upgraded. Identical specs hash identically;
+        // changing the steps, the allow-list, or the secrets changes the hash.
+        let base = spec(&["install nodejs"], &["deb.debian.org"]);
+        let same = spec(&["install nodejs"], &["deb.debian.org"]);
+        assert_eq!(
+            spec_hash(&base),
+            spec_hash(&same),
+            "identical spec content yields the same drift label"
+        );
+        // The label is decoupled from the version-bearing cache key: a real layer key folds in
+        // the CLI VERSION, but spec_hash must be the same regardless of any version.
+        assert_eq!(
+            spec_hash(&base),
+            cache_key("", &base.steps, &base.allow, &base.secrets),
+            "spec_hash is cache_key with an empty (version-free) identity"
+        );
+        assert_ne!(
+            spec_hash(&base),
+            spec_hash(&spec(
+                &["install nodejs", "install bun"],
+                &["deb.debian.org"]
+            )),
+            "changed steps change the label"
+        );
+        assert_ne!(
+            spec_hash(&base),
+            spec_hash(&spec(&["install nodejs"], &["registry.npmjs.org"])),
+            "changed allow changes the label"
+        );
+        let mut with_secret = spec(&["install nodejs"], &["deb.debian.org"]);
+        with_secret.secrets = vec![secret("npm", "NPM_TOKEN", &["registry.npmjs.org"])];
+        assert_ne!(
+            spec_hash(&base),
+            spec_hash(&with_secret),
+            "changed secrets change the label"
+        );
     }
 
     #[test]

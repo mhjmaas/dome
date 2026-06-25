@@ -315,6 +315,24 @@ impl ResolvedConfig {
         Ok(())
     }
 
+    /// Re-resolve this stored config against the current `dome.json` + flags for `dome sandbox
+    /// config --reload`, preserving the fields that are **create-only** because they are
+    /// physically pinned to the already-materialized disk and so cannot change without recreating
+    /// the sandbox:
+    /// - `disk_size` — the disk is pinned to the index's chunk count;
+    /// - `provision` — the toolchain is baked into the disk at creation, so the sidecar must keep
+    ///   recording the *as-built* spec. If a reload overwrote it with the edited dome.json spec,
+    ///   the sidecar would claim a toolchain the disk doesn't have and drift detection (#89)
+    ///   would be silently defeated.
+    ///
+    /// Every other field (cpus, ports, network, secrets, …) takes the edited dome.json value.
+    pub(crate) fn reloaded(&self, dome: &DomeConfig, flags: &VmArgs) -> Result<Self> {
+        let mut next = Self::resolve(self, dome, flags)?;
+        next.disk_size = self.disk_size;
+        next.provision = self.provision.clone();
+        Ok(next)
+    }
+
     /// Human-readable lines describing where the per-invocation `requested` flags differ
     /// from `self` (the live, already-booted config). Used to warn — naming the live value —
     /// that flags passed to a sandbox that is already running take effect only on the next
@@ -1003,6 +1021,53 @@ mod tests {
             r.provision.unwrap().steps,
             vec!["echo hi".to_string()],
             "an omitted dome.json provision inherits the base spec"
+        );
+    }
+
+    #[test]
+    fn reloaded_applies_dome_json_edits_but_preserves_create_only_fields() {
+        // `dome sandbox config --reload` re-applies an edited dome.json to an existing sandbox,
+        // but disk_size and provision are create-only: the disk is physically pinned at creation
+        // and the toolchain is baked into it, so neither can change without recreating. The
+        // sidecar must keep recording the *as-built* spec — otherwise drift detection (#89) would
+        // be silently defeated by a reload claiming a toolchain the disk doesn't have.
+        let stored = ResolvedConfig {
+            disk_size: Some(8192),
+            cpus: Some(2),
+            provision: Some(ProvisionSpec {
+                steps: vec!["install bun".into()],
+                allow: vec![],
+                secrets: vec![],
+            }),
+            ..Default::default()
+        };
+        // dome.json now asks for more cpus AND a different provision block + a different disk size.
+        let dome = DomeConfig {
+            cpus: Some(8),
+            disk_size: Some(1024),
+            provision: Some(ProvisionEntry {
+                steps: vec!["install node".into()],
+                allow: None,
+                secrets: None,
+            }),
+            ..Default::default()
+        };
+
+        let reloaded = stored.reloaded(&dome, &VmArgs::default()).unwrap();
+
+        assert_eq!(
+            reloaded.cpus,
+            Some(8),
+            "an editable field takes the dome.json value"
+        );
+        assert_eq!(
+            reloaded.disk_size,
+            Some(8192),
+            "disk_size is create-only: it is preserved, never taken from dome.json"
+        );
+        assert_eq!(
+            reloaded.provision, stored.provision,
+            "provision is create-only: the as-built spec is preserved, not re-resolved"
         );
     }
 
