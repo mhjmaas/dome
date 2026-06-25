@@ -16,6 +16,9 @@
 //! (the `Count` op round-trip) and `src/daemon.rs` (overlay applies the live count, and a
 //! worker with zero attached terminals still reads as `running`).
 
+use std::io::{Read, Write};
+use std::os::unix::io::FromRawFd;
+use std::os::unix::process::CommandExt;
 use std::process::{Command, Stdio};
 use std::time::Duration;
 
@@ -95,6 +98,101 @@ fn cleanup(name: &str) {
     let dir = format!("{}/.local/share/dome/sandboxes", home);
     let _ = std::fs::remove_file(format!("{}/{}.idx", dir, name));
     let _ = std::fs::remove_file(format!("{}/{}.lock", dir, name));
+}
+
+/// Run `dome sandbox shell <name>` over a REAL pseudo-terminal so the CLI sees an interactive
+/// tty (`stdin().is_terminal()` → `tty=true`), exercising the guest's TTY/PTY exec path — the
+/// one the non-TTY `run` tests never touch. Sends `exit\n`, then drains the pty until the CLI
+/// exits (the slave fds close → master read returns 0/EIO), with a timeout backstop so a stuck
+/// session fails the test rather than hanging. `secs` must be generous enough for a cold boot.
+fn shell_exit_over_pty(name: &str, secs: u64) {
+    let mut master: libc::c_int = 0;
+    let mut slave: libc::c_int = 0;
+    let rc = unsafe {
+        libc::openpty(
+            &mut master,
+            &mut slave,
+            std::ptr::null_mut(),
+            std::ptr::null_mut(),
+            std::ptr::null_mut(),
+        )
+    };
+    assert_eq!(rc, 0, "openpty failed");
+
+    let mut cmd = Command::new(dome_bin());
+    cmd.args(["sandbox", "shell", name]);
+    let slave_fd = slave;
+    unsafe {
+        cmd.stdin(Stdio::from_raw_fd(libc::dup(slave_fd)));
+        cmd.stdout(Stdio::from_raw_fd(libc::dup(slave_fd)));
+        cmd.stderr(Stdio::from_raw_fd(libc::dup(slave_fd)));
+        cmd.pre_exec(move || {
+            libc::setsid();
+            let _ = libc::ioctl(slave_fd, libc::TIOCSCTTY as _, 0);
+            Ok(())
+        });
+    }
+    let mut child = cmd.spawn().expect("failed to spawn `dome sandbox shell` under a pty");
+    unsafe {
+        libc::close(slave);
+    }
+
+    // Ask the interactive shell to exit. The line waits in the tty buffer until the guest's
+    // login shell reads it, so writing immediately (before the prompt) is fine.
+    let mut writer = unsafe { std::fs::File::from_raw_fd(libc::dup(master)) };
+    let _ = writer.write_all(b"exit\n");
+    let _ = writer.flush();
+
+    let mut reader = unsafe { std::fs::File::from_raw_fd(master) };
+    let start = std::time::Instant::now();
+    let mut buf = [0u8; 4096];
+    loop {
+        match reader.read(&mut buf) {
+            Ok(0) | Err(_) => break,
+            Ok(_) => {}
+        }
+        if start.elapsed() > Duration::from_secs(secs) {
+            break;
+        }
+    }
+    let _ = child.wait();
+}
+
+/// Issue #82: after an INTERACTIVE (tty) shell exits, the worker must drain the attached count
+/// back to 0. The guest's TTY exec path leaked a duplicate vsock fd, so the connection stayed
+/// half-open, the host relay never tore down, and the count stuck above 0 — which forced a
+/// non-forced stop to be refused. The non-TTY `run` path above never caught this; this drives a
+/// real pty so `tty=true`.
+#[test]
+#[ignore]
+fn an_interactive_shell_drains_the_attached_count_after_it_exits() {
+    let name = sandbox_name("tty");
+    cleanup(&name);
+
+    // First interactive shell cold-boots the VM (generous timeout), then exits.
+    shell_exit_over_pty(&name, 90);
+    assert!(
+        wait_until(20, || ls_attached(&name) == Some(0)),
+        "ls should report 0 attached after the interactive shell exits; got {:?}, state {:?}",
+        ls_attached(&name),
+        ls_state(&name)
+    );
+    assert_eq!(
+        ls_state(&name).as_deref(),
+        Some("running"),
+        "the VM must stay running after the interactive shell exits"
+    );
+
+    // A second interactive shell against the now-warm VM must also drain to 0 — proving the
+    // count balances per session, not just once.
+    shell_exit_over_pty(&name, 30);
+    assert!(
+        wait_until(20, || ls_attached(&name) == Some(0)),
+        "a second interactive shell must also drain the count to 0; got {:?}",
+        ls_attached(&name)
+    );
+
+    cleanup(&name);
 }
 
 /// Two terminals against one sandbox share one live, writable VM: a write in the first is

@@ -459,6 +459,34 @@ impl SessionState {
     }
 }
 
+/// An RAII session slot. [`SessionGuard::acquire`] claims one (bumping the count) unless a
+/// stop has committed, and the guard's `Drop` releases it — so a session is ended exactly
+/// once on *every* exit path: a normal return, an early return, or a panic unwind. This makes
+/// it impossible to leak the attached count by a missed `end()`, which would otherwise pin the
+/// count above zero and force a non-forced stop to be refused forever (issue #82). Mirrors
+/// domed's `ClientGuard`. Holds the `Mutex<SessionState>` directly so the lifecycle is a type
+/// the rest of the worker cannot misuse.
+struct SessionGuard<'a>(&'a Mutex<SessionState>);
+
+impl<'a> SessionGuard<'a> {
+    /// Claim a session slot, or `None` if a stop has committed (the attach is refused, not
+    /// counted). Acquiring under the same lock that a stop commits under keeps the count
+    /// atomic with the stop guard — see [`SessionState`].
+    fn acquire(sessions: &'a Mutex<SessionState>) -> Option<Self> {
+        if sessions.lock().unwrap().begin() {
+            Some(SessionGuard(sessions))
+        } else {
+            None
+        }
+    }
+}
+
+impl Drop for SessionGuard<'_> {
+    fn drop(&mut self) {
+        self.0.lock().unwrap().end();
+    }
+}
+
 /// Append a line to a worker's on-disk log. A free function so the boot path can log
 /// (naming the data dir + sandbox) before the [`Worker`] struct itself exists.
 fn append_log(data_dir: &str, name: &str, msg: &str) {
@@ -486,15 +514,11 @@ impl Worker {
         self.sessions.lock().unwrap().attached
     }
 
-    /// Try to start a session (see [`SessionState::begin`]): false if the worker is
-    /// stopping, so a late attach is refused cleanly rather than racing the teardown.
-    fn begin_session(&self) -> bool {
-        self.sessions.lock().unwrap().begin()
-    }
-
-    /// End a session started by [`Worker::begin_session`].
-    fn end_session(&self) {
-        self.sessions.lock().unwrap().end();
+    /// Claim a session slot, returning an RAII [`SessionGuard`] that ends the session on drop
+    /// (every exit path), or `None` if the worker is stopping so a late attach is refused
+    /// cleanly rather than racing the teardown.
+    fn begin_session(&self) -> Option<SessionGuard<'_>> {
+        SessionGuard::acquire(&self.sessions)
     }
 
     /// Decide + commit a stop (see [`SessionState::commit_stop`]). `Err(attached)` when
@@ -937,17 +961,22 @@ fn handle_attach(
     // Claim a session slot. This is atomic with a stop's commit, so a session can never
     // start once a stop has committed — closing the check-then-act window the old
     // count-then-stop had. Reserve BEFORE opening the guest session (and before the count is
-    // observable), so a concurrent non-forced stop sees this attach.
-    if !worker.begin_session() {
-        let _ = write_line(
-            &mut stream,
-            &AttachAck {
-                ok: false,
-                error: Some("sandbox is stopping".to_string()),
-            },
-        );
-        return;
-    }
+    // observable), so a concurrent non-forced stop sees this attach. The returned guard ends
+    // the session on EVERY exit path (return or panic) — see [`SessionGuard`] — so the count
+    // is never leaked (issue #82).
+    let _session = match worker.begin_session() {
+        Some(g) => g,
+        None => {
+            let _ = write_line(
+                &mut stream,
+                &AttachAck {
+                    ok: false,
+                    error: Some("sandbox is stopping".to_string()),
+                },
+            );
+            return;
+        }
+    };
 
     // Open the guest session (mounts + ExecRequest sent on the vsock side here, so the
     // client's relay only deals with terminal frames).
@@ -960,7 +989,6 @@ fn handle_attach(
         Ok(g) => g,
         Err(e) => {
             worker.log(&format!("attach: opening session failed: {e:#}"));
-            worker.end_session();
             let _ = write_line(
                 &mut stream,
                 &AttachAck {
@@ -984,13 +1012,13 @@ fn handle_attach(
     )
     .is_err()
     {
-        worker.end_session();
         return;
     }
 
     worker.log("session attached");
     splice(stream, guest);
-    worker.end_session();
+    // `_session` drops here, ending the session (decrementing the attached count). It also
+    // drops on any early return or panic above, so the count is never leaked.
     worker.log("session detached (VM stays running)");
 }
 
@@ -1526,6 +1554,50 @@ mod tests {
         let mut z = SessionState::new();
         z.end();
         assert_eq!(z.attached, 0);
+    }
+
+    #[test]
+    fn a_session_guard_ends_the_session_on_every_exit_path() {
+        // Issue #82: the attached count must return to its prior value when a session scope
+        // ends, no matter HOW it ends — a normal drop, an early return, or a panic unwind.
+        // The RAII `SessionGuard` encodes that so a missed/early/panicking `end_session` can
+        // never leak a count (which would force a non-forced stop to be refused forever).
+        let sessions = Mutex::new(SessionState::new());
+
+        // A guard claims a slot (count goes to 1) and releases it on a normal drop (back to 0).
+        {
+            let _g = SessionGuard::acquire(&sessions).expect("idle worker grants a session");
+            assert_eq!(sessions.lock().unwrap().attached, 1, "guard claims one slot");
+        }
+        assert_eq!(
+            sessions.lock().unwrap().attached,
+            0,
+            "a dropped guard ends the session"
+        );
+
+        // A panic mid-session still unwinds through the guard's Drop, so the count is released.
+        let _ = std::panic::catch_unwind(|| {
+            let _g = SessionGuard::acquire(&sessions).expect("guard granted before the panic");
+            assert_eq!(sessions.lock().unwrap().attached, 1);
+            panic!("session body blew up");
+        });
+        assert_eq!(
+            sessions.lock().unwrap().attached,
+            0,
+            "a panicking session body must not leak the count"
+        );
+
+        // Once a stop has committed, no guard is granted (the attach is refused, not counted).
+        sessions.lock().unwrap().commit_stop(false).unwrap();
+        assert!(
+            SessionGuard::acquire(&sessions).is_none(),
+            "no session may start once a stop has committed"
+        );
+        assert_eq!(
+            sessions.lock().unwrap().attached,
+            0,
+            "a refused acquire must not bump the count"
+        );
     }
 
     #[test]

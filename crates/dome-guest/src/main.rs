@@ -353,11 +353,16 @@ mod guest {
                     }
 
                     if req.tty.unwrap_or(false) {
-                        // TTY mode: hand off the raw fd
+                        // TTY mode: hand the writer's raw fd to handle_tty_exec, which owns and
+                        // closes it. `forget(writer)` stops TcpStream's Drop from closing that
+                        // same fd first. `reader` is a SEPARATE dup of the connection
+                        // (try_clone above) that handle_tty_exec never touches — it must be
+                        // CLOSED, not forgotten. Forgetting it leaked a dup that kept the vsock
+                        // half-open after the shell exited, so the host's relay never saw EOF,
+                        // never tore down, and the attached count stuck above 0 (issue #82).
                         let raw_fd = std::os::unix::io::AsRawFd::as_raw_fd(&writer);
-                        // Prevent TcpStream from closing the fd on drop
                         std::mem::forget(writer);
-                        std::mem::forget(reader);
+                        drop(reader);
                         handle_tty_exec(raw_fd, &req);
                         return;
                     }
