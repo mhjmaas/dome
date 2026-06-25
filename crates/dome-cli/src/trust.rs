@@ -5,8 +5,9 @@
 //! a hostile `dome.json` in a cloned repo could otherwise mount paths or open ports the
 //! instant you enter the directory. The gate is an explicit one-time `dome allow` per
 //! project, recorded as a trust record keyed to the canonical project directory and a
-//! hash of the whole `dome.json`. Any later edit to `dome.json` changes the hash and
-//! re-locks the project until it is re-approved.
+//! hash of the *normalized* `dome.json` (see [`config_hash`]). Any later edit that changes
+//! what dome acts on re-locks the project until it is re-approved; cosmetic churn that does
+//! not (reformatting, key reordering, an unknown key) leaves trust intact.
 
 use std::path::Path;
 
@@ -26,14 +27,67 @@ fn dir_key(canonical_dir: &Path) -> String {
     format!("{:x}", hasher.finalize())
 }
 
-/// Hex sha256 of the whole `dome.json` file bytes. Hashing the raw bytes means ANY edit —
-/// even whitespace — changes the hash and re-locks the project, which is the safe default:
-/// re-approval is cheap, and a silently-accepted edit is exactly the risk the gate exists
-/// to prevent.
+/// Hex sha256 of a project's *normalized* `dome.json` — the parsed [`DomeConfig`] re-serialized
+/// to canonical (sorted-key) JSON, then hashed. Hashing the meaning rather than the bytes means
+/// cosmetic churn that dome does not act on — reformatting, key reordering, an unrecognized key
+/// an editor adds or drops — no longer re-locks a trusted project, while any change to a field
+/// dome *does* act on (mounts, ports, network, provision, command, secrets, sandbox, activate…)
+/// still changes the hash and re-locks until re-approved. That preserves the security purpose of
+/// the gate — a silently-accepted *semantic* edit is the risk it exists to prevent — without the
+/// brittleness that made a project permanently un-activatable after a benign rewrite.
+///
+/// A `dome.json` that does not parse falls back to a raw-byte hash: it cannot be loaded or
+/// activated anyway, so there is no normalized form to compare, and a stable fingerprint still
+/// lets `dome allow` re-record it.
 pub(crate) fn config_hash(dome_json_bytes: &[u8]) -> String {
+    let canonical = match serde_json::from_slice::<crate::config::DomeConfig>(dome_json_bytes)
+        .ok()
+        .and_then(|cfg| serde_json::to_value(cfg).ok())
+    {
+        Some(value) => canonical_json(&value),
+        None => String::from_utf8_lossy(dome_json_bytes).into_owned(),
+    };
     let mut hasher = Sha256::new();
-    hasher.update(dome_json_bytes);
+    hasher.update(canonical.as_bytes());
     format!("{:x}", hasher.finalize())
+}
+
+/// Serialize a JSON value to a deterministic canonical string: object keys sorted, no incidental
+/// whitespace. Independent of serde_json's map ordering (which the `preserve_order` feature can
+/// flip), so a config whose `secrets` map is written in a different key order still hashes the
+/// same.
+fn canonical_json(value: &serde_json::Value) -> String {
+    use std::fmt::Write;
+    match value {
+        serde_json::Value::Object(map) => {
+            let mut keys: Vec<&String> = map.keys().collect();
+            keys.sort();
+            let mut out = String::from("{");
+            for (i, k) in keys.iter().enumerate() {
+                if i > 0 {
+                    out.push(',');
+                }
+                // A key is a JSON string; serde_json renders the escaping for us.
+                let _ = write!(out, "{}:", serde_json::Value::String((*k).clone()));
+                out.push_str(&canonical_json(&map[*k]));
+            }
+            out.push('}');
+            out
+        }
+        serde_json::Value::Array(items) => {
+            let mut out = String::from("[");
+            for (i, item) in items.iter().enumerate() {
+                if i > 0 {
+                    out.push(',');
+                }
+                out.push_str(&canonical_json(item));
+            }
+            out.push(']');
+            out
+        }
+        // Scalars: serde_json's own rendering is already canonical.
+        other => other.to_string(),
+    }
 }
 
 /// The on-disk trust record: the canonical project directory and the `dome.json` hash that
@@ -101,22 +155,54 @@ pub(crate) fn record_trust(
     Ok(())
 }
 
-/// Whether `project_dir` is trusted at its current `dome.json` content. True only when a
-/// record exists for the canonical directory AND its stored hash matches the current
-/// `dome.json` bytes. A missing record (never approved) or a hash mismatch (edited since
-/// approval) both return false, so the caller stays on the host.
-pub(crate) fn is_trusted(data_dir: &str, project_dir: &Path, dome_json_bytes: &[u8]) -> bool {
+/// Where `project_dir` stands against its trust record at the current `dome.json` content.
+/// The three states the auto-activation gate must tell apart: a re-lock after an edit is a
+/// stale approval the developer can refresh, which is a different message than a project that
+/// was never vouched for at all.
+#[derive(Debug, PartialEq, Eq)]
+pub(crate) enum TrustState {
+    /// A record exists for this directory and its hash matches the current `dome.json`.
+    Trusted,
+    /// A record exists but the current `dome.json` no longer matches it (edited since approval).
+    Changed,
+    /// No trust record for this directory — the project was never allowed.
+    NeverAllowed,
+}
+
+/// Classify `project_dir` against its stored trust record at the current `dome.json` content.
+/// `Trusted` only when a record exists for the canonical directory AND its stored hash matches;
+/// `Changed` when a record exists but the hash differs (edited since approval); `NeverAllowed`
+/// when there is no record (or it is unreadable, which is treated as absent so the caller
+/// re-locks rather than trusting a corrupt store).
+pub(crate) fn trust_state(
+    data_dir: &str,
+    project_dir: &Path,
+    dome_json_bytes: &[u8],
+) -> TrustState {
     let Ok(canonical) = std::fs::canonicalize(project_dir) else {
-        return false;
+        return TrustState::NeverAllowed;
     };
     let path = allowed_dir(data_dir).join(format!("{}.json", dir_key(&canonical)));
     let Ok(bytes) = std::fs::read(&path) else {
-        return false;
+        return TrustState::NeverAllowed;
     };
     let Ok(record) = serde_json::from_slice::<TrustRecord>(&bytes) else {
-        return false;
+        return TrustState::NeverAllowed;
     };
-    record.dir == canonical.to_string_lossy() && record.hash == config_hash(dome_json_bytes)
+    if record.dir != canonical.to_string_lossy() {
+        return TrustState::NeverAllowed;
+    }
+    if record.hash == config_hash(dome_json_bytes) {
+        TrustState::Trusted
+    } else {
+        TrustState::Changed
+    }
+}
+
+/// Whether `project_dir` is trusted at its current `dome.json` content. A convenience over
+/// [`trust_state`] for callers that only need the yes/no gate, not which kind of "no".
+pub(crate) fn is_trusted(data_dir: &str, project_dir: &Path, dome_json_bytes: &[u8]) -> bool {
+    trust_state(data_dir, project_dir, dome_json_bytes) == TrustState::Trusted
 }
 
 #[cfg(unix)]
@@ -179,6 +265,23 @@ mod tests {
     }
 
     #[test]
+    fn trust_state_distinguishes_changed_from_never_allowed() {
+        // The three-way contract the auto-activation warning depends on: an unrecorded project
+        // is NeverAllowed, a recorded one at its approved content is Trusted, and a semantic edit
+        // since approval is Changed (not silently lumped in with NeverAllowed).
+        let (project, data, bytes) = fixture(r#"{"sandbox":"web"}"#);
+        let dd = data.path().to_str().unwrap();
+        assert_eq!(
+            trust_state(dd, project.path(), &bytes),
+            TrustState::NeverAllowed
+        );
+        record_trust(dd, project.path(), &bytes).unwrap();
+        assert_eq!(trust_state(dd, project.path(), &bytes), TrustState::Trusted);
+        let edited = br#"{"sandbox":"web","allow_net":true}"#;
+        assert_eq!(trust_state(dd, project.path(), edited), TrustState::Changed);
+    }
+
+    #[test]
     fn re_approval_after_an_edit_restores_trust() {
         let (project, data, bytes) = fixture(r#"{"sandbox":"web"}"#);
         let dd = data.path().to_str().unwrap();
@@ -211,8 +314,46 @@ mod tests {
     }
 
     #[test]
-    fn config_hash_is_stable_and_content_sensitive() {
-        assert_eq!(config_hash(b"{}"), config_hash(b"{}"));
-        assert_ne!(config_hash(b"{}"), config_hash(b"{ }"));
+    fn config_hash_is_invariant_to_formatting_and_key_order() {
+        // Reformatting (whitespace) and reordering keys do not change what dome acts on, so the
+        // fingerprint is stable across them — an editor's save no longer re-locks the project.
+        let a = config_hash(br#"{"sandbox":"web","allow_net":true}"#);
+        let b = config_hash(b"{\n  \"allow_net\": true,\n  \"sandbox\": \"web\"\n}\n");
+        assert_eq!(a, b);
+    }
+
+    #[test]
+    fn config_hash_is_sensitive_to_semantic_changes() {
+        // A change to a field dome acts on must still re-lock: this is the security purpose of
+        // the gate. Adding `allow_net` is a real capability change, so the hash must differ.
+        assert_ne!(
+            config_hash(br#"{"sandbox":"web"}"#),
+            config_hash(br#"{"sandbox":"web","allow_net":true}"#),
+        );
+    }
+
+    #[test]
+    fn config_hash_is_invariant_to_secret_key_order() {
+        // `secrets` is a map; its serialized key order must not leak into the fingerprint, or a
+        // re-serialization with a different iteration order would spuriously re-lock the project.
+        let a = config_hash(
+            br#"{"secrets":{"A":{"from":"A","hosts":["a.com"]},"B":{"from":"B","hosts":["b.com"]}}}"#,
+        );
+        let b = config_hash(
+            br#"{"secrets":{"B":{"from":"B","hosts":["b.com"]},"A":{"from":"A","hosts":["a.com"]}}}"#,
+        );
+        assert_eq!(a, b);
+    }
+
+    #[test]
+    fn config_hash_ignores_unknown_keys() {
+        // The incident: `dome allow` recorded trust over a dome.json carrying an unrecognized
+        // top-level `name` key; a later rewrite dropped it, changing the raw bytes and silently
+        // re-locking the project forever. Unknown keys are not part of the config dome acts on,
+        // so they must not affect the trust fingerprint.
+        assert_eq!(
+            config_hash(br#"{"sandbox":"web"}"#),
+            config_hash(br#"{"sandbox":"web","name":"web"}"#),
+        );
     }
 }
