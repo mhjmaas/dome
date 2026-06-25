@@ -584,3 +584,132 @@ fn runtime_mounts_the_project_root_at_workspace_writable() {
         "the guest's /workspace write must reach the host; got: {written}"
     );
 }
+
+/// The drift warning substring `shell`/`run` prints when an existing sandbox's `dome.json`
+/// provision spec no longer matches the spec it was created with.
+const DRIFT_WARNING: &str = "this sandbox's provision spec differs from dome.json";
+
+/// Overwrite `dome.json` in `dir` with a provision block whose single step touches `marker`.
+fn write_provision(dir: &Path, marker: &str) {
+    let dome_json = format!(
+        r#"{{ "provision": {{ "steps": ["mkdir -p /opt && echo ok > /opt/{marker}"] }} }}"#
+    );
+    std::fs::write(dir.join("dome.json"), dome_json).expect("write dome.json");
+}
+
+/// Provision drift (#89): editing the `dome.json` provision block after a sandbox is created
+/// has no effect on that sandbox (provisioning runs only at creation), so `shell`/`run` must
+/// warn that the edit won't apply until the sandbox is recreated. Crucially, `config --reload`
+/// must NOT silence the warning: provisioning is create-only (baked into the pinned disk), so a
+/// reload preserves the as-built spec and the drift is still genuinely unresolved. The warning
+/// clears only after the sandbox is actually recreated against the new spec.
+#[test]
+#[ignore]
+fn provision_drift_warns_on_existing_sandbox_and_reload_does_not_mask_it() {
+    let id = std::process::id();
+    let sandbox = format!("drift-sb-{id}");
+    let marker_a = format!("drift-a-{id}");
+    let marker_b = format!("drift-b-{id}");
+
+    let project = tempfile::tempdir().expect("tempdir");
+    write_provision(project.path(), &marker_a);
+    let layers_before = layer_paths();
+
+    // 1. Create the sandbox against spec A (cold-builds the layer).
+    let create = Command::new(dome_bin())
+        .current_dir(project.path())
+        .args(["sandbox", "create", &sandbox])
+        .output()
+        .expect("failed to spawn dome sandbox create");
+    assert!(
+        create.status.success(),
+        "sandbox create should succeed; stderr: {}",
+        String::from_utf8_lossy(&create.stderr)
+    );
+    let layer = newly_published_layer(&layers_before);
+
+    let run = |project_dir: &Path| {
+        Command::new(dome_bin())
+            .current_dir(project_dir)
+            .args(["sandbox", "run", &sandbox, "--", "sh", "-c", "true"])
+            .output()
+            .expect("failed to spawn dome sandbox run")
+    };
+
+    // 2. Re-entering with the unchanged spec must NOT warn (the steady state stays quiet).
+    let unchanged = run(project.path());
+    assert!(
+        !String::from_utf8_lossy(&unchanged.stderr).contains(DRIFT_WARNING),
+        "an unchanged provision spec must not warn; stderr: {}",
+        String::from_utf8_lossy(&unchanged.stderr)
+    );
+
+    // 3. Edit the provision block (spec A → spec B). Provisioning will NOT re-run (the index
+    //    already exists), so the sandbox still carries spec A's toolchain.
+    write_provision(project.path(), &marker_b);
+
+    // 4. Re-entering now warns: the dome.json spec has drifted from what the sandbox was built
+    //    with, and the edit won't take effect until it is recreated.
+    let drifted = run(project.path());
+    let drifted_err = String::from_utf8_lossy(&drifted.stderr);
+    assert!(
+        drifted_err.contains(DRIFT_WARNING),
+        "a changed provision spec must warn on an existing sandbox; stderr: {drifted_err}"
+    );
+    assert!(
+        drifted_err.contains(&sandbox),
+        "the drift warning must name the sandbox and its recreate remedy; stderr: {drifted_err}"
+    );
+
+    // 5. `config --reload` re-applies dome.json edits but must preserve the create-only provision
+    //    spec — so the drift is still real and the warning must PERSIST. (Without the create-only
+    //    preservation, reload would overwrite the sidecar with spec B and silently mask the drift
+    //    even though the disk still carries spec A — the bug this guards against.)
+    let reload = Command::new(dome_bin())
+        .current_dir(project.path())
+        .args(["sandbox", "config", &sandbox, "--reload"])
+        .output()
+        .expect("failed to spawn dome sandbox config --reload");
+    assert!(
+        reload.status.success(),
+        "config --reload should succeed; stderr: {}",
+        String::from_utf8_lossy(&reload.stderr)
+    );
+    let after_reload = run(project.path());
+    assert!(
+        String::from_utf8_lossy(&after_reload.stderr).contains(DRIFT_WARNING),
+        "config --reload must NOT mask create-only provision drift; stderr: {}",
+        String::from_utf8_lossy(&after_reload.stderr)
+    );
+
+    // 6. Recreating the sandbox against spec B is the real remedy: the warning clears.
+    let _ = Command::new(dome_bin())
+        .args(["sandbox", "rm", &sandbox])
+        .output();
+    let recreate = Command::new(dome_bin())
+        .current_dir(project.path())
+        .args(["sandbox", "create", &sandbox])
+        .output()
+        .expect("failed to spawn dome sandbox create (recreate)");
+    assert!(
+        recreate.status.success(),
+        "recreate should succeed; stderr: {}",
+        String::from_utf8_lossy(&recreate.stderr)
+    );
+    let recreated = run(project.path());
+    assert!(
+        !String::from_utf8_lossy(&recreated.stderr).contains(DRIFT_WARNING),
+        "recreating against the new spec must clear the drift warning; stderr: {}",
+        String::from_utf8_lossy(&recreated.stderr)
+    );
+
+    // Best-effort cleanup.
+    let _ = Command::new(dome_bin())
+        .args(["sandbox", "rm", &sandbox])
+        .output();
+    let _ = std::fs::remove_file(&layer);
+    // The recreate against spec B published a second layer; remove it too if it appeared.
+    for p in layer_paths().difference(&layers_before) {
+        let _ = std::fs::remove_file(p);
+    }
+}

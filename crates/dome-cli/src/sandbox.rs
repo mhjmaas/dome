@@ -15,7 +15,7 @@ use crate::checkpoint;
 use crate::cli::VmArgs;
 use crate::config::{load_config, DomeConfig};
 use crate::lock::{self, Lock};
-use crate::sandbox_config::{self, ResolvedConfig};
+use crate::sandbox_config::{self, ProvisionSpec, ResolvedConfig};
 use crate::vm::SandboxSource;
 use crate::worker;
 
@@ -119,6 +119,14 @@ pub(crate) fn run_sandbox(
         );
     }
 
+    // Provisioning runs only at creation, so a `dome.json` provision edit is silently ignored on
+    // an existing sandbox until it is recreated. Warn (warn-only) when the spec has drifted, so
+    // the user knows their edit hasn't taken effect (issue #89). New sandboxes are built fresh
+    // from the current spec above, so they can never drift — only check an existing one.
+    if Path::new(&index_path).exists() {
+        warn_if_provision_drifted(&data_dir, &name, &cfg, vm_args);
+    }
+
     // The boot spec is consumed by the worker only on a cold boot; it captures exactly
     // what this invocation would have booted (resolved name, seed, cwd, and VM flags).
     let boot = worker::BootSpec::new(
@@ -173,6 +181,51 @@ pub(crate) fn run_sandbox(
     }
 
     worker::attach_and_relay(&attach, &command, tty)
+}
+
+/// Compare the provision spec a sandbox was created with (`stored`, from its sidecar) against
+/// the project's current `dome.json` spec (`current`), returning `None` when they match and
+/// `Some((stored_label, current_label))` short content hashes when they differ. Pure (no I/O)
+/// so the drift decision is testable in isolation; the side that has no spec is labeled `none`.
+/// Labels are version-free spec hashes ([`crate::provision::spec_hash`]) so an unchanged spec
+/// never reports drift just because the CLI was upgraded.
+fn provision_drift(
+    stored: Option<&ProvisionSpec>,
+    current: Option<&ProvisionSpec>,
+) -> Option<(String, String)> {
+    if stored == current {
+        return None;
+    }
+    let label = |p: Option<&ProvisionSpec>| {
+        p.map(|s| crate::provision::spec_hash(s)[..12].to_string())
+            .unwrap_or_else(|| "none".to_string())
+    };
+    Some((label(stored), label(current)))
+}
+
+/// Warn (warn-only, never gate) when an existing sandbox's `dome.json` provision spec has
+/// drifted from the spec it was created with: provisioning runs only at creation, so the edit
+/// is silently ignored on `shell`/`run` until the sandbox is recreated (issue #89). The stored
+/// spec is read from the sidecar (healing a legacy one in place, exactly as the config-update
+/// path does); the current spec is re-resolved from `dome.json` the same way creation would.
+/// Both failure paths — an unreadable/absent sidecar, a `dome.json` that fails to resolve — are
+/// silent: this is advisory, and any real resolve error surfaces on the boot path that follows.
+fn warn_if_provision_drifted(data_dir: &str, name: &str, cfg: &DomeConfig, vm_args: &VmArgs) {
+    let Ok(Some(stored)) = sandbox_config::load_or_heal(data_dir, name, vm_args.config.as_deref())
+    else {
+        return; // no sidecar yet (legacy/lazy), or unreadable — nothing to compare against
+    };
+    let Ok(current) = ResolvedConfig::resolve(&ResolvedConfig::default(), cfg, vm_args) else {
+        return; // a malformed flag/secret surfaces on the boot path; don't double-report here
+    };
+    if let Some((old, new)) = provision_drift(stored.provision.as_ref(), current.provision.as_ref())
+    {
+        eprintln!(
+            "dome: this sandbox's provision spec differs from dome.json (created against {old}, \
+             current {new}). Changes won't apply until you recreate it: `dome sandbox rm {name}` \
+             && `dome sandbox shell`.",
+        );
+    }
 }
 
 /// `--disk-size` is honored only at creation: the disk is physically pinned to the index's
@@ -598,13 +651,12 @@ pub(crate) fn config_sandbox(
 
     // `--reload`: the explicit, first-class way to re-apply an edited dome.json to an existing
     // sandbox. Re-resolve from the current sidecar (base) + the current dome.json + any flags,
-    // so dome.json edits take effect without recreating the sandbox. disk_size is create-only:
-    // the disk is physically pinned, so it stays exactly as the sidecar recorded it (a
-    // `--disk-size` flag is already rejected above).
+    // so dome.json edits take effect without recreating the sandbox. `reloaded` preserves the
+    // create-only fields pinned to the materialized disk — `disk_size` (physically pinned) and
+    // `provision` (baked in at creation; keeping the as-built spec is what lets drift detection
+    // keep working, #89).
     if reload {
-        let pinned_disk_size = config.disk_size;
-        config = ResolvedConfig::resolve(&config, &cfg, vm_args)?;
-        config.disk_size = pinned_disk_size;
+        config = config.reloaded(&cfg, vm_args)?;
         config.save(&data_dir, &name)?;
         eprintln!(
             "dome: reloaded config for sandbox '{}' from dome.json. It applies on the next \
@@ -1088,6 +1140,62 @@ fn pinned_base_for_existing(index_path: &str) -> Result<String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn pspec(steps: &[&str]) -> ProvisionSpec {
+        ProvisionSpec {
+            steps: steps.iter().map(|s| s.to_string()).collect(),
+            ..Default::default()
+        }
+    }
+
+    #[test]
+    fn provision_drift_detects_spec_changes_against_an_existing_sandbox() {
+        // No drift when neither side provisions, or when the stored spec equals the current one
+        // — the common steady state, so `shell`/`run` stays quiet.
+        assert_eq!(
+            provision_drift(None, None),
+            None,
+            "no provisioning either side"
+        );
+        let a = pspec(&["install bun"]);
+        let same = pspec(&["install bun"]);
+        assert_eq!(
+            provision_drift(Some(&a), Some(&same)),
+            None,
+            "an unchanged spec is not drift"
+        );
+
+        // Drift when the spec content differs: the warning carries a short content label per
+        // side so the user can see something changed. Labels are the version-free spec hashes.
+        let b = pspec(&["install bun", "install node"]);
+        assert_eq!(
+            provision_drift(Some(&a), Some(&b)),
+            Some((
+                crate::provision::spec_hash(&a)[..12].to_string(),
+                crate::provision::spec_hash(&b)[..12].to_string()
+            )),
+            "a changed spec drifts and labels both sides"
+        );
+
+        // One-sided drift: a provision block added to (or removed from) dome.json since creation
+        // labels the absent side `none`.
+        assert_eq!(
+            provision_drift(Some(&a), None),
+            Some((
+                crate::provision::spec_hash(&a)[..12].to_string(),
+                "none".to_string()
+            )),
+            "removing the provision block from dome.json is drift"
+        );
+        assert_eq!(
+            provision_drift(None, Some(&a)),
+            Some((
+                "none".to_string(),
+                crate::provision::spec_hash(&a)[..12].to_string()
+            )),
+            "adding a provision block after creation is drift"
+        );
+    }
 
     #[test]
     fn base_version_is_parsed_from_a_versioned_rootfs_path() {
