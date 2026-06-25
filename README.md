@@ -157,6 +157,33 @@ dome sandbox rm myenv
 
 The name is optional — it defaults to the `sandbox` field in `dome.json`, otherwise a slug of the current directory. A sandbox resolves its config **once, at creation**, and stores it in a sidecar (see [Config file](#config-file)). Multiple terminals can attach to the same running sandbox at once; a fully idle sandbox shuts its VM down on its own and reboots on next use.
 
+### Directory auto-activation
+
+Install a shell hook and dome will drop you straight into a project's sandbox whenever you `cd` into a directory that contains a `dome.json` — no need to type `dome sandbox shell`. When you exit the guest, you're back on the host; you stay there until you leave the project and `cd` back in.
+
+```sh
+# Install the hook into your shell rc ($SHELL is auto-detected; zsh, bash, fish)
+dome hook --install
+
+# ...or print it and wire it up yourself
+eval "$(dome hook zsh)"      # add to ~/.zshrc
+eval "$(dome hook bash)"     # add to ~/.bashrc
+dome hook fish | source      # add to ~/.config/fish/config.fish
+```
+
+**Activation requires explicit trust.** A directory does nothing until you allow it — the hook just prints a one-line hint. Trust is recorded for that exact directory and the current `dome.json` content:
+
+```sh
+# From inside the project, grant trust (records the dir + a hash of its dome.json)
+dome allow
+```
+
+Editing `dome.json` **re-locks** the project: the next time you enter it the hook reminds you it changed, and you re-run `dome allow` to review the diff and re-grant. This keeps a pulled or edited config from silently changing what boots.
+
+The hook only acts on an interactive terminal you're driving. It stays out of the way when any of these hold: you're already inside a dome guest (`$DOME_SANDBOX`), `$CI` is set, or you export `DOME_NO_AUTO=1`. To disable auto-activation for one project while keeping it trusted, set `"activate": "off"` in its `dome.json` (`dome sandbox shell` still works manually).
+
+The sandbox a project auto-activates into is the `sandbox` field from its `dome.json`, otherwise a `<slug>-<pathhash>` name — the path hash means two different directories that share a basename never collide on the same VM. If you `cd` into a subdirectory of the project, you land at the matching path under `/workspace`.
+
 ### Provisioning
 
 The base image is intentionally bare. Declare your project's **toolchain** in a `provision` block in `dome.json` and dome installs it once, snapshots the result as a hidden cache layer, and seeds every later sandbox or `dome run` from that layer — so the cost is paid exactly once.
@@ -246,10 +273,12 @@ Dome loads `dome.json` from the current directory (or `--config PATH`). All fiel
 
 ```json
 {
+  "sandbox": "myenv",
   "cpus": 4,
   "memory": 4096,
   "disk_size": 8192,
   "allow_net": true,
+  "activate": "shell",
   "ports": ["8080:80"],
   "mounts": ["./src:/workspace", "./data:/data"],
   "command": ["python", "script.py"],
@@ -269,7 +298,7 @@ Dome loads `dome.json` from the current directory (or `--config PATH`). All fiel
 }
 ```
 
-The `network.allow` list restricts which hosts the guest can reach. Omit it to allow all hosts. The `provision` block declares a cached toolchain layer built once per spec (see [Provisioning](#provisioning)).
+The `network.allow` list restricts which hosts the guest can reach. Omit it to allow all hosts. The `provision` block declares a cached toolchain layer built once per spec (see [Provisioning](#provisioning)). The `sandbox` field pins the persistent sandbox name (otherwise a slug of the directory is used), and `activate` controls [directory auto-activation](#directory-auto-activation) — `"shell"` (the default) drops you into the sandbox on `cd`, `"off"` disables it.
 
 #### One resolution rule
 
