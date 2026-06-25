@@ -386,7 +386,7 @@ __dome_hook() {{
   # cd *within* the same project.
   __dome_suppressed_root="$found"
   if [[ $rc -eq {dropped} ]]; then
-    print -u2 "dome: back on the host — cd out of and into ${{found:t}} to re-enter"
+    print -u2 "dome: back on the host — cd out of and into ${{found:t}} to re-enter or run 'dome sandbox shell'"
   elif [[ $rc -eq {untrusted} ]]; then
     # Print the `dome allow` hint at most once per terminal session, even across re-entries:
     # remember which roots have been hinted (this list is never cleared on cd-out).
@@ -466,7 +466,7 @@ __dome_hook() {{
   # Suppress re-entry for this project until the developer leaves and returns.
   __dome_suppressed_root="$found"
   if [[ $rc -eq {dropped} ]]; then
-    printf '%s\n' "dome: back on the host — cd out of and into ${{found##*/}} to re-enter" >&2
+    printf '%s\n' "dome: back on the host — cd out of and into ${{found##*/}} to re-enter or run 'dome sandbox shell'" >&2
   elif [[ $rc -eq {untrusted} ]]; then
     # Print the `dome allow` hint at most once per terminal session, even across re-entries.
     if [[ " $__dome_hinted " != *" $found "* ]]; then
@@ -549,7 +549,7 @@ function __dome_hook --on-variable PWD
   # Suppress re-entry for this project until the developer leaves and returns.
   set -g __dome_suppressed_root "$found"
   if test $rc -eq {dropped}
-    echo "dome: back on the host — cd out of and into "(basename "$found")" to re-enter" >&2
+    echo "dome: back on the host — cd out of and into "(basename "$found")" to re-enter or run 'dome sandbox shell'" >&2
   else if test $rc -eq {untrusted}
     # Print the `dome allow` hint at most once per terminal session, even across re-entries.
     if not contains -- "$found" $__dome_hinted

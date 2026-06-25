@@ -180,7 +180,7 @@ pub(crate) fn run_sandbox(
         );
     }
 
-    worker::attach_and_relay(&attach, &command, tty)
+    worker::attach_and_relay(&attach, &command, tty, land_cwd)
 }
 
 /// Compare the provision spec a sandbox was created with (`stored`, from its sidecar) against

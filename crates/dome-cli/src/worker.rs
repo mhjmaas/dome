@@ -267,6 +267,12 @@ enum WorkerRequest {
         argv: Vec<String>,
         rows: u16,
         cols: u16,
+        /// The guest directory this session should land in, mapped from the client's current
+        /// host cwd. Travels per-attach (not only on the cold-boot spec) so a warm re-entry
+        /// lands where the developer is now, not where the VM first booted. Optional and
+        /// skipped when absent so a manual shell — and an older client — omit it cleanly.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        land_cwd: Option<String>,
     },
     /// domed asks the worker how many terminals are currently attached. The worker is
     /// the source of truth for this count: it owns the byte path, so it (not domed) sees
@@ -932,8 +938,23 @@ fn handle_conn(worker: &Arc<Worker>, mut stream: UnixStream) {
             argv,
             rows,
             cols,
-        } => handle_attach(worker, stream, &token, tty, &argv, rows, cols),
+            land_cwd,
+        } => handle_attach(worker, stream, &token, tty, &argv, rows, cols, land_cwd.as_deref()),
     }
+}
+
+/// The environment for one attached session: the worker's base env (captured once at cold
+/// boot) with `DOME_LAND_CWD` overridden by *this* attach's landing dir when the client sent
+/// one. The cold-boot env freezes the landing at the first-boot directory; a warm re-attach
+/// carries its own current host-mapped dir, so overriding here lands the developer where they
+/// are now instead of where the VM first booted. An attach with no landing (e.g. a manual
+/// `dome sandbox shell` from outside a project) leaves the base env untouched.
+fn session_env(base: &HashMap<String, String>, land_cwd: Option<&str>) -> HashMap<String, String> {
+    let mut env = base.clone();
+    if let Some(land) = land_cwd {
+        env.insert("DOME_LAND_CWD".to_string(), land.to_string());
+    }
+    env
 }
 
 /// Authorize and open one session, then splice the client byte stream straight to the
@@ -946,6 +967,7 @@ fn handle_attach(
     argv: &[String],
     rows: u16,
     cols: u16,
+    land_cwd: Option<&str>,
 ) {
     if !worker.tokens.lock().unwrap().take(token) {
         let _ = write_line(
@@ -980,10 +1002,13 @@ fn handle_attach(
 
     // Open the guest session (mounts + ExecRequest sent on the vsock side here, so the
     // client's relay only deals with terminal frames).
+    // Per-session env: the cold-boot env with this attach's landing applied, so a warm
+    // re-entry lands at the developer's current directory rather than the first-boot one.
+    let env = session_env(&worker.env, land_cwd);
     let guest = if tty {
-        worker.sandbox.open_shell(argv, &worker.env, rows, cols)
+        worker.sandbox.open_shell(argv, &env, rows, cols)
     } else {
-        worker.sandbox.open_exec(argv, &worker.env, None)
+        worker.sandbox.open_exec(argv, &env, None)
     };
     let guest = match guest {
         Ok(g) => g,
@@ -1130,6 +1155,7 @@ pub(crate) fn attach_and_relay(
     attach: &AttachResult,
     command: &[String],
     tty: bool,
+    land_cwd: Option<&str>,
 ) -> Result<i32> {
     let stdin_fd = std::io::stdin().as_raw_fd();
     let (rows, cols) = if tty {
@@ -1148,6 +1174,7 @@ pub(crate) fn attach_and_relay(
             argv: command.to_vec(),
             rows,
             cols,
+            land_cwd: land_cwd.map(str::to_string),
         },
     )
     .context("sending attach request to worker")?;
@@ -1261,6 +1288,34 @@ mod tests {
     use super::*;
 
     #[test]
+    fn session_env_overrides_a_stale_land_cwd_for_a_warm_attach() {
+        // The bug: DOME_LAND_CWD is baked into the worker env at cold boot, so a warm re-attach
+        // would otherwise reuse the first-boot directory. A session whose attach carries its own
+        // landing must override it so the developer lands where they currently are.
+        let mut base = HashMap::new();
+        base.insert("DOME_LAND_CWD".to_string(), "/workspace/apps".to_string());
+        base.insert("DOME_SANDBOX".to_string(), "trader-v3".to_string());
+
+        let env = session_env(&base, Some("/workspace/packages/core"));
+
+        assert_eq!(env.get("DOME_LAND_CWD").map(String::as_str), Some("/workspace/packages/core"));
+        assert_eq!(env.get("DOME_SANDBOX").map(String::as_str), Some("trader-v3"));
+    }
+
+    #[test]
+    fn session_env_leaves_base_untouched_when_no_landing_is_given() {
+        // A manual `dome sandbox shell` (no landing) must not alter the inherited env — it keeps
+        // whatever DOME_LAND_CWD the worker booted with, exactly as before this fix.
+        let mut base = HashMap::new();
+        base.insert("DOME_LAND_CWD".to_string(), "/workspace".to_string());
+        base.insert("PATH".to_string(), "/usr/bin".to_string());
+
+        let env = session_env(&base, None);
+
+        assert_eq!(env, base);
+    }
+
+    #[test]
     fn tokens_are_single_use() {
         let mut store = TokenStore::new();
         let token = store.mint();
@@ -1310,6 +1365,38 @@ mod tests {
     }
 
     #[test]
+    fn attach_request_carries_and_roundtrips_the_per_session_landing() {
+        // The landing must travel on the attach message (not just the cold-boot spec) so a warm
+        // re-attach can update it. And a message from an older client that omits the field must
+        // still deserialize — to no landing — so a mixed-version client/worker never breaks.
+        let req = WorkerRequest::Attach {
+            token: "tok".to_string(),
+            tty: true,
+            argv: vec!["bash".to_string(), "-l".to_string()],
+            rows: 40,
+            cols: 120,
+            land_cwd: Some("/workspace/apps".to_string()),
+        };
+        let back: WorkerRequest = serde_json::from_str(&serde_json::to_string(&req).unwrap()).unwrap();
+        assert_eq!(back, req);
+
+        // A legacy attach line with no land_cwd field still parses (defaults to None).
+        let legacy = r#"{"op":"attach","token":"t","tty":false,"argv":["ls"],"rows":24,"cols":80}"#;
+        let parsed: WorkerRequest = serde_json::from_str(legacy).unwrap();
+        assert_eq!(
+            parsed,
+            WorkerRequest::Attach {
+                token: "t".to_string(),
+                tty: false,
+                argv: vec!["ls".to_string()],
+                rows: 24,
+                cols: 80,
+                land_cwd: None,
+            }
+        );
+    }
+
+    #[test]
     fn attach_request_roundtrips_with_a_flat_op_tag() {
         let req = WorkerRequest::Attach {
             token: "tok".to_string(),
@@ -1317,6 +1404,7 @@ mod tests {
             argv: vec!["/bin/sh".to_string()],
             rows: 40,
             cols: 120,
+            land_cwd: None,
         };
         let line = serde_json::to_string(&req).unwrap();
         assert!(
@@ -1340,6 +1428,7 @@ mod tests {
                 argv: vec!["ls".to_string(), "-la".to_string()],
                 rows: 24,
                 cols: 80,
+                land_cwd: Some("/workspace/svc".to_string()),
             },
         ] {
             let back: WorkerRequest =
