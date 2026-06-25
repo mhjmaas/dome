@@ -33,6 +33,17 @@ build-image: build-guest
     cp -c ~/.local/share/dome/rootfs.ext4 ~/.local/share/dome/rootfs-$(cat ~/.local/share/dome/VERSION).ext4 2>/dev/null || cp ~/.local/share/dome/rootfs.ext4 ~/.local/share/dome/rootfs-$(cat ~/.local/share/dome/VERSION).ext4
     @echo "==> Local OS image ready ($(cat ~/.local/share/dome/VERSION)) — CLI will use it instead of downloading"
 
+# Plain `build-image` skips an existing rootfs/initramfs (fast, but silently serves a STALE
+# image when dome's own contents change — e.g. the rootfs landing profile or the guest binary).
+# This sets FORCE=1, which prepare-rootfs.sh honors to regenerate them. The kernel stays cached;
+# delete ~/.local/share/dome/Image to rebuild that too. To pick the new image up in an EXISTING
+# sandbox, also drop its stale provision layer and recreate it: `dome sandbox rm <name>` + remove
+# ~/.local/share/dome/provision/*.idx.
+
+# Force a full local OS image rebuild, ignoring cached rootfs/initramfs (kernel stays cached)
+rebuild-image:
+    FORCE=1 just build-image
+
 # Re-inject a freshly-built guest into the EXISTING boot image (Docker required). `build-image`
 # and prepare-rootfs.sh SKIP existing artifacts, so a guest-only change (dome-guest) never reaches
 # the VM without this. The guest that ACTUALLY runs is the copy baked into the initramfs: its

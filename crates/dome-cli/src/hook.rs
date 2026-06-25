@@ -17,13 +17,17 @@ use crate::config::{load_config, ActivateMode};
 /// shell has now returned to the host. The hook suppresses re-entry for this project for the
 /// rest of the terminal session.
 pub(crate) const ACTIVATE_DROPPED_IN: i32 = 0;
-/// Exit code: the project is untrusted (or its `dome.json` changed since `dome allow`). The
-/// binary printed the one-line `dome allow` hint; the hook records that the hint was shown so
-/// it is not repeated.
+/// Exit code: the project was never allowed. The hook prints the one-line `dome allow` hint
+/// (once per terminal session) so the developer knows how to opt in.
 pub(crate) const ACTIVATE_UNTRUSTED: i32 = 10;
 /// Exit code: auto-activation is a no-op here (`activate: "off"`, or a guard like an active
 /// guest / `$CI` / `$DOME_NO_AUTO` fired). The hook stays quiet and does not re-invoke.
 pub(crate) const ACTIVATE_SKIP: i32 = 11;
+/// Exit code: the project was allowed before but its `dome.json` has changed since, so the
+/// approval is stale and auto-activation is re-locked. Distinct from [`ACTIVATE_UNTRUSTED`] so
+/// the hook can warn "changed since you allowed it — run `dome allow` again" instead of the
+/// never-allowed hint, turning a previously-silent re-lock into an actionable message.
+pub(crate) const ACTIVATE_CHANGED: i32 = 12;
 
 /// The sentinel env var the installed shell hook exports on `eval`. Its presence in a manual
 /// `dome sandbox` session means the hook is active, so the one-time install tip is suppressed.
@@ -271,10 +275,11 @@ pub(crate) fn run_hook_activate(project_dir: &str) -> Result<i32> {
     let dir = Path::new(project_dir);
     match decide(&data_dir, dir, |k| std::env::var(k).ok())? {
         Decision::Skip => Ok(ACTIVATE_SKIP),
-        // The untrusted hint is printed by the SHELL HOOK, not here: only the hook can show it
-        // "at most once per terminal session" (each `__hook-activate` is a fresh process). The
-        // binary just signals the state via the exit code.
+        // The untrusted / re-lock messages are printed by the SHELL HOOK, not here: only the
+        // hook can dedupe them "at most once per terminal session" (each `__hook-activate` is a
+        // fresh process). The binary just signals the state via the exit code.
         Decision::Untrusted => Ok(ACTIVATE_UNTRUSTED),
+        Decision::Changed => Ok(ACTIVATE_CHANGED),
         Decision::Activate => {
             drop_in(dir)?;
             Ok(ACTIVATE_DROPPED_IN)
@@ -389,6 +394,13 @@ __dome_hook() {{
       __dome_hinted="$__dome_hinted $found"
       print -u2 "dome: ${{found:t}} has a dome.json but is not trusted. Run 'dome allow' to auto-activate it."
     fi
+  elif [[ $rc -eq {changed} ]]; then
+    # Re-lock: previously allowed, but dome.json changed since. Warn once per session via a
+    # SEPARATE list so a project already in __dome_hinted still surfaces this distinct state.
+    if [[ " $__dome_relocked " != *" $found "* ]]; then
+      __dome_relocked="$__dome_relocked $found"
+      print -u2 "dome: ${{found:t}}'s dome.json changed since you ran 'dome allow' — run 'dome allow' to re-approve and auto-activate."
+    fi
   fi
 }}
 autoload -Uz add-zsh-hook
@@ -399,6 +411,7 @@ add-zsh-hook precmd __dome_hook
         sentinel = HOOK_SENTINEL,
         dropped = ACTIVATE_DROPPED_IN,
         untrusted = ACTIVATE_UNTRUSTED,
+        changed = ACTIVATE_CHANGED,
     )
 }
 
@@ -460,6 +473,13 @@ __dome_hook() {{
       __dome_hinted="$__dome_hinted $found"
       printf '%s\n' "dome: ${{found##*/}} has a dome.json but is not trusted. Run 'dome allow' to auto-activate it." >&2
     fi
+  elif [[ $rc -eq {changed} ]]; then
+    # Re-lock: previously allowed, but dome.json changed since. Warn once per session via a
+    # SEPARATE list so a project already in __dome_hinted still surfaces this distinct state.
+    if [[ " $__dome_relocked " != *" $found "* ]]; then
+      __dome_relocked="$__dome_relocked $found"
+      printf '%s\n' "dome: ${{found##*/}}'s dome.json changed since you ran 'dome allow' — run 'dome allow' to re-approve and auto-activate." >&2
+    fi
   fi
 }}
 # Prepend the hook to PROMPT_COMMAND (once), preserving any existing value.
@@ -472,6 +492,7 @@ esac
         sentinel = HOOK_SENTINEL,
         dropped = ACTIVATE_DROPPED_IN,
         untrusted = ACTIVATE_UNTRUSTED,
+        changed = ACTIVATE_CHANGED,
     )
 }
 
@@ -535,6 +556,13 @@ function __dome_hook --on-variable PWD
       set -g __dome_hinted $__dome_hinted "$found"
       echo "dome: "(basename "$found")" has a dome.json but is not trusted. Run 'dome allow' to auto-activate it." >&2
     end
+  else if test $rc -eq {changed}
+    # Re-lock: previously allowed, but dome.json changed since. Warn once per session via a
+    # SEPARATE list so a project already in __dome_hinted still surfaces this distinct state.
+    if not contains -- "$found" $__dome_relocked
+      set -g __dome_relocked $__dome_relocked "$found"
+      echo "dome: "(basename "$found")"'s dome.json changed since you ran 'dome allow' — run 'dome allow' to re-approve and auto-activate." >&2
+    end
   end
 end
 "#,
@@ -542,6 +570,7 @@ end
         sentinel = HOOK_SENTINEL,
         dropped = ACTIVATE_DROPPED_IN,
         untrusted = ACTIVATE_UNTRUSTED,
+        changed = ACTIVATE_CHANGED,
     )
 }
 
@@ -576,8 +605,11 @@ pub(crate) fn activation_blocked(getenv: impl Fn(&str) -> Option<String>) -> Opt
 pub(crate) enum Decision {
     /// Drop into the sandbox shell for this trusted, activate-on project.
     Activate,
-    /// Untrusted or changed since `dome allow`: print the hint, do not drop in.
+    /// Never allowed: print the `dome allow` hint, do not drop in.
     Untrusted,
+    /// Allowed before, but `dome.json` changed since: print the re-lock warning so the stale
+    /// approval is not a silent dead end, and do not drop in.
+    Changed,
     /// A no-op (guard fired, or `activate: "off"`): stay quiet.
     Skip,
 }
@@ -604,10 +636,10 @@ pub(crate) fn decide(
     if cfg.activate() == ActivateMode::Off {
         return Ok(Decision::Skip);
     }
-    if crate::trust::is_trusted(data_dir, project_dir, &bytes) {
-        Ok(Decision::Activate)
-    } else {
-        Ok(Decision::Untrusted)
+    match crate::trust::trust_state(data_dir, project_dir, &bytes) {
+        crate::trust::TrustState::Trusted => Ok(Decision::Activate),
+        crate::trust::TrustState::Changed => Ok(Decision::Changed),
+        crate::trust::TrustState::NeverAllowed => Ok(Decision::Untrusted),
     }
 }
 
@@ -1187,6 +1219,33 @@ mod tests {
     }
 
     #[test]
+    fn emitted_hooks_warn_on_a_stale_approval_distinctly_from_never_allowed() {
+        // A re-lock (dome.json changed since `dome allow`) must surface its own actionable
+        // message — not the never-allowed hint, and not silence. It is deduped via a SEPARATE
+        // list (`__dome_relocked`) from the never-allowed hint (`__dome_hinted`), so a project
+        // already hinted as untrusted still gets the re-lock warning when its state changes.
+        for script in [
+            emit_zsh_hook("/opt/dome"),
+            emit_bash_hook("/opt/dome"),
+            emit_fish_hook("/opt/dome"),
+        ] {
+            assert!(
+                script.contains(&format!("-eq {ACTIVATE_CHANGED}"))
+                    || script.contains(&format!("$rc -eq {ACTIVATE_CHANGED}")),
+                "hook must branch on the changed exit code {ACTIVATE_CHANGED}; got:\n{script}"
+            );
+            assert!(
+                script.contains("__dome_relocked"),
+                "re-lock warning must dedupe via its own list, separate from __dome_hinted; got:\n{script}"
+            );
+            assert!(
+                script.contains("changed since"),
+                "the warning must say the dome.json changed since approval; got:\n{script}"
+            );
+        }
+    }
+
+    #[test]
     fn hook_tip_offered_until_the_marker_is_written() {
         let data = tempfile::tempdir().unwrap();
         let dd = data.path().to_str().unwrap();
@@ -1353,6 +1412,23 @@ mod tests {
         let (project, data) = fixture("{}");
         let d = decide(data.path().to_str().unwrap(), project.path(), no_env).unwrap();
         assert_eq!(d, Decision::Untrusted);
+    }
+
+    #[test]
+    fn decide_reports_changed_when_dome_json_edited_since_allow() {
+        // Allowed once, then the config changed in a way dome acts on. This is distinct from
+        // "never allowed": the hook should tell the developer their approval is stale, not that
+        // the project was never trusted — otherwise a re-lock is a silent dead end.
+        let (project, data) = fixture(r#"{"sandbox":"web"}"#);
+        let dd = data.path().to_str().unwrap();
+        crate::trust::record_trust(dd, project.path(), br#"{"sandbox":"web"}"#).unwrap();
+        std::fs::write(
+            project.path().join("dome.json"),
+            r#"{"sandbox":"web","allow_net":true}"#,
+        )
+        .unwrap();
+        let d = decide(dd, project.path(), no_env).unwrap();
+        assert_eq!(d, Decision::Changed);
     }
 
     #[test]

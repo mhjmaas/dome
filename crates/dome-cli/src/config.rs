@@ -1,9 +1,9 @@
 use std::collections::HashMap;
 
 use anyhow::{bail, Result};
-use serde::Deserialize;
+use serde::{Deserialize, Serialize};
 
-#[derive(Default, Deserialize)]
+#[derive(Default, Deserialize, Serialize)]
 pub(crate) struct DomeConfig {
     pub cpus: Option<usize>,
     pub memory: Option<u64>,
@@ -35,7 +35,7 @@ pub(crate) struct DomeConfig {
 }
 
 /// What the directory auto-activation hook does when it enters a trusted project.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize, Serialize)]
 #[serde(rename_all = "lowercase")]
 pub(crate) enum ActivateMode {
     /// Drop into the sandbox shell. The default when `activate` is omitted.
@@ -54,7 +54,7 @@ impl DomeConfig {
 
 /// A secret to inject via the proxy.
 /// Example: `{ "from": "OPENAI_API_KEY", "hosts": ["api.openai.com"] }`
-#[derive(Debug, Clone, Deserialize)]
+#[derive(Debug, Clone, Deserialize, Serialize)]
 pub(crate) struct SecretEntry {
     /// Host environment variable containing the real value.
     pub from: String,
@@ -63,7 +63,7 @@ pub(crate) struct SecretEntry {
 }
 
 /// Network access policy.
-#[derive(Debug, Clone, Default, Deserialize)]
+#[derive(Debug, Clone, Default, Deserialize, Serialize)]
 pub(crate) struct NetworkEntry {
     /// Allowed domain patterns. Empty or absent = allow all.
     pub allow: Option<Vec<String>>,
@@ -75,7 +75,7 @@ pub(crate) struct NetworkEntry {
 /// cached layer. `allow` is the *provision-time* network allow-list, separate from the
 /// runtime `network.allow` (empty/unset = all allowed). Installs the toolchain only
 /// (node, pnpm, gcc, python3) — project-dependency installs belong in the live sandbox.
-#[derive(Debug, Clone, Default, Deserialize)]
+#[derive(Debug, Clone, Default, Deserialize, Serialize)]
 pub(crate) struct ProvisionEntry {
     /// Ordered shell commands run as root inside the build VM, each via `sh -c`.
     #[serde(default)]
