@@ -61,6 +61,46 @@ fn shell_with_stdin(name: &str, script: &str) -> String {
     String::from_utf8_lossy(&out.stdout).to_string()
 }
 
+/// Run an explicit command in the sandbox over piped (non-TTY) stdin and return captured
+/// stdout. `sandbox run <cmd>` bypasses the default `bash -l`, so `/etc/profile.d/dome.sh`
+/// is NOT sourced — this exercises the same bare `handle_piped_exec` path provision steps
+/// use, where `HOME` can only come from the guest init environment.
+fn run_with_stdin(name: &str, command: &[&str]) -> String {
+    let mut child = Command::new(dome_bin())
+        .args(["sandbox", "run", name])
+        .args(command)
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .expect("failed to spawn `dome sandbox run <cmd>`");
+    // Close stdin immediately (empty) so the session is detected as non-TTY.
+    drop(child.stdin.take());
+    let out = child.wait_with_output().expect("wait for command");
+    String::from_utf8_lossy(&out.stdout).to_string()
+}
+
+/// Regression for issue #90: provision steps (and any non-login piped exec) must run with a
+/// real `HOME`, not an empty one. A bare `sh -c` does not source `/etc/profile.d/dome.sh`,
+/// so `$HOME` can only come from the guest init environment — which must default it to
+/// `/root`. With `HOME` unset, `$HOME`-relative installers (e.g. bun) land under `/` and
+/// fail silently at runtime.
+#[test]
+#[ignore]
+fn piped_exec_runs_with_home_set() {
+    let name = sandbox_name("home");
+    cleanup(&name);
+
+    let stdout = run_with_stdin(&name, &["sh", "-c", r#"printf 'HOME=%s\n' "$HOME""#]);
+
+    assert!(
+        stdout.lines().any(|l| l == "HOME=/root"),
+        "non-login piped exec must see HOME=/root (issue #90); stdout:\n{stdout}"
+    );
+
+    cleanup(&name);
+}
+
 /// The default sandbox shell is a `bash` login shell whose prompt carries the running
 /// sandbox's name, and `$HOME` is set — proving the bash + profile.d upgrade end to end.
 #[test]

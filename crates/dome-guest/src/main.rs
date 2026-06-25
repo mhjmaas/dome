@@ -1592,6 +1592,14 @@ mod guest {
             "/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin",
         );
 
+        // Default HOME for every exec'd process (issue #90). The kernel hands PID 1 an
+        // (almost) empty environment, so without this HOME is unset for non-login execs —
+        // provision steps and bare `sh -c` runs. Installers that resolve targets relative to
+        // $HOME (e.g. bun's $HOME/.bun) then land under `/` and fail silently. Setting it
+        // here covers both the piped and TTY exec paths via inheritance; a per-request HOME
+        // still overrides it, and login shells re-export the same value via profile.d.
+        std::env::set_var("HOME", "/root");
+
         mount_filesystems();
         eprintln!("dome-guest: filesystems mounted");
 
