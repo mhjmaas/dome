@@ -33,6 +33,38 @@ build-image: build-guest
     cp -c ~/.local/share/dome/rootfs.ext4 ~/.local/share/dome/rootfs-$(cat ~/.local/share/dome/VERSION).ext4 2>/dev/null || cp ~/.local/share/dome/rootfs.ext4 ~/.local/share/dome/rootfs-$(cat ~/.local/share/dome/VERSION).ext4
     @echo "==> Local OS image ready ($(cat ~/.local/share/dome/VERSION)) — CLI will use it instead of downloading"
 
+# Re-inject a freshly-built guest into the EXISTING boot image (Docker required). `build-image`
+# and prepare-rootfs.sh SKIP existing artifacts, so a guest-only change (dome-guest) never reaches
+# the VM without this. The guest that ACTUALLY runs is the copy baked into the initramfs: its
+# `/init` overwrites the rootfs's `/usr/bin/dome-init` with its own copy on every boot, then
+# `switch_root`s into it (see scripts/prepare-rootfs.sh). So this rebuilds the initramfs in place
+# (replacing /bin/dome-init, preserving the init script + everything else). The rootfs copy is
+# clobbered at boot, so it does not need swapping. A RUNNING sandbox keeps the old guest in
+# memory — force-stop it afterward so it cold-boots the new one.
+refresh-guest: build-guest
+    #!/usr/bin/env bash
+    set -euo pipefail
+    data_dir="$HOME/.local/share/dome"
+    guest="{{ justfile_directory() }}/target/{{ guest_target }}/release/dome-guest"
+    initramfs="$data_dir/initramfs.cpio.gz"
+    [ -f "$initramfs" ] || { echo "no $initramfs — run 'just build-image' first"; exit 1; }
+    echo "==> rebuilding initramfs with the freshly-built guest"
+    docker run --rm --platform linux/arm64/v8 \
+        -v "$data_dir:/output" \
+        -v "$guest:/tmp/dome-init:ro" \
+        debian:trixie-slim /bin/sh -c '
+            set -e
+            apt-get update -qq >/dev/null 2>&1
+            apt-get install -y -qq cpio gzip >/dev/null 2>&1
+            mkdir -p /work && cd /work
+            zcat /output/initramfs.cpio.gz | cpio -idm --quiet
+            cp /tmp/dome-init bin/dome-init
+            chmod 755 bin/dome-init
+            find . | cpio -o -H newc --quiet | gzip > /output/initramfs.cpio.gz
+        '
+    echo "==> guest refreshed in $initramfs"
+    echo "==> NOTE: 'dome sandbox stop --force <name>' any RUNNING sandbox so it cold-boots the new guest"
+
 # Run a command inside the VM
 run *args:
     {{ binary }} run -- {{ args }}
@@ -78,7 +110,13 @@ install: build-guest
     cargo build -p dome-cli --release
     codesign --entitlements dome.entitlements --force -s - target/release/dome
     mkdir -p ~/.local/bin
-    cp target/release/dome ~/.local/bin/dome
+    # Install atomically: copy to a temp path, then rename into place. An in-place
+    # `cp` rewrites the same inode (O_TRUNC), so a `domed`/worker from a prior build
+    # still mmap'ing it pins the old, differently-signed code pages — macOS then
+    # SIGKILLs new execs on a code-signature page-hash mismatch (Killed: 9 / exit 137).
+    # `mv` swaps in a fresh inode, leaving running processes on their old one.
+    cp target/release/dome ~/.local/bin/dome.tmp
+    mv -f ~/.local/bin/dome.tmp ~/.local/bin/dome
     mkdir -p ~/.local/share/dome
     cargo pkgid -p dome-cli | sed 's/.*#//' > ~/.local/share/dome/VERSION
 
