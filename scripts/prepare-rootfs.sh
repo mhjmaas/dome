@@ -8,10 +8,22 @@ KERNEL_PATH="${DATA_DIR}/Image"
 INITRAMFS_PATH="${DATA_DIR}/initramfs.cpio.gz"
 GUEST_BINARY="target/aarch64-unknown-linux-musl/release/dome-guest"
 ROOTFS_SIZE_MB=1024
+# FORCE=1 regenerates the rootfs and initramfs even when they already exist. The default
+# (unset) keeps the fast skip-if-present behavior, but that silently serves a stale image
+# when dome's own contents change — e.g. the /etc/profile.d/dome.sh landing logic in the
+# rootfs, or the guest binary in the initramfs. `just rebuild-image` sets this. The kernel
+# is version-independent and slow to compile, so FORCE leaves it cached; delete
+# "$KERNEL_PATH" to rebuild that too.
+FORCE="${FORCE:-}"
 
 echo "==> Dome rootfs preparation script"
 echo "    Debian ${DEBIAN_RELEASE} (kernel + rootfs)"
 echo ""
+
+if [ -n "$FORCE" ]; then
+    echo "==> FORCE set — regenerating rootfs and initramfs even if present (kernel stays cached)."
+    echo ""
+fi
 
 if [[ "$(uname)" == "Darwin" ]]; then
     if ! command -v docker &>/dev/null; then
@@ -38,7 +50,7 @@ else
     echo "==> Kernel already present."
 fi
 
-if [ ! -f "$INITRAMFS_PATH" ]; then
+if [ ! -f "$INITRAMFS_PATH" ] || [ -n "$FORCE" ]; then
     echo "==> Building minimal initramfs..."
 
     docker run --rm \
@@ -93,7 +105,7 @@ else
     echo "==> Initramfs already present."
 fi
 
-if [ -f "$ROOTFS_IMG" ]; then
+if [ -f "$ROOTFS_IMG" ] && [ -z "$FORCE" ]; then
     echo "==> Rootfs already present."
 else
 echo "==> Creating ext4 rootfs image (${ROOTFS_SIZE_MB}MB) with Debian ${DEBIAN_RELEASE}..."
