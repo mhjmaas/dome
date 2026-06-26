@@ -198,10 +198,16 @@ impl ConnAudit {
         });
     }
 
-    /// Emit `conn_close` with the observed byte counts and duration. Skipped if the
-    /// connection never reached an `open` (e.g. rejected by the allowlist before a path
-    /// was chosen), so close rows always pair with an open.
-    fn close(&self) {
+}
+
+/// Emit `conn_close` on drop with the observed byte counts and duration. Driving the close
+/// from `Drop` (rather than an explicit call on each path) guarantees every `conn_open` is
+/// paired with a `conn_close` on *all* exit paths — including an early `?` return when the
+/// upstream `connect` fails after the open was emitted. Skipped when the connection never
+/// reached an `open` (e.g. rejected by the allowlist before a path was chosen), so close
+/// rows always pair with an open and opens always pair with a close.
+impl Drop for ConnAudit {
+    fn drop(&mut self) {
         if !self.opened {
             return;
         }
@@ -247,10 +253,9 @@ async fn handle_connection(
             audit.open(ConnKind::ExposeHost, dst, None);
             let upstream = TcpStream::connect(local_dst).await?;
             let (mut upstream_rd, mut upstream_wr) = upstream.into_split();
-            let r = blind_relay(id, &mut upstream_rd, &mut upstream_wr, data_rx, cmd_tx, &audit)
+            // `audit` drops at function return, emitting the paired `conn_close`.
+            return blind_relay(id, &mut upstream_rd, &mut upstream_wr, data_rx, cmd_tx, &audit)
                 .await;
-            audit.close();
-            return r;
         }
     }
 
@@ -332,7 +337,8 @@ async fn handle_connection(
             if !substitutions.is_empty() {
                 debug!("MITM: {domain}");
                 audit.open(ConnKind::Mitm, dst, Some(domain));
-                let r = handle_mitm(
+                // `audit` drops at function return, emitting the paired `conn_close`.
+                return handle_mitm(
                     id,
                     dst,
                     domain.clone(),
@@ -345,8 +351,6 @@ async fn handle_connection(
                     &audit,
                 )
                 .await;
-                audit.close();
-                return r;
             }
         }
 
@@ -360,10 +364,8 @@ async fn handle_connection(
         upstream_wr.write_all(&tls_buf).await?;
         audit.bytes_tx.fetch_add(tls_buf.len() as u64, Ordering::Relaxed);
 
-        let r =
-            blind_relay(id, &mut upstream_rd, &mut upstream_wr, data_rx, cmd_tx, &audit).await;
-        audit.close();
-        return r;
+        // `audit` drops at function return, emitting the paired `conn_close`.
+        return blind_relay(id, &mut upstream_rd, &mut upstream_wr, data_rx, cmd_tx, &audit).await;
     }
 
     // Non-TLS: blind tunnel
@@ -372,9 +374,8 @@ async fn handle_connection(
     let upstream = TcpStream::connect(dst).await?;
     let (mut upstream_rd, mut upstream_wr) = upstream.into_split();
 
-    let r = blind_relay(id, &mut upstream_rd, &mut upstream_wr, data_rx, cmd_tx, &audit).await;
-    audit.close();
-    r
+    // `audit` drops at function return, emitting the paired `conn_close`.
+    blind_relay(id, &mut upstream_rd, &mut upstream_wr, data_rx, cmd_tx, &audit).await
 }
 
 /// Blind bidirectional relay (no inspection). Counts bytes in each direction into the
