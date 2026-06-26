@@ -5,7 +5,7 @@ use std::sync::Arc;
 use std::time::{Instant, SystemTime, UNIX_EPOCH};
 
 use boring::ssl::{SslConnector, SslMethod};
-use dome_audit::{AuditEvent, ConnKind};
+use dome_audit::{AuditEvent, ConnKind, Direction, HttpFramer};
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::TcpStream;
 use tokio::sync::mpsc;
@@ -466,16 +466,30 @@ async fn handle_mitm(
     let (mut guest_rd, mut guest_wr) = tokio::io::split(guest_tls);
     let (mut upstream_rd, mut upstream_wr) = tokio::io::split(upstream_tls);
 
+    // Identity + sink for the per-request framer events, captured before the relay tasks
+    // move the byte counters. `None` (auditing disabled) makes the framer work a no-op.
+    let conn_id = audit.conn_id;
+    let audit_tx = audit.tx.clone();
+
     // Count the GUEST-side (pre-substitution) byte volume so the audit never reflects the
     // real secret's length. Substitution is left exactly as-is — capture is observe-only.
     let bytes_tx = audit.bytes_tx.clone();
+    let req_tx = audit_tx.clone();
     let guest_to_upstream = async move {
+        // Tee a read-only HTTP framer over the pre-substitution guest bytes: the guest-side
+        // view contains only placeholders, so the real secret can never enter the log.
+        let mut framer = req_tx.as_ref().map(|_| HttpFramer::new(Direction::Request));
         let mut buf = vec![0u8; 65536];
         loop {
             match guest_rd.read(&mut buf).await {
                 Ok(0) | Err(_) => break,
                 Ok(n) => {
                     bytes_tx.fetch_add(n as u64, Ordering::Relaxed);
+                    if let (Some(tx), Some(framer)) = (&req_tx, framer.as_mut()) {
+                        for ev in framer.push(&buf[..n]) {
+                            let _ = tx.try_send(ev.into_audit(conn_id, Direction::Request, now_ms()));
+                        }
+                    }
                     let mut data = buf[..n].to_vec();
                     for (placeholder, real_value) in &substitutions {
                         data = replace_bytes(&data, placeholder.as_bytes(), real_value.as_bytes());
@@ -489,13 +503,20 @@ async fn handle_mitm(
     };
 
     let bytes_rx = audit.bytes_rx.clone();
+    let resp_tx = audit_tx.clone();
     let upstream_to_guest = async move {
+        let mut framer = resp_tx.as_ref().map(|_| HttpFramer::new(Direction::Response));
         let mut buf = vec![0u8; 65536];
         loop {
             match upstream_rd.read(&mut buf).await {
                 Ok(0) | Err(_) => break,
                 Ok(n) => {
                     bytes_rx.fetch_add(n as u64, Ordering::Relaxed);
+                    if let (Some(tx), Some(framer)) = (&resp_tx, framer.as_mut()) {
+                        for ev in framer.push(&buf[..n]) {
+                            let _ = tx.try_send(ev.into_audit(conn_id, Direction::Response, now_ms()));
+                        }
+                    }
                     if guest_wr.write_all(&buf[..n]).await.is_err() {
                         break;
                     }
