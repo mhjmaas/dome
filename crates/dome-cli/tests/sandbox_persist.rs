@@ -346,6 +346,36 @@ fn audit_sandbox_dir(name: &str) -> String {
     format!("{}/.local/share/dome/audit/{}", home, name)
 }
 
+/// The session directories (`audit/<name>/<session>/`) for a sandbox.
+fn audit_session_dirs(name: &str) -> Vec<std::path::PathBuf> {
+    let mut dirs = Vec::new();
+    if let Ok(sessions) = std::fs::read_dir(audit_sandbox_dir(name)) {
+        for session in sessions.filter_map(|e| e.ok()) {
+            if session.path().is_dir() {
+                dirs.push(session.path());
+            }
+        }
+    }
+    dirs
+}
+
+/// Backdate every segment file in a session directory by `age` so the age-based reaper sees
+/// a stale session. (Reaping keys off the newest contained file's mtime.)
+fn age_audit_session(session_dir: &std::path::Path, age: std::time::Duration) {
+    let when = std::time::SystemTime::now() - age;
+    if let Ok(files) = std::fs::read_dir(session_dir) {
+        for f in files.filter_map(|e| e.ok()) {
+            if f.path().is_file() {
+                std::fs::File::options()
+                    .write(true)
+                    .open(f.path())
+                    .and_then(|file| file.set_modified(when))
+                    .expect("backdate segment mtime");
+            }
+        }
+    }
+}
+
 /// Every `events-NNNN.jsonl` segment under a sandbox's sessions, sorted oldest-first (session
 /// dir names are timestamp-led and segment names zero-padded, so a path sort is an age sort).
 fn audit_segments(name: &str) -> Vec<std::path::PathBuf> {
@@ -734,6 +764,115 @@ fn egress_audit_log_labels_dropped_events_under_overload() {
     assert!(
         !rows.iter().any(|r| r.contains("real-secret-value")),
         "the real secret value must never enter the audit log; rows: {rows:#?}"
+    );
+
+    rm_sandbox(&name);
+    let _ = std::fs::remove_dir_all(audit_sandbox_dir(&name));
+}
+
+/// Age-based audit retention folded into `dome prune` (#106), end-to-end through the real boot
+/// path. The size ceiling (#104) is the always-on bound; this is the complementary age
+/// housekeeping — drop whole sessions untouched for longer than the default age, on-demand via
+/// `dome prune` (no background timer). We boot a *persistent* sandbox and run an *ephemeral*
+/// `dome run`, both making real egress so each writes a genuine audit session; we then backdate
+/// every segment of those sessions past the age threshold, seed a *fresh* sentinel session that
+/// must survive, and run the real `dome prune`. It must reap both aged sessions (ephemeral and
+/// persistent under the same policy), keep the fresh one, and report the reclaimed bytes in its
+/// summary alongside the chunk sweep.
+#[test]
+#[ignore]
+fn egress_audit_log_reaps_aged_sessions_via_prune() {
+    let name = sandbox_name("audit-reap");
+    rm_sandbox(&name);
+    let _ = std::fs::remove_dir_all(audit_sandbox_dir(&name));
+
+    // A persistent sandbox makes egress (auditing rides the proxy, so `--allow-net`): a real
+    // audit session lands under audit/<name>/.
+    let guest_cmd =
+        "curl -sS --max-time 25 https://example.com/ > /dev/null 2>&1; echo persistent-done";
+    let persistent = Command::new(dome_bin())
+        .args([
+            "sandbox", "run", &name, "--allow-net", "--", "sh", "-c", guest_cmd,
+        ])
+        .output()
+        .expect("failed to spawn dome — is DOME_BIN correct?");
+    assert!(
+        persistent.status.success(),
+        "the persistent audited run should succeed; stderr: {}",
+        String::from_utf8_lossy(&persistent.stderr)
+    );
+    // Stop the worker so the writer drains and flushes before we backdate + prune.
+    stop_worker(&name);
+
+    // An ephemeral `dome run` makes egress too: its (single-session) rows bucket under
+    // audit/ephemeral/. Snapshot that bucket before/after so we age only this run's session.
+    let eph_before: std::collections::HashSet<_> =
+        audit_session_dirs("ephemeral").into_iter().collect();
+    let ephemeral = Command::new(dome_bin())
+        .args(["run", "--allow-net", "--", "sh", "-c", guest_cmd])
+        .output()
+        .expect("failed to spawn dome — is DOME_BIN correct?");
+    assert!(
+        ephemeral.status.success(),
+        "the ephemeral audited run should succeed; stderr: {}",
+        String::from_utf8_lossy(&ephemeral.stderr)
+    );
+    let eph_new: Vec<_> = audit_session_dirs("ephemeral")
+        .into_iter()
+        .filter(|d| !eph_before.contains(d))
+        .collect();
+    assert!(
+        !eph_new.is_empty(),
+        "the ephemeral run should have written a new audit session under audit/ephemeral/"
+    );
+
+    // Backdate every aged session (persistent + the new ephemeral one) past the threshold.
+    let aged = std::time::Duration::from_secs(40 * 86_400);
+    let persistent_sessions = audit_session_dirs(&name);
+    assert!(
+        !persistent_sessions.is_empty(),
+        "the persistent run should have written an audit session under audit/{name}/"
+    );
+    for dir in persistent_sessions.iter().chain(eph_new.iter()) {
+        age_audit_session(dir, aged);
+    }
+
+    // Seed a FRESH sentinel session under the persistent sandbox: it must survive the prune.
+    let fresh = audit_sandbox_dir(&name) + "/fresh-sentinel";
+    std::fs::create_dir_all(&fresh).unwrap();
+    std::fs::write(
+        format!("{fresh}/events-0001.jsonl"),
+        "{\"kind\":\"conn_open\"}\n",
+    )
+    .unwrap();
+
+    // On-demand age reaping runs as part of the real `dome prune`.
+    let prune = prune_cmd();
+    assert!(
+        prune.status.success(),
+        "prune should succeed; stderr: {}",
+        String::from_utf8_lossy(&prune.stderr)
+    );
+    let stderr = String::from_utf8_lossy(&prune.stderr);
+
+    // The reclaimed audit bytes are reported in the prune summary (alongside the chunk sweep).
+    assert!(
+        stderr.contains("reaped") && stderr.contains("aged audit session"),
+        "prune must report reaped audit sessions; stderr: {stderr}"
+    );
+
+    // Both aged sessions (persistent AND ephemeral) were removed under the same age policy.
+    for dir in persistent_sessions.iter().chain(eph_new.iter()) {
+        assert!(
+            !dir.exists(),
+            "aged audit session should have been reaped: {}",
+            dir.display()
+        );
+    }
+    // The fresh sentinel session survives — only aged sessions are reaped.
+    assert!(
+        std::path::Path::new(&fresh).exists(),
+        "a fresh audit session must survive the age reap"
     );
 
     rm_sandbox(&name);

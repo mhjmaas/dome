@@ -245,6 +245,22 @@ fn main() -> Result<()> {
                     stats.bases_removed
                 );
             }
+
+            // 5. Age-based audit retention: reap egress-audit sessions (ephemeral and
+            // persistent alike) untouched for longer than the default age. The size ceiling
+            // is enforced inline by the writer at rotation; this is the complementary age
+            // housekeeping, on-demand here rather than via a background timer.
+            let audit_dir = std::path::Path::new(&data_dir).join("audit");
+            let audit = dome_audit::reap_aged_sessions(&audit_dir, dome_audit::DEFAULT_MAX_AGE);
+            if audit.sessions_removed == 0 {
+                eprintln!("dome: no aged audit sessions to reap");
+            } else {
+                eprintln!(
+                    "dome: reaped {} aged audit session(s) ({})",
+                    audit.sessions_removed,
+                    gc::format_bytes(audit.bytes_removed),
+                );
+            }
         }
         Commands::Provision { action } => match action {
             ProvisionCommands::List => provision::list()?,
