@@ -43,6 +43,52 @@ pub(crate) struct SandboxSource {
     pub base_path: String,
 }
 
+/// Optional egress-audit rotation/retention cap overrides, resolved once in the **client**
+/// process (which has the operator's fresh environment) and carried per-invocation to the
+/// boot path. The production defaults live in [`dome_audit::WriterConfig::new`]; these knobs
+/// exist only so the real-VM integration test can drive rotation and size-ceiling trimming
+/// with a handful of small egress connections. They must NOT be read in the worker/domed
+/// process: domed is long-lived and shared, so a worker-side env read would stick across
+/// every later sandbox boot (user-configurable retention is intentionally out of scope —
+/// see the PRD). An unset field falls back to the writer default.
+#[derive(Debug, Clone, Default, serde::Serialize, serde::Deserialize)]
+pub(crate) struct AuditCaps {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub segment_max_bytes: Option<u64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub segment_max_events: Option<u64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub sandbox_max_bytes: Option<u64>,
+}
+
+impl AuditCaps {
+    /// Read the `DOME_AUDIT_*` overrides from the environment. Returns `None` unless at least
+    /// one is set, so the common (production) path carries nothing and uses the baked defaults.
+    /// Call this only in the client process — never in the worker (see the type docs).
+    pub(crate) fn from_env() -> Option<Self> {
+        fn var_u64(key: &str) -> Option<u64> {
+            std::env::var(key).ok().and_then(|v| v.parse::<u64>().ok())
+        }
+        let caps = AuditCaps {
+            segment_max_bytes: var_u64("DOME_AUDIT_SEGMENT_MAX_BYTES"),
+            segment_max_events: var_u64("DOME_AUDIT_SEGMENT_MAX_EVENTS"),
+            sandbox_max_bytes: var_u64("DOME_AUDIT_SANDBOX_MAX_BYTES"),
+        };
+        let any_set = caps.segment_max_bytes.is_some()
+            || caps.segment_max_events.is_some()
+            || caps.sandbox_max_bytes.is_some();
+        any_set.then_some(caps)
+    }
+
+    /// Apply the set overrides onto a writer config, leaving unset fields at their defaults.
+    fn apply(&self, config: dome_audit::WriterConfig) -> dome_audit::WriterConfig {
+        let segment_max_bytes = self.segment_max_bytes.unwrap_or(config.segment_max_bytes);
+        let segment_max_events = self.segment_max_events.unwrap_or(config.segment_max_events);
+        let sandbox_max_bytes = self.sandbox_max_bytes.unwrap_or(config.sandbox_max_bytes);
+        config.with_caps(segment_max_bytes, segment_max_events, sandbox_max_bytes)
+    }
+}
+
 pub(crate) struct PreparedVm {
     pub instance_dir: String,
     /// Audit bucket name for egress rows: `audit/<sandbox_name>/<session>/`. A persistent
@@ -61,6 +107,9 @@ pub(crate) struct PreparedVm {
     pub verbose: bool,
     pub forwards: Vec<PortMapping>,
     pub mounts: Vec<MountConfig>,
+    /// Per-invocation egress-audit cap overrides (test/ops knob). Resolved in the client and
+    /// carried here; `None` uses the baked production defaults. See [`AuditCaps`].
+    pub audit_caps: Option<AuditCaps>,
 }
 
 /// Resolve the disk size for booting an *existing* sandbox. Disk size is pinned at
@@ -287,6 +336,9 @@ pub(crate) fn prepare_vm(
         verbose,
         forwards,
         mounts,
+        // Resolved by the caller (client side) when present; the worker cold-boot path copies
+        // it from the boot spec, the ephemeral path from the environment. None = baked defaults.
+        audit_caps: None,
     })
 }
 
@@ -393,7 +445,11 @@ pub(crate) fn boot_vm(prepared: &PreparedVm) -> Result<BootedVm> {
     let (vm_fd, proxy_handle, audit_handle) = if let Some(ref proxy_config) = prepared.proxy_config
     {
         let (vm_fd, host_fd) = dome_proxy::create_socketpair()?;
-        let audit = start_audit_writer(&prepared.sandbox_name, prepared.verbose);
+        let audit = start_audit_writer(
+            &prepared.sandbox_name,
+            prepared.verbose,
+            prepared.audit_caps.as_ref(),
+        );
         let audit_tx = audit.as_ref().map(|a| a.sender());
         let handle = dome_proxy::start(host_fd, proxy_config.clone(), audit_tx)?;
 
@@ -464,14 +520,16 @@ pub(crate) fn boot_vm(prepared: &PreparedVm) -> Result<BootedVm> {
 pub(crate) fn start_audit_writer(
     sandbox_name: &str,
     verbose: bool,
+    caps: Option<&AuditCaps>,
 ) -> Option<dome_audit::AuditHandle> {
     let audit_dir = format!("{}/audit", dome_vm::default_data_dir());
     let session = dome_audit::mint_session();
-    match dome_audit::AuditWriter::spawn(dome_audit::WriterConfig::new(
-        audit_dir,
-        sandbox_name.to_string(),
-        session.clone(),
-    )) {
+    let base = dome_audit::WriterConfig::new(audit_dir, sandbox_name.to_string(), session.clone());
+    let config = match caps {
+        Some(caps) => caps.apply(base),
+        None => base,
+    };
+    match dome_audit::AuditWriter::spawn(config) {
         Ok(handle) => {
             if verbose {
                 eprintln!("dome: egress audit log -> audit/{sandbox_name}/{session}/");

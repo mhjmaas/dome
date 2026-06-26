@@ -32,6 +32,15 @@ const DEFAULT_FLUSH_EVERY: usize = 256;
 const DEFAULT_FLUSH_INTERVAL: Duration = Duration::from_millis(250);
 /// Upper bound on the shutdown drain+flush so a stuck disk cannot wedge process exit.
 const SHUTDOWN_TIMEOUT: Duration = Duration::from_secs(2);
+/// Roll to a fresh segment once the current one reaches this many bytes (~64 MB), so files
+/// stay tail-able and the reaper can trim oldest segments of even a still-running session.
+const DEFAULT_SEGMENT_MAX_BYTES: u64 = 64 * 1024 * 1024;
+/// Roll at this many events even before the byte cap, whichever comes first (~100k).
+const DEFAULT_SEGMENT_MAX_EVENTS: u64 = 100_000;
+/// Always-on per-sandbox safety bound: after each rotation, oldest segments across the
+/// sandbox's sessions are unlinked until the sandbox audit dir is back under this (~512 MB).
+/// Holds even if `dome prune` is never run; can trim oldest segments of a live session.
+const DEFAULT_SANDBOX_MAX_BYTES: u64 = 512 * 1024 * 1024;
 
 /// Identity and tuning for a writer bound to one `{sandbox, session}`.
 pub struct WriterConfig {
@@ -48,6 +57,12 @@ pub struct WriterConfig {
     pub flush_every: usize,
     /// Flush at least this often.
     pub flush_interval: Duration,
+    /// Roll to a new segment once the current one reaches this many bytes.
+    pub segment_max_bytes: u64,
+    /// Roll to a new segment once the current one reaches this many events.
+    pub segment_max_events: u64,
+    /// Per-sandbox total-size ceiling enforced inline at each rotation.
+    pub sandbox_max_bytes: u64,
 }
 
 impl WriterConfig {
@@ -65,8 +80,191 @@ impl WriterConfig {
             channel_capacity: DEFAULT_CHANNEL_CAPACITY,
             flush_every: DEFAULT_FLUSH_EVERY,
             flush_interval: DEFAULT_FLUSH_INTERVAL,
+            segment_max_bytes: DEFAULT_SEGMENT_MAX_BYTES,
+            segment_max_events: DEFAULT_SEGMENT_MAX_EVENTS,
+            sandbox_max_bytes: DEFAULT_SANDBOX_MAX_BYTES,
         }
     }
+
+    /// Override the rotation caps and the per-sandbox size ceiling. Intended for tests, which
+    /// drive rotation and trimming with small inputs.
+    pub fn with_caps(
+        mut self,
+        segment_max_bytes: u64,
+        segment_max_events: u64,
+        sandbox_max_bytes: u64,
+    ) -> Self {
+        self.segment_max_bytes = segment_max_bytes;
+        self.segment_max_events = segment_max_events;
+        self.sandbox_max_bytes = sandbox_max_bytes;
+        self
+    }
+}
+
+/// Owns the current on-disk segment for one `{sandbox, session}` and the rotation +
+/// size-ceiling policy. Rows are appended through [`SegmentSink::write_line`], which rolls to
+/// `events-NNNN.jsonl` once the segment hits a byte or event cap and, immediately after each
+/// roll, trims the oldest segments across the whole sandbox until under the size ceiling.
+struct SegmentSink {
+    /// `<audit_dir>/<sandbox>/<session>` — where this session's segments live.
+    session_dir: PathBuf,
+    /// `<audit_dir>/<sandbox>` — the trim scope: all sessions of this sandbox.
+    sandbox_dir: PathBuf,
+    /// Current segment number (1-based), formatted as `events-NNNN.jsonl`.
+    seg_no: u32,
+    /// Path of the currently-open segment; never trimmed while active.
+    path: PathBuf,
+    out: BufWriter<std::fs::File>,
+    /// Bytes written to the current segment so far.
+    bytes: u64,
+    /// Events written to the current segment so far.
+    events: u64,
+    max_bytes: u64,
+    max_events: u64,
+    sandbox_max_bytes: u64,
+}
+
+impl SegmentSink {
+    fn segment_name(seg_no: u32) -> String {
+        format!("events-{seg_no:04}.jsonl")
+    }
+
+    /// Open the first segment (`events-0001.jsonl`) under `session_dir`.
+    fn open(
+        session_dir: PathBuf,
+        sandbox_dir: PathBuf,
+        max_bytes: u64,
+        max_events: u64,
+        sandbox_max_bytes: u64,
+    ) -> std::io::Result<Self> {
+        let seg_no = 1;
+        let path = session_dir.join(Self::segment_name(seg_no));
+        let out = BufWriter::new(open_segment(&path)?);
+        Ok(SegmentSink {
+            session_dir,
+            sandbox_dir,
+            seg_no,
+            path,
+            out,
+            bytes: 0,
+            events: 0,
+            max_bytes,
+            max_events,
+            sandbox_max_bytes,
+        })
+    }
+
+    /// Append one already-serialized, newline-terminated row, then roll if the segment is now
+    /// at or past a cap. A row may push the segment slightly past the byte cap before the roll;
+    /// that bounded overshoot keeps each row whole.
+    fn write_line(&mut self, line: &[u8]) {
+        if self.out.write_all(line).is_ok() {
+            self.bytes += line.len() as u64;
+            self.events += 1;
+        }
+        if self.bytes >= self.max_bytes || self.events >= self.max_events {
+            self.rotate();
+        }
+    }
+
+    /// Finalize the current segment, open the next one, then enforce the size ceiling. Best
+    /// effort: if the next segment cannot be opened we keep writing to the current one rather
+    /// than lose the writer.
+    fn rotate(&mut self) {
+        let _ = self.out.flush();
+        if let Ok(file) = self.out.get_ref().try_clone() {
+            let _ = file.sync_all();
+        }
+        let next_no = self.seg_no + 1;
+        let next_path = self.session_dir.join(Self::segment_name(next_no));
+        match open_segment(&next_path) {
+            Ok(file) => {
+                self.out = BufWriter::new(file);
+                self.seg_no = next_no;
+                self.path = next_path;
+                self.bytes = 0;
+                self.events = 0;
+                self.enforce_ceiling();
+            }
+            Err(_) => {
+                // Couldn't roll: stay on the current segment (it has been flushed) and keep
+                // accepting rows. The byte/event counters keep climbing, so we retry the roll
+                // on the next write — never wedging the writer.
+            }
+        }
+    }
+
+    /// Sum the sandbox's audit-dir size and unlink oldest segments until under the ceiling.
+    /// The currently-active segment is never removed, so a still-running session's writer is
+    /// undisturbed even as its older segments (and older sessions' segments) are reaped.
+    fn enforce_ceiling(&mut self) {
+        if self.sandbox_max_bytes == u64::MAX {
+            return;
+        }
+        // Oldest-first across the whole sandbox: session dir names are timestamp-led and
+        // segment names are zero-padded, so a lexical path sort is an age sort.
+        let mut segments = collect_segments(&self.sandbox_dir);
+        segments.sort_by(|a, b| a.0.cmp(&b.0));
+        let mut total: u64 = segments.iter().map(|(_, size)| size).sum();
+        for (path, size) in segments {
+            if total <= self.sandbox_max_bytes {
+                break;
+            }
+            if path == self.path {
+                continue; // never unlink the segment we're actively writing
+            }
+            if std::fs::remove_file(&path).is_ok() {
+                total = total.saturating_sub(size);
+            }
+        }
+    }
+
+    fn flush(&mut self) {
+        let _ = self.out.flush();
+    }
+
+    /// Flush and fsync the current segment on shutdown.
+    fn finalize(mut self) {
+        let _ = self.out.flush();
+        if let Ok(file) = self.out.into_inner() {
+            let _ = file.sync_all();
+        }
+    }
+}
+
+/// Open a segment file for append-only writing, creating it if absent.
+fn open_segment(path: &std::path::Path) -> std::io::Result<std::fs::File> {
+    std::fs::OpenOptions::new()
+        .create(true)
+        .append(true)
+        .open(path)
+}
+
+/// All `events-NNNN.jsonl` segments under a sandbox dir (across every session), each paired
+/// with its byte size. Returns `(path, size)` pairs; missing/unreadable dirs yield nothing.
+fn collect_segments(sandbox_dir: &std::path::Path) -> Vec<(PathBuf, u64)> {
+    let mut out = Vec::new();
+    let Ok(sessions) = std::fs::read_dir(sandbox_dir) else {
+        return out;
+    };
+    for session in sessions.filter_map(|e| e.ok()) {
+        let Ok(segments) = std::fs::read_dir(session.path()) else {
+            continue;
+        };
+        for seg in segments.filter_map(|e| e.ok()) {
+            let path = seg.path();
+            let is_segment = path
+                .file_name()
+                .and_then(|n| n.to_str())
+                .is_some_and(|n| n.starts_with("events-") && n.ends_with(".jsonl"));
+            if !is_segment {
+                continue;
+            }
+            let size = seg.metadata().map(|m| m.len()).unwrap_or(0);
+            out.push((path, size));
+        }
+    }
+    out
 }
 
 /// Constructs writers. Stateless; the entry point is [`AuditWriter::spawn`].
@@ -77,16 +275,16 @@ impl AuditWriter {
     /// Returns a handle whose [`AuditHandle::sender`] feeds the proxy and whose drop drains
     /// the channel and flushes.
     pub fn spawn(config: WriterConfig) -> std::io::Result<AuditHandle> {
-        let session_dir = config
-            .audit_dir
-            .join(&config.sandbox)
-            .join(&config.session);
+        let sandbox_dir = config.audit_dir.join(&config.sandbox);
+        let session_dir = sandbox_dir.join(&config.session);
         std::fs::create_dir_all(&session_dir)?;
-        let segment_path = session_dir.join("events-0001.jsonl");
-        let file = std::fs::OpenOptions::new()
-            .create(true)
-            .append(true)
-            .open(&segment_path)?;
+        let sink = SegmentSink::open(
+            session_dir,
+            sandbox_dir,
+            config.segment_max_bytes,
+            config.segment_max_events,
+            config.sandbox_max_bytes,
+        )?;
 
         let (tx, rx) = mpsc::channel::<AuditEvent>(config.channel_capacity);
         let shutdown = Arc::new(Notify::new());
@@ -110,7 +308,7 @@ impl AuditWriter {
                 rt.block_on(run_writer(
                     rx,
                     task_shutdown,
-                    BufWriter::new(file),
+                    sink,
                     sandbox,
                     session,
                     flush_every,
@@ -175,7 +373,7 @@ fn join_bounded(thread: JoinHandle<()>, timeout: Duration) {
 async fn run_writer(
     mut rx: mpsc::Receiver<AuditEvent>,
     shutdown: Arc<Notify>,
-    mut out: BufWriter<std::fs::File>,
+    mut sink: SegmentSink,
     sandbox: String,
     session: String,
     flush_every: usize,
@@ -191,31 +389,31 @@ async fn run_writer(
             _ = shutdown.notified() => {
                 // Drain everything already queued, then flush+fsync and exit.
                 while let Ok(event) = rx.try_recv() {
-                    write_row(&mut out, &event, &sandbox, &session);
+                    write_row(&mut sink, &event, &sandbox, &session);
                 }
-                finalize(out);
+                sink.finalize();
                 return;
             }
             event = rx.recv() => {
                 match event {
                     Some(event) => {
-                        write_row(&mut out, &event, &sandbox, &session);
+                        write_row(&mut sink, &event, &sandbox, &session);
                         since_flush += 1;
                         if since_flush >= flush_every {
-                            let _ = out.flush();
+                            sink.flush();
                             since_flush = 0;
                         }
                     }
                     // All senders dropped: no more events will ever arrive.
                     None => {
-                        finalize(out);
+                        sink.finalize();
                         return;
                     }
                 }
             }
             _ = interval.tick() => {
                 if since_flush > 0 {
-                    let _ = out.flush();
+                    sink.flush();
                     since_flush = 0;
                 }
             }
@@ -223,24 +421,10 @@ async fn run_writer(
     }
 }
 
-/// Flush the buffer and fsync the file. Best-effort: failures degrade the log, never the
-/// caller.
-fn finalize(mut out: BufWriter<std::fs::File>) {
-    let _ = out.flush();
-    if let Ok(file) = out.into_inner() {
-        let _ = file.sync_all();
-    }
-}
-
 /// Serialize one event into a self-describing JSONL row, stamping `{sandbox, session}`, and
-/// append it (newline-terminated). Serialization cannot fail for our event types, so a
-/// failure here is dropped rather than disturbing the writer.
-fn write_row(
-    out: &mut BufWriter<std::fs::File>,
-    event: &AuditEvent,
-    sandbox: &str,
-    session: &str,
-) {
+/// append it through the sink (which handles rotation + ceiling). Serialization cannot fail
+/// for our event types, so a failure here is dropped rather than disturbing the writer.
+fn write_row(sink: &mut SegmentSink, event: &AuditEvent, sandbox: &str, session: &str) {
     let mut value = match serde_json::to_value(event) {
         Ok(serde_json::Value::Object(map)) => map,
         _ => return,
@@ -249,7 +433,7 @@ fn write_row(
     value.insert("session".to_string(), json!(session));
     let mut line = serde_json::Value::Object(value).to_string();
     line.push('\n');
-    let _ = out.write_all(line.as_bytes());
+    sink.write_line(line.as_bytes());
 }
 
 /// Mint a per-boot session id: a millisecond Unix timestamp (sortable) plus a short nonce,
@@ -286,6 +470,171 @@ mod tests {
             .join(sandbox)
             .join(session)
             .join("events-0001.jsonl")
+    }
+
+    /// The `events-NNNN.jsonl` segment files currently present in a session dir, sorted by
+    /// name (which, being zero-padded, is oldest-first).
+    fn segments(audit_dir: &std::path::Path, sandbox: &str, session: &str) -> Vec<PathBuf> {
+        let dir = audit_dir.join(sandbox).join(session);
+        let mut out: Vec<PathBuf> = std::fs::read_dir(&dir)
+            .map(|rd| {
+                rd.filter_map(|e| e.ok())
+                    .map(|e| e.path())
+                    .filter(|p| {
+                        p.file_name()
+                            .and_then(|n| n.to_str())
+                            .is_some_and(|n| n.starts_with("events-") && n.ends_with(".jsonl"))
+                    })
+                    .collect()
+            })
+            .unwrap_or_default();
+        out.sort();
+        out
+    }
+
+    /// Push a `conn_open` event whose `dst` is padded so each serialized row is comfortably
+    /// large, making byte-cap rotation easy to drive with a handful of events.
+    fn send_padded(tx: &mpsc::Sender<AuditEvent>, conn_id: u64) {
+        tx.try_send(AuditEvent::ConnOpen {
+            conn_id,
+            dst: "1.2.3.4:443".into(),
+            sni: Some("x".repeat(200)),
+            conn_kind: ConnKind::Mitm,
+            ts_ms: 1_717_000_000_000,
+        })
+        .unwrap();
+    }
+
+    #[test]
+    fn rolls_to_a_new_segment_at_the_byte_cap() {
+        let tmp = tempfile::tempdir().unwrap();
+        let audit_dir = tmp.path().to_path_buf();
+        // Tiny byte cap: each padded row is ~250 bytes, so every couple of events rolls a
+        // segment. Generous event/sandbox caps so only the byte cap fires here.
+        let mut handle = AuditWriter::spawn(
+            WriterConfig::new(&audit_dir, "web", "sess-rot").with_caps(300, 1_000_000, u64::MAX),
+        )
+        .unwrap();
+        let tx = handle.sender();
+        for id in 0..6 {
+            send_padded(&tx, id);
+        }
+        handle.shutdown();
+
+        let segs = segments(&audit_dir, "web", "sess-rot");
+        assert!(
+            segs.len() >= 2,
+            "byte cap should have rolled multiple segments, got: {segs:#?}"
+        );
+        assert_eq!(
+            segs[0].file_name().unwrap().to_str().unwrap(),
+            "events-0001.jsonl",
+            "first segment keeps the 0001 name"
+        );
+        assert_eq!(
+            segs[1].file_name().unwrap().to_str().unwrap(),
+            "events-0002.jsonl",
+            "rotation increments the segment number"
+        );
+        // Every event survives across the roll: total rows == events sent.
+        let total: usize = segs.iter().map(|p| read_rows(p).len()).sum();
+        assert_eq!(total, 6, "no events lost across rotation");
+    }
+
+    #[test]
+    fn rolls_to_a_new_segment_at_the_event_cap() {
+        let tmp = tempfile::tempdir().unwrap();
+        let audit_dir = tmp.path().to_path_buf();
+        // Cap at 2 events/segment; huge byte/sandbox caps so only the event cap fires.
+        let mut handle = AuditWriter::spawn(
+            WriterConfig::new(&audit_dir, "web", "sess-evt").with_caps(u64::MAX, 2, u64::MAX),
+        )
+        .unwrap();
+        let tx = handle.sender();
+        for id in 0..5 {
+            send_padded(&tx, id);
+        }
+        handle.shutdown();
+
+        let segs = segments(&audit_dir, "web", "sess-evt");
+        // 5 events at 2/segment -> events-0001 (2), 0002 (2), 0003 (1).
+        assert_eq!(
+            segs.len(),
+            3,
+            "event cap should roll every 2 events: {segs:#?}"
+        );
+        assert_eq!(read_rows(&segs[0]).len(), 2, "first segment holds the cap");
+        assert_eq!(read_rows(&segs[1]).len(), 2, "second segment holds the cap");
+        assert_eq!(
+            read_rows(&segs[2]).len(),
+            1,
+            "remainder lands in the last segment"
+        );
+    }
+
+    /// Pull the `conn_id` out of every row across all of a session's segments, oldest-first.
+    fn conn_ids(audit_dir: &std::path::Path, sandbox: &str, session: &str) -> Vec<u64> {
+        segments(audit_dir, sandbox, session)
+            .iter()
+            .flat_map(|p| read_rows(p))
+            .map(|r| r["conn_id"].as_u64().unwrap())
+            .collect()
+    }
+
+    #[test]
+    fn trims_oldest_segments_once_over_the_sandbox_ceiling() {
+        let tmp = tempfile::tempdir().unwrap();
+        let audit_dir = tmp.path().to_path_buf();
+        // Roll on (almost) every row, and a ceiling that fits only a few segments. Sending far
+        // more events than the ceiling holds forces oldest segments to be unlinked while the
+        // writer keeps running.
+        let mut handle = AuditWriter::spawn(
+            WriterConfig::new(&audit_dir, "web", "sess-trim").with_caps(200, u64::MAX, 900),
+        )
+        .unwrap();
+        let tx = handle.sender();
+        for id in 0..20 {
+            send_padded(&tx, id);
+        }
+        handle.shutdown();
+
+        let segs = segments(&audit_dir, "web", "sess-trim");
+        // The ceiling bounds total on-disk size: surviving segments stay within the ceiling
+        // plus at most the active (post-trim) segment's growth — never the full 20-event run.
+        let total_bytes: u64 = segs
+            .iter()
+            .map(|p| std::fs::metadata(p).unwrap().len())
+            .sum();
+        assert!(
+            total_bytes <= 900 + 400,
+            "size ceiling must bound the sandbox dir; got {total_bytes} bytes over {segs:#?}"
+        );
+
+        // The oldest segment was unlinked: events-0001 is gone, the run did not just keep
+        // appending unboundedly.
+        assert!(
+            !audit_dir
+                .join("web")
+                .join("sess-trim")
+                .join("events-0001.jsonl")
+                .exists(),
+            "the oldest segment should have been trimmed"
+        );
+
+        // The active writer was never disrupted: the most recent events survive, and the rows
+        // that remain are the newest contiguous suffix (oldest were dropped, not a hole).
+        let ids = conn_ids(&audit_dir, "web", "sess-trim");
+        assert!(!ids.is_empty(), "recent events must survive the trim");
+        assert_eq!(*ids.last().unwrap(), 19, "the latest event must be present");
+        assert!(
+            ids[0] > 0,
+            "the earliest events were trimmed, not the latest"
+        );
+        let contiguous = ids.windows(2).all(|w| w[1] == w[0] + 1);
+        assert!(
+            contiguous,
+            "survivors are a contiguous newest suffix: {ids:?}"
+        );
     }
 
     #[test]
