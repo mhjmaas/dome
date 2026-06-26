@@ -452,3 +452,97 @@ fn egress_audit_log_records_connection_metadata() {
     rm_sandbox(&name);
     let _ = std::fs::remove_dir_all(audit_sandbox_dir(&name));
 }
+
+/// Per-HTTP-request framing on secret-bound (MITM) connections (#103): the read-only framer
+/// tee'd alongside the substitution relay must turn the decrypted request/response stream into
+/// per-request `http_request` / `http_response` rows carrying the request line, status, sizes,
+/// and timing — without headers (deferred to #107) and without ever logging the real secret.
+/// A `GET` and a body-bearing `POST` on the MITM'd host exercise both no-body and
+/// Content-Length framing (and reframing of the second request after the first body); the blind
+/// tunnel to `example.com` stays metadata-only because the proxy never decrypts it.
+#[test]
+#[ignore]
+fn egress_audit_log_frames_http_requests() {
+    let name = sandbox_name("audit-framing");
+    rm_sandbox(&name);
+    let _ = std::fs::remove_dir_all(audit_sandbox_dir(&name));
+
+    // A GET and a POST (with a body) to the MITM'd host, plus a blind tunnel to example.com.
+    // `--keepalive-time` nudges curl to reuse one connection so the framer reframes the POST
+    // after the GET on the same MITM stream where possible.
+    let guest_cmd = "curl -sS --max-time 25 -H \"Authorization: $ECHO_TOKEN\" \
+         https://postman-echo.com/get > /tmp/get.out 2>&1; \
+         curl -sS --max-time 25 -H \"Authorization: $ECHO_TOKEN\" \
+         -d hello=world https://postman-echo.com/post > /tmp/post.out 2>&1; \
+         curl -sS --max-time 25 https://example.com/ > /tmp/ex.out 2>&1; echo framing-done";
+    let out = Command::new(dome_bin())
+        .env("ECHO_TOKEN", "real-secret-value")
+        .args([
+            "sandbox",
+            "run",
+            &name,
+            "--allow-net",
+            "--secret",
+            "ECHO_TOKEN=ECHO_TOKEN@postman-echo.com",
+            "--",
+            "sh",
+            "-c",
+            guest_cmd,
+        ])
+        .output()
+        .expect("failed to spawn dome — is DOME_BIN correct?");
+    assert!(
+        out.status.success(),
+        "the framed run should succeed; stdout: {}, stderr: {}",
+        String::from_utf8_lossy(&out.stdout),
+        String::from_utf8_lossy(&out.stderr)
+    );
+
+    // Stop the worker so the writer drains and flushes its tail before we read the log.
+    stop_worker(&name);
+
+    let rows = audit_rows(&name);
+    assert!(
+        !rows.is_empty(),
+        "egress should have produced audit rows under audit/{name}/"
+    );
+
+    // The MITM'd GET was framed into an http_request row with its request line and no body.
+    assert!(
+        rows.iter().any(|r| r.contains("\"kind\":\"http_request\"")
+            && r.contains("\"method\":\"GET\"")
+            && r.contains("\"path\":\"/get\"")),
+        "expected an http_request row for GET /get; rows: {rows:#?}"
+    );
+    // The body-bearing POST was framed too, with its Content-Length body length captured.
+    assert!(
+        rows.iter().any(|r| r.contains("\"kind\":\"http_request\"")
+            && r.contains("\"method\":\"POST\"")
+            && r.contains("\"path\":\"/post\"")
+            && r.contains("\"body_bytes\":11")),
+        "expected an http_request row for POST /post with body_bytes=11; rows: {rows:#?}"
+    );
+    // The response side was framed symmetrically into an http_response row.
+    assert!(
+        rows.iter().any(|r| r.contains("\"kind\":\"http_response\"")
+            && r.contains("\"status\":200")),
+        "expected an http_response row with status 200; rows: {rows:#?}"
+    );
+    // Header capture is deferred to #107: no header values are logged in this slice. The real
+    // secret value never appears even though the guest sent it as an Authorization header.
+    assert!(
+        !rows.iter().any(|r| r.contains("real-secret-value")),
+        "the real secret value must never enter the audit log; rows: {rows:#?}"
+    );
+    // The blind tunnel is never decrypted, so no http_request/http_response is attributable to
+    // it — every framed row belongs to the MITM'd host, which only ever has /get and /post.
+    assert!(
+        !rows.iter().any(|r| r.contains("\"kind\":\"http_request\"")
+            && !r.contains("\"path\":\"/get\"")
+            && !r.contains("\"path\":\"/post\"")),
+        "no http_request rows should exist beyond the MITM'd host's paths; rows: {rows:#?}"
+    );
+
+    rm_sandbox(&name);
+    let _ = std::fs::remove_dir_all(audit_sandbox_dir(&name));
+}

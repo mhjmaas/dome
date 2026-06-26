@@ -514,6 +514,7 @@ dependencies = [
 name = "dome-audit"
 version = "0.1.0"
 dependencies = [
+ "httparse",
  "serde",
  "serde_json",
  "tempfile",

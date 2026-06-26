@@ -54,4 +54,58 @@ pub enum AuditEvent {
         /// Wall-clock close time, milliseconds since the Unix epoch.
         ts_ms: u64,
     },
+    /// One HTTP request seen on a MITM connection. Emitted the moment the request
+    /// head is fully parsed (before the body is consumed), so it suits a live tail.
+    /// Carries the request line and sizes only — no headers (deferred to the
+    /// redaction slice). The bytes are captured guest-side, pre-substitution, so the
+    /// real secret value can never appear here.
+    HttpRequest {
+        conn_id: u64,
+        /// Request method, e.g. `GET`, `POST`.
+        method: String,
+        /// Request target (path + query) exactly as sent.
+        path: String,
+        /// HTTP minor version (`1` for HTTP/1.1, `0` for HTTP/1.0).
+        http_minor: u8,
+        /// Bytes of the request head (request line + headers + terminating CRLFCRLF).
+        head_bytes: u64,
+        /// Declared body length from `Content-Length`; `None` when the body is
+        /// `chunked` or otherwise indeterminate at head-parse time.
+        #[serde(skip_serializing_if = "Option::is_none")]
+        body_bytes: Option<u64>,
+        /// Wall-clock time the head was parsed, milliseconds since the Unix epoch.
+        ts_ms: u64,
+    },
+    /// One HTTP response seen on a MITM connection. Emitted when the status line +
+    /// headers are parsed. Pairs with the [`AuditEvent::HttpRequest`] of the same
+    /// `conn_id` by order (HTTP/1.1 preserves request/response ordering).
+    HttpResponse {
+        conn_id: u64,
+        /// Status code, e.g. `200`, `404`.
+        status: u16,
+        /// Reason phrase, e.g. `OK`; empty when absent.
+        #[serde(skip_serializing_if = "String::is_empty")]
+        reason: String,
+        /// HTTP minor version.
+        http_minor: u8,
+        /// Bytes of the response head (status line + headers + terminating CRLFCRLF).
+        head_bytes: u64,
+        /// Declared body length from `Content-Length`; `None` when `chunked` or
+        /// read-until-close.
+        #[serde(skip_serializing_if = "Option::is_none")]
+        body_bytes: Option<u64>,
+        ts_ms: u64,
+    },
+    /// The framer hit something it cannot parse on a MITM connection (an unexpected
+    /// encoding, a protocol upgrade, HTTP/2 over the tunnel, or a desync) and has
+    /// stopped framing that connection. Emitted once per affected direction; the
+    /// connection's traffic is never affected — the log degrades, not the network.
+    Unparsed {
+        conn_id: u64,
+        /// Which side desynced: `"request"` or `"response"`.
+        direction: &'static str,
+        /// Short, non-sensitive reason, e.g. `"chunked size"` or `"http2 preface"`.
+        reason: &'static str,
+        ts_ms: u64,
+    },
 }

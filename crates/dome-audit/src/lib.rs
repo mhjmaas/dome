@@ -10,7 +10,9 @@
 //! `try_send`s into a bounded channel and never blocks egress on the audit subsystem.
 
 mod event;
+mod framer;
 mod writer;
 
 pub use event::{AuditEvent, ConnKind};
+pub use framer::{Direction, FrameEvent, HttpFramer};
 pub use writer::{mint_session, AuditHandle, AuditWriter, WriterConfig};
