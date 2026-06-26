@@ -372,13 +372,22 @@ impl Body {
 /// Determine how the body after a head is framed from its headers (RFC 9112 §6).
 fn body_length(headers: &[httparse::Header], ctx: BodyContext) -> Result<Body, &'static str> {
     let mut content_length: Option<u64> = None;
-    let mut chunked = false;
+    // Whether any `Transfer-Encoding` header is present, and whether the *final* (rightmost)
+    // transfer-coding across them is `chunked`. Only a chunked *final* coding makes the body
+    // self-delimiting (RFC 9112 §6.1); anything else (e.g. `chunked, gzip`) we cannot frame.
+    let mut te_present = false;
+    let mut te_final_chunked = false;
     for h in headers {
         if h.name.eq_ignore_ascii_case("transfer-encoding") {
-            // The final encoding being "chunked" makes the body self-delimiting.
             if let Ok(v) = std::str::from_utf8(h.value) {
-                if v.split(',').any(|t| t.trim().eq_ignore_ascii_case("chunked")) {
-                    chunked = true;
+                for tok in v.split(',') {
+                    let tok = tok.trim();
+                    if tok.is_empty() {
+                        continue;
+                    }
+                    te_present = true;
+                    // The last non-empty token across all TE headers wins.
+                    te_final_chunked = tok.eq_ignore_ascii_case("chunked");
                 }
             }
         } else if h.name.eq_ignore_ascii_case("content-length") {
@@ -386,17 +395,31 @@ fn body_length(headers: &[httparse::Header], ctx: BodyContext) -> Result<Body, &
                 .ok()
                 .and_then(|s| s.trim().parse::<u64>().ok());
             match v {
-                Some(n) => content_length = Some(n),
+                // Duplicate but *conflicting* Content-Length is a smuggling vector: a downstream
+                // proxy may honor the first while we honored the last, desyncing the framer.
+                // Refuse to guess, exactly as for the chunked+length conflict below.
+                Some(n) => match content_length {
+                    Some(prev) if prev != n => return Err("conflicting length"),
+                    _ => content_length = Some(n),
+                },
                 None => return Err("bad content-length"),
             }
         }
     }
-    // Both present is a request-smuggling vector; refuse to guess rather than desync.
-    if chunked && content_length.is_some() {
+    // Transfer-Encoding and Content-Length together is a request-smuggling vector; refuse to
+    // guess rather than desync.
+    if te_present && content_length.is_some() {
         return Err("conflicting length");
     }
-    if chunked {
-        return Ok(Body::Chunked);
+    if te_present {
+        // Only a chunked *final* coding is self-delimiting. A non-chunked final coding
+        // (e.g. `gzip`, or `chunked, gzip`) leaves the body length indeterminate to the
+        // framer — stop rather than mis-skip bytes and desync the next message.
+        return if te_final_chunked {
+            Ok(Body::Chunked)
+        } else {
+            Err("transfer-encoding")
+        };
     }
     if let Some(n) = content_length {
         return Ok(Body::Fixed(n));
@@ -671,6 +694,71 @@ mod tests {
         assert_eq!(
             events,
             vec![FrameEvent::Unparsed { reason: "conflicting length" }]
+        );
+    }
+
+    #[test]
+    fn conflicting_duplicate_content_length_yields_unparsed() {
+        let mut f = HttpFramer::new(Direction::Request);
+        // Two distinct Content-Length values: a downstream proxy may honor the first while we
+        // honor the last, so we refuse to frame rather than desync the next request.
+        let events = f.push(
+            b"POST /x HTTP/1.1\r\nContent-Length: 10\r\nContent-Length: 20\r\n\r\n",
+        );
+        assert_eq!(
+            events,
+            vec![FrameEvent::Unparsed { reason: "conflicting length" }]
+        );
+    }
+
+    #[test]
+    fn duplicate_identical_content_length_is_accepted() {
+        let mut f = HttpFramer::new(Direction::Request);
+        // Repeated *identical* Content-Length is unambiguous (RFC 9110 §8.6) — frame normally,
+        // skipping the declared 3-byte body, then reframe the pipelined GET.
+        let events = f.push(
+            b"POST /x HTTP/1.1\r\nContent-Length: 3\r\nContent-Length: 3\r\n\r\nabc\
+              GET /next HTTP/1.1\r\n\r\n",
+        );
+        assert_eq!(
+            req_lines(&events),
+            vec![
+                ("POST".into(), "/x".into(), Some(3)),
+                ("GET".into(), "/next".into(), Some(0)),
+            ]
+        );
+    }
+
+    #[test]
+    fn non_chunked_final_transfer_encoding_yields_unparsed() {
+        let mut f = HttpFramer::new(Direction::Request);
+        // `chunked, gzip` makes gzip — not chunked — the framing layer, so the body is not
+        // self-delimiting to the framer. Stop rather than mis-skip bytes.
+        let events = f.push(
+            b"POST /x HTTP/1.1\r\nTransfer-Encoding: chunked, gzip\r\n\r\n",
+        );
+        assert_eq!(
+            events,
+            vec![FrameEvent::Unparsed { reason: "transfer-encoding" }]
+        );
+    }
+
+    #[test]
+    fn final_chunked_after_other_codings_frames_as_chunked() {
+        let mut f = HttpFramer::new(Direction::Request);
+        // `gzip, chunked` — chunked is the final (framing) coding, so the chunked machine drives
+        // body skipping and the pipelined GET reframes.
+        let events = f.push(
+            b"POST /c HTTP/1.1\r\nTransfer-Encoding: gzip, chunked\r\n\r\n\
+              4\r\nWiki\r\n0\r\n\r\n\
+              GET /after HTTP/1.1\r\n\r\n",
+        );
+        assert_eq!(
+            req_lines(&events),
+            vec![
+                ("POST".into(), "/c".into(), None),
+                ("GET".into(), "/after".into(), Some(0)),
+            ]
         );
     }
 
