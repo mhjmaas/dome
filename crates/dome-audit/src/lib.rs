@@ -17,4 +17,4 @@ mod writer;
 pub use event::{AuditEvent, ConnKind};
 pub use framer::{Direction, FrameEvent, HttpFramer};
 pub use redact::{attribute_placeholders, is_sensitive_header, scrub_header, PlaceholderNames};
-pub use writer::{mint_session, AuditHandle, AuditWriter, WriterConfig};
+pub use writer::{mint_session, AuditHandle, AuditSink, AuditWriter, WriterConfig};

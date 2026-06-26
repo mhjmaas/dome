@@ -648,6 +648,98 @@ fn egress_audit_log_redacts_and_attributes_headers() {
     let _ = std::fs::remove_dir_all(audit_sandbox_dir(&name));
 }
 
+/// Drop accounting / fail-open made visible (#105), end-to-end through the real boot path. The
+/// proxy→writer channel is bounded and senders `try_send` (never block egress); when the guest
+/// floods egress faster than the writer drains, events are dropped — and that gap must be
+/// *labeled* rather than lost silently. We force a depth-1 channel via `DOME_AUDIT_CHANNEL_CAPACITY`
+/// (resolved client-side, never read in the shared worker — same threading as the rotation caps)
+/// and fire a thundering herd of concurrent connections so the burst of `conn_open`/`conn_close`
+/// events outruns the writer. We then assert that at least one `dropped { count }` marker with a
+/// positive count was materialized directly to the log, that the markers are self-describing, and
+/// that the secret-capture invariant still holds (the real secret never appears) even under flood.
+#[test]
+#[ignore]
+fn egress_audit_log_labels_dropped_events_under_overload() {
+    let name = sandbox_name("audit-drops");
+    rm_sandbox(&name);
+    let _ = std::fs::remove_dir_all(audit_sandbox_dir(&name));
+
+    // A thundering herd: 60 backgrounded curls open near-simultaneously, so a burst of
+    // conn_open events slams a depth-1 channel far faster than the writer drains one at a time —
+    // forcing try_send to see Full and the sink to count drops. A final secret-bound MITM curl
+    // re-checks the capture invariant under load.
+    let guest_cmd = "for i in $(seq 1 60); do \
+         curl -sS --max-time 25 https://example.com/ > /dev/null 2>&1 & done; wait; \
+         curl -sS --max-time 25 -H \"Authorization: $ECHO_TOKEN\" \
+         https://postman-echo.com/get > /dev/null 2>&1; echo drops-done";
+    let out = Command::new(dome_bin())
+        .env("ECHO_TOKEN", "real-secret-value")
+        // Depth-1 channel: the smallest bound, so even a modest concurrent burst saturates it.
+        .env("DOME_AUDIT_CHANNEL_CAPACITY", "1")
+        .args([
+            "sandbox",
+            "run",
+            &name,
+            "--allow-net",
+            "--secret",
+            "ECHO_TOKEN=ECHO_TOKEN@postman-echo.com",
+            "--",
+            "sh",
+            "-c",
+            guest_cmd,
+        ])
+        .output()
+        .expect("failed to spawn dome — is DOME_BIN correct?");
+    assert!(
+        out.status.success(),
+        "the audited run should succeed; stdout: {}, stderr: {}",
+        String::from_utf8_lossy(&out.stdout),
+        String::from_utf8_lossy(&out.stderr)
+    );
+
+    // Stop the worker so the writer drains and labels the final gap before we read the log.
+    stop_worker(&name);
+
+    let rows = audit_rows(&name);
+    assert!(
+        !rows.is_empty(),
+        "egress should have produced audit rows under audit/{name}/"
+    );
+
+    // The flood produced at least one labeled gap: a `dropped` record materialized directly to
+    // the file (it could never have travelled the channel that overflowed) carrying a positive
+    // count of events lost since the previous marker.
+    let dropped: Vec<&String> = rows
+        .iter()
+        .filter(|r| r.contains("\"kind\":\"dropped\""))
+        .collect();
+    assert!(
+        !dropped.is_empty(),
+        "a saturated channel must label the gap with a `dropped` record; rows: {rows:#?}"
+    );
+    // Each marker is self-describing (stamped identity) and reports a non-zero count.
+    assert!(
+        dropped
+            .iter()
+            .all(|r| r.contains(&format!("\"sandbox\":\"{name}\"")) && r.contains("\"session\":")),
+        "dropped markers must carry the sandbox/session identity; markers: {dropped:#?}"
+    );
+    assert!(
+        dropped
+            .iter()
+            .all(|r| !r.contains("\"count\":0") && r.contains("\"count\":")),
+        "a dropped marker is only written for a real gap (count > 0); markers: {dropped:#?}"
+    );
+    // Fail-open visibility never compromises the capture invariant: the real secret is absent.
+    assert!(
+        !rows.iter().any(|r| r.contains("real-secret-value")),
+        "the real secret value must never enter the audit log; rows: {rows:#?}"
+    );
+
+    rm_sandbox(&name);
+    let _ = std::fs::remove_dir_all(audit_sandbox_dir(&name));
+}
+
 /// Segment rotation + inline size-ceiling retention (#104), end-to-end through the real boot
 /// path. The writer rolls to `events-NNNN.jsonl` once a segment hits its cap and, immediately
 /// after each roll, unlinks the oldest segments across the sandbox until under the per-sandbox

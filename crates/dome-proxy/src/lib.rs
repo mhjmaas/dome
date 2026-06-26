@@ -98,13 +98,14 @@ pub fn create_socketpair() -> anyhow::Result<(RawFd, RawFd)> {
 ///
 /// - `host_fd`: the host end of the socketpair (raw L2 Ethernet frames)
 /// - `config`: proxy configuration (secrets, network rules)
-/// - `audit_tx`: optional egress-audit sink. `Some(_)` makes the proxy emit lean
-///   `conn_open`/`conn_close` events (fail-open `try_send`, never blocking egress);
-///   `None` disables auditing with no behavioral change.
+/// - `audit_sink`: optional egress-audit sink. `Some(_)` makes the proxy emit lean
+///   `conn_open`/`conn_close` events (fail-open `try_send`, never blocking egress; a full
+///   channel drops the event and bumps the sink's drop counter); `None` disables auditing
+///   with no behavioral change.
 pub fn start(
     host_fd: RawFd,
     config: ProxyConfig,
-    audit_tx: Option<mpsc::Sender<dome_audit::AuditEvent>>,
+    audit_sink: Option<dome_audit::AuditSink>,
 ) -> anyhow::Result<ProxyHandle> {
     // Install rustls crypto provider (process-wide, idempotent)
     let _ = rustls::crypto::aws_lc_rs::default_provider().install_default();
@@ -156,7 +157,7 @@ pub fn start(
                     proxy_placeholders,
                     proxy_allowed_ips,
                     proxy_dns_cache,
-                    audit_tx,
+                    audit_sink,
                 );
                 engine.run().await;
             });
