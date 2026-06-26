@@ -528,8 +528,8 @@ fn egress_audit_log_frames_http_requests() {
             && r.contains("\"status\":200")),
         "expected an http_response row with status 200; rows: {rows:#?}"
     );
-    // Header capture is deferred to #107: no header values are logged in this slice. The real
-    // secret value never appears even though the guest sent it as an Authorization header.
+    // The real secret value never appears even though the guest sent it as an Authorization
+    // header (header redaction is exercised in detail by the #107 test).
     assert!(
         !rows.iter().any(|r| r.contains("real-secret-value")),
         "the real secret value must never enter the audit log; rows: {rows:#?}"
@@ -541,6 +541,85 @@ fn egress_audit_log_frames_http_requests() {
             && !r.contains("\"path\":\"/get\"")
             && !r.contains("\"path\":\"/post\"")),
         "no http_request rows should exist beyond the MITM'd host's paths; rows: {rows:#?}"
+    );
+
+    rm_sandbox(&name);
+    let _ = std::fs::remove_dir_all(audit_sandbox_dir(&name));
+}
+
+/// Header capture + placeholder-aware redaction + attribution on MITM connections (#107):
+/// `http_request` rows now carry headers, but every header is scrubbed at capture so a raw
+/// credential never reaches the log. The guest sends `Authorization: $ECHO_TOKEN`, where the
+/// guest-visible value is a dome placeholder; the proxy framer must record that header as the
+/// attribution tag `<secret:ECHO_TOKEN>` (naming which secret was used) while a non-sensitive
+/// header like `Host` passes through verbatim. The real secret value must never appear.
+#[test]
+#[ignore]
+fn egress_audit_log_redacts_and_attributes_headers() {
+    let name = sandbox_name("audit-headers");
+    rm_sandbox(&name);
+    let _ = std::fs::remove_dir_all(audit_sandbox_dir(&name));
+
+    // One GET to the MITM'd host carrying the secret in an Authorization header.
+    let guest_cmd = "curl -sS --max-time 25 -H \"Authorization: Bearer $ECHO_TOKEN\" \
+         https://postman-echo.com/get > /tmp/get.out 2>&1; echo headers-done";
+    let out = Command::new(dome_bin())
+        .env("ECHO_TOKEN", "real-secret-value")
+        .args([
+            "sandbox",
+            "run",
+            &name,
+            "--allow-net",
+            "--secret",
+            "ECHO_TOKEN=ECHO_TOKEN@postman-echo.com",
+            "--",
+            "sh",
+            "-c",
+            guest_cmd,
+        ])
+        .output()
+        .expect("failed to spawn dome — is DOME_BIN correct?");
+    assert!(
+        out.status.success(),
+        "the audited run should succeed; stdout: {}, stderr: {}",
+        String::from_utf8_lossy(&out.stdout),
+        String::from_utf8_lossy(&out.stderr)
+    );
+
+    // Stop the worker so the writer drains and flushes its tail before we read the log.
+    stop_worker(&name);
+
+    let rows = audit_rows(&name);
+    assert!(
+        !rows.is_empty(),
+        "egress should have produced audit rows under audit/{name}/"
+    );
+
+    // The Authorization header was captured but redacted to its attribution tag: the request
+    // is recorded as having used the ECHO_TOKEN secret, without the placeholder or real value.
+    assert!(
+        rows.iter().any(|r| r.contains("\"kind\":\"http_request\"")
+            && r.contains("\"path\":\"/get\"")
+            && r.contains("<secret:ECHO_TOKEN>")),
+        "expected the GET /get request row to attribute its Authorization header to \
+         <secret:ECHO_TOKEN>; rows: {rows:#?}"
+    );
+    // A non-sensitive header passes through verbatim, so the row carries real header context.
+    assert!(
+        rows.iter().any(|r| r.contains("\"kind\":\"http_request\"")
+            && r.contains("postman-echo.com")),
+        "expected the request row to carry the verbatim Host header; rows: {rows:#?}"
+    );
+    // The real secret value never reaches the log, even as a redacted header.
+    assert!(
+        !rows.iter().any(|r| r.contains("real-secret-value")),
+        "the real secret value must never enter the audit log; rows: {rows:#?}"
+    );
+    // The raw placeholder token must not survive in the log either — a sensitive header
+    // carrying it is rewritten to the attribution tag, never the bare token.
+    assert!(
+        !rows.iter().any(|r| r.contains("dome_tok_")),
+        "the raw placeholder token must not appear in the audit log; rows: {rows:#?}"
     );
 
     rm_sandbox(&name);

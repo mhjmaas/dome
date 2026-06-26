@@ -56,9 +56,9 @@ pub enum AuditEvent {
     },
     /// One HTTP request seen on a MITM connection. Emitted the moment the request
     /// head is fully parsed (before the body is consumed), so it suits a live tail.
-    /// Carries the request line and sizes only — no headers (deferred to the
-    /// redaction slice). The bytes are captured guest-side, pre-substitution, so the
-    /// real secret value can never appear here.
+    /// The bytes are captured guest-side, pre-substitution, and every header value is
+    /// scrubbed at capture (see [`crate::scrub_header`]) before it reaches this event, so
+    /// the real secret value can never appear here.
     HttpRequest {
         conn_id: u64,
         /// Request method, e.g. `GET`, `POST`.
@@ -73,6 +73,11 @@ pub enum AuditEvent {
         /// `chunked` or otherwise indeterminate at head-parse time.
         #[serde(skip_serializing_if = "Option::is_none")]
         body_bytes: Option<u64>,
+        /// Request headers `(name, value)` in wire order. Sensitive values are redacted —
+        /// a dome placeholder becomes `<secret:NAME>`, an unrecognized credential becomes
+        /// `<redacted len=N>` — so a raw credential is never present here.
+        #[serde(skip_serializing_if = "Vec::is_empty")]
+        headers: Vec<(String, String)>,
         /// Wall-clock time the head was parsed, milliseconds since the Unix epoch.
         ts_ms: u64,
     },
@@ -94,6 +99,10 @@ pub enum AuditEvent {
         /// read-until-close.
         #[serde(skip_serializing_if = "Option::is_none")]
         body_bytes: Option<u64>,
+        /// Response headers `(name, value)` in wire order, redacted the same way as
+        /// [`AuditEvent::HttpRequest::headers`].
+        #[serde(skip_serializing_if = "Vec::is_empty")]
+        headers: Vec<(String, String)>,
         ts_ms: u64,
     },
     /// The framer hit something it cannot parse on a MITM connection (an unexpected

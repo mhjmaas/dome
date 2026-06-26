@@ -5,7 +5,7 @@ use std::sync::Arc;
 use std::time::{Instant, SystemTime, UNIX_EPOCH};
 
 use boring::ssl::{SslConnector, SslMethod};
-use dome_audit::{AuditEvent, ConnKind, Direction, HttpFramer};
+use dome_audit::{AuditEvent, ConnKind, Direction, HttpFramer, PlaceholderNames};
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::TcpStream;
 use tokio::sync::mpsc;
@@ -32,6 +32,9 @@ pub struct ProxyEngine {
     cmd_tx: mpsc::UnboundedSender<StackCommand>,
     connections: HashMap<ConnectionId, mpsc::UnboundedSender<Vec<u8>>>,
     placeholders: Arc<HashMap<String, String>>,
+    /// Inverse of `placeholders` (`placeholder → secret-name`), handed to the audit framer so
+    /// it can attribute a placeholder seen in a sensitive header to the secret it stands for.
+    placeholder_names: Arc<PlaceholderNames>,
     ca: Arc<tokio::sync::Mutex<CertificateAuthority>>,
     upstream_ssl: SslConnector,
     allowed_ips: AllowedIps,
@@ -60,12 +63,20 @@ impl ProxyEngine {
         builder.set_alpn_protos(b"\x08http/1.1").expect("ALPN");
         let upstream_ssl = builder.build();
 
+        // Invert `name → placeholder` into `placeholder → name` once, up front, so the framer
+        // can name the secret behind a placeholder it sees in a sensitive header.
+        let placeholder_names: PlaceholderNames = placeholders
+            .iter()
+            .map(|(name, placeholder)| (placeholder.clone(), name.clone()))
+            .collect();
+
         ProxyEngine {
             config: Arc::new(config),
             event_rx,
             cmd_tx,
             connections: HashMap::new(),
             placeholders: Arc::new(placeholders),
+            placeholder_names: Arc::new(placeholder_names),
             ca: Arc::new(tokio::sync::Mutex::new(ca)),
             upstream_ssl,
             allowed_ips,
@@ -122,6 +133,7 @@ impl ProxyEngine {
         let config = self.config.clone();
         let ca = self.ca.clone();
         let placeholders = self.placeholders.clone();
+        let placeholder_names = self.placeholder_names.clone();
         let upstream_ssl = self.upstream_ssl.clone();
         let allowed_ips = self.allowed_ips.clone();
 
@@ -138,6 +150,7 @@ impl ProxyEngine {
                 &config,
                 ca,
                 &placeholders,
+                placeholder_names,
                 upstream_ssl,
                 &allowed_ips,
                 audit,
@@ -234,6 +247,7 @@ async fn handle_connection(
     config: &ProxyConfig,
     ca: Arc<tokio::sync::Mutex<CertificateAuthority>>,
     placeholders: &HashMap<String, String>,
+    placeholder_names: Arc<PlaceholderNames>,
     upstream_ssl: SslConnector,
     allowed_ips: &AllowedIps,
     mut audit: ConnAudit,
@@ -347,6 +361,7 @@ async fn handle_connection(
                     cmd_tx,
                     ca,
                     substitutions,
+                    placeholder_names,
                     upstream_ssl,
                     &audit,
                 )
@@ -442,6 +457,7 @@ async fn handle_mitm(
     cmd_tx: mpsc::UnboundedSender<StackCommand>,
     ca: Arc<tokio::sync::Mutex<CertificateAuthority>>,
     substitutions: Vec<(String, String)>,
+    placeholder_names: Arc<PlaceholderNames>,
     upstream_ssl: SslConnector,
     audit: &ConnAudit,
 ) -> anyhow::Result<()> {
@@ -475,10 +491,14 @@ async fn handle_mitm(
     // real secret's length. Substitution is left exactly as-is — capture is observe-only.
     let bytes_tx = audit.bytes_tx.clone();
     let req_tx = audit_tx.clone();
+    let req_names = placeholder_names.clone();
     let guest_to_upstream = async move {
         // Tee a read-only HTTP framer over the pre-substitution guest bytes: the guest-side
-        // view contains only placeholders, so the real secret can never enter the log.
-        let mut framer = req_tx.as_ref().map(|_| HttpFramer::new(Direction::Request));
+        // view contains only placeholders, so the real secret can never enter the log. The
+        // placeholder→name map lets the framer attribute a placeholder in a sensitive header.
+        let mut framer = req_tx
+            .as_ref()
+            .map(|_| HttpFramer::with_names(Direction::Request, req_names));
         let mut buf = vec![0u8; 65536];
         loop {
             match guest_rd.read(&mut buf).await {
@@ -504,8 +524,11 @@ async fn handle_mitm(
 
     let bytes_rx = audit.bytes_rx.clone();
     let resp_tx = audit_tx.clone();
+    let resp_names = placeholder_names.clone();
     let upstream_to_guest = async move {
-        let mut framer = resp_tx.as_ref().map(|_| HttpFramer::new(Direction::Response));
+        let mut framer = resp_tx
+            .as_ref()
+            .map(|_| HttpFramer::with_names(Direction::Response, resp_names));
         let mut buf = vec![0u8; 65536];
         loop {
             match upstream_rd.read(&mut buf).await {
