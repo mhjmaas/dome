@@ -339,3 +339,116 @@ fn rm_then_prune_reclaims_orphans_while_keeping_referenced() {
     rm_sandbox(&victim);
     rm_sandbox(&keeper);
 }
+
+/// The sandbox's central audit directory (`audit/<name>/`), which outlives the sandbox.
+fn audit_sandbox_dir(name: &str) -> String {
+    let home = std::env::var("HOME").unwrap_or_else(|_| "/tmp".to_string());
+    format!("{}/.local/share/dome/audit/{}", home, name)
+}
+
+/// Read every audit row across all of a sandbox's sessions as raw JSONL lines.
+fn audit_rows(name: &str) -> Vec<String> {
+    let mut rows = Vec::new();
+    let Ok(sessions) = std::fs::read_dir(audit_sandbox_dir(name)) else {
+        return rows;
+    };
+    for session in sessions.filter_map(|e| e.ok()) {
+        let segment = session.path().join("events-0001.jsonl");
+        if let Ok(text) = std::fs::read_to_string(&segment) {
+            rows.extend(text.lines().map(str::to_string));
+        }
+    }
+    rows
+}
+
+/// End-to-end spine of the egress audit log (#102): a real sandbox making egress produces
+/// self-describing JSONL metadata rows under a central `audit/` root that survives the
+/// sandbox. One connection is secret-bound (MITM: `postman-echo.com` carries an
+/// `Authorization` secret) and one is not (blind tunnel: `example.com`); both must appear as
+/// `conn_open`/`conn_close` rows stamped with the sandbox identity and carrying SNI, kind,
+/// and byte counts. The proxy never decrypts the blind tunnel, so that row is metadata-only.
+#[test]
+#[ignore]
+fn egress_audit_log_records_connection_metadata() {
+    let name = sandbox_name("audit-spine");
+    rm_sandbox(&name);
+    // Clear any audit logs from a previous run of this test so we read only this boot's rows.
+    let _ = std::fs::remove_dir_all(audit_sandbox_dir(&name));
+
+    // `--allow-net` (all hosts) + a secret bound to postman-echo.com: that host is MITM'd
+    // (rich, decryptable), example.com is a plain blind tunnel (metadata only). The guest's
+    // own egress to both is what produces the audit rows; the guest output is irrelevant.
+    let guest_cmd = "curl -sS --max-time 25 -H \"Authorization: $ECHO_TOKEN\" \
+         https://postman-echo.com/get > /tmp/echo.out 2>&1; \
+         curl -sS --max-time 25 https://example.com/ > /tmp/ex.out 2>&1; echo audit-done";
+    let out = Command::new(dome_bin())
+        .env("ECHO_TOKEN", "real-secret-value")
+        .args([
+            "sandbox",
+            "run",
+            &name,
+            "--allow-net",
+            "--secret",
+            "ECHO_TOKEN=ECHO_TOKEN@postman-echo.com",
+            "--",
+            "sh",
+            "-c",
+            guest_cmd,
+        ])
+        .output()
+        .expect("failed to spawn dome — is DOME_BIN correct?");
+    assert!(
+        out.status.success(),
+        "the audited run should succeed; stdout: {}, stderr: {}",
+        String::from_utf8_lossy(&out.stdout),
+        String::from_utf8_lossy(&out.stderr)
+    );
+
+    // Stop the worker so the writer drains and flushes its tail before we read the log.
+    stop_worker(&name);
+
+    let rows = audit_rows(&name);
+    assert!(
+        !rows.is_empty(),
+        "egress should have produced audit rows under audit/{name}/"
+    );
+    // Every row is self-describing: stamped with the sandbox identity by the writer.
+    assert!(
+        rows.iter().all(|r| r.contains(&format!("\"sandbox\":\"{name}\""))),
+        "every row must carry the sandbox identity; rows: {rows:#?}"
+    );
+    assert!(
+        rows.iter().all(|r| r.contains("\"session\":")),
+        "every row must carry its session; rows: {rows:#?}"
+    );
+
+    // The secret-bound host was MITM'd: a conn_open row tagged mitm with its SNI.
+    assert!(
+        rows.iter().any(|r| r.contains("\"kind\":\"conn_open\"")
+            && r.contains("\"conn_kind\":\"mitm\"")
+            && r.contains("\"sni\":\"postman-echo.com\"")),
+        "expected a MITM conn_open for the secret-bound host; rows: {rows:#?}"
+    );
+    // The non-secret host was a blind tunnel: metadata only, never decrypted.
+    assert!(
+        rows.iter().any(|r| r.contains("\"kind\":\"conn_open\"")
+            && r.contains("\"conn_kind\":\"blind_tunnel\"")
+            && r.contains("\"sni\":\"example.com\"")),
+        "expected a blind-tunnel conn_open for the non-secret host; rows: {rows:#?}"
+    );
+    // Connections closed: at least one conn_close with byte accounting was recorded.
+    assert!(
+        rows.iter().any(|r| r.contains("\"kind\":\"conn_close\"")
+            && r.contains("\"bytes_rx\":")
+            && r.contains("\"bytes_tx\":")),
+        "expected a conn_close row with byte counts; rows: {rows:#?}"
+    );
+    // The real secret value must never appear in the audit log.
+    assert!(
+        !rows.iter().any(|r| r.contains("real-secret-value")),
+        "the real secret value must never enter the audit log; rows: {rows:#?}"
+    );
+
+    rm_sandbox(&name);
+    let _ = std::fs::remove_dir_all(audit_sandbox_dir(&name));
+}

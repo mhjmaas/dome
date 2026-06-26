@@ -1,8 +1,11 @@
 use std::collections::HashMap;
 use std::net::SocketAddr;
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
+use std::time::{Instant, SystemTime, UNIX_EPOCH};
 
 use boring::ssl::{SslConnector, SslMethod};
+use dome_audit::{AuditEvent, ConnKind};
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::TcpStream;
 use tokio::sync::mpsc;
@@ -33,9 +36,14 @@ pub struct ProxyEngine {
     upstream_ssl: SslConnector,
     allowed_ips: AllowedIps,
     dns_cache: crate::dns::SharedDnsCache,
+    audit_tx: Option<mpsc::Sender<AuditEvent>>,
+    /// Monotonic per-session connection id, assigned as each connection opens. Stable and
+    /// unambiguous within a `{sandbox, session}`.
+    next_conn_id: u64,
 }
 
 impl ProxyEngine {
+    #[allow(clippy::too_many_arguments)]
     pub fn new(
         config: ProxyConfig,
         event_rx: mpsc::UnboundedReceiver<StackEvent>,
@@ -44,6 +52,7 @@ impl ProxyEngine {
         placeholders: HashMap<String, String>,
         allowed_ips: AllowedIps,
         dns_cache: crate::dns::SharedDnsCache,
+        audit_tx: Option<mpsc::Sender<AuditEvent>>,
     ) -> Self {
         // BoringSSL upstream connector — Chrome's TLS stack so Cloudflare
         // doesn't reject our MITM connections based on JA3/JA4 fingerprint.
@@ -61,6 +70,8 @@ impl ProxyEngine {
             upstream_ssl,
             allowed_ips,
             dns_cache,
+            audit_tx,
+            next_conn_id: 0,
         }
     }
 
@@ -114,6 +125,10 @@ impl ProxyEngine {
         let upstream_ssl = self.upstream_ssl.clone();
         let allowed_ips = self.allowed_ips.clone();
 
+        let conn_id = self.next_conn_id;
+        self.next_conn_id += 1;
+        let audit = ConnAudit::new(self.audit_tx.clone(), conn_id);
+
         tokio::spawn(async move {
             if let Err(e) = handle_connection(
                 conn.id,
@@ -125,11 +140,78 @@ impl ProxyEngine {
                 &placeholders,
                 upstream_ssl,
                 &allowed_ips,
+                audit,
             )
             .await
             {
                 debug!("connection to {} ended: {e}", conn.dst);
             }
+        });
+    }
+}
+
+/// Current wall-clock time in milliseconds since the Unix epoch.
+fn now_ms() -> u64 {
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_millis() as u64
+}
+
+/// Observe-and-emit audit helper for one connection. Tracks the open instant and byte
+/// counters, and emits `conn_open`/`conn_close` events fail-open. When the proxy was
+/// started without an audit sink (`audit_tx == None`) every method is a no-op, so the
+/// network paths carry it unconditionally without branching.
+struct ConnAudit {
+    tx: Option<mpsc::Sender<AuditEvent>>,
+    conn_id: u64,
+    started: Instant,
+    /// Bytes guest → upstream. Shared so the relay's directional tasks can increment it.
+    bytes_tx: Arc<AtomicU64>,
+    /// Bytes upstream → guest.
+    bytes_rx: Arc<AtomicU64>,
+    opened: bool,
+}
+
+impl ConnAudit {
+    fn new(tx: Option<mpsc::Sender<AuditEvent>>, conn_id: u64) -> Self {
+        ConnAudit {
+            tx,
+            conn_id,
+            started: Instant::now(),
+            bytes_tx: Arc::new(AtomicU64::new(0)),
+            bytes_rx: Arc::new(AtomicU64::new(0)),
+            opened: false,
+        }
+    }
+
+    /// Emit `conn_open` once the path/kind (and SNI, where known) is decided.
+    fn open(&mut self, kind: ConnKind, dst: SocketAddr, sni: Option<&str>) {
+        self.opened = true;
+        let Some(tx) = &self.tx else { return };
+        let _ = tx.try_send(AuditEvent::ConnOpen {
+            conn_id: self.conn_id,
+            dst: dst.to_string(),
+            sni: sni.map(str::to_string),
+            conn_kind: kind,
+            ts_ms: now_ms(),
+        });
+    }
+
+    /// Emit `conn_close` with the observed byte counts and duration. Skipped if the
+    /// connection never reached an `open` (e.g. rejected by the allowlist before a path
+    /// was chosen), so close rows always pair with an open.
+    fn close(&self) {
+        if !self.opened {
+            return;
+        }
+        let Some(tx) = &self.tx else { return };
+        let _ = tx.try_send(AuditEvent::ConnClose {
+            conn_id: self.conn_id,
+            bytes_tx: self.bytes_tx.load(Ordering::Relaxed),
+            bytes_rx: self.bytes_rx.load(Ordering::Relaxed),
+            duration_ms: self.started.elapsed().as_millis() as u64,
+            ts_ms: now_ms(),
         });
     }
 }
@@ -148,6 +230,7 @@ async fn handle_connection(
     placeholders: &HashMap<String, String>,
     upstream_ssl: SslConnector,
     allowed_ips: &AllowedIps,
+    mut audit: ConnAudit,
 ) -> anyhow::Result<()> {
     // Check if this is a connection to an exposed host port (host.dome.internal).
     if let std::net::IpAddr::V4(ipv4) = dst.ip() {
@@ -161,9 +244,13 @@ async fn handle_connection(
                 std::net::IpAddr::V4(std::net::Ipv4Addr::LOCALHOST),
                 host_port,
             );
+            audit.open(ConnKind::ExposeHost, dst, None);
             let upstream = TcpStream::connect(local_dst).await?;
             let (mut upstream_rd, mut upstream_wr) = upstream.into_split();
-            return blind_relay(id, &mut upstream_rd, &mut upstream_wr, data_rx, cmd_tx).await;
+            let r = blind_relay(id, &mut upstream_rd, &mut upstream_wr, data_rx, cmd_tx, &audit)
+                .await;
+            audit.close();
+            return r;
         }
     }
 
@@ -240,59 +327,75 @@ async fn handle_connection(
             }
         }
 
-        if let Some(domain) = sni {
-            let substitutions = config.secrets_for_domain(&domain, placeholders);
+        if let Some(domain) = &sni {
+            let substitutions = config.secrets_for_domain(domain, placeholders);
             if !substitutions.is_empty() {
                 debug!("MITM: {domain}");
-                return handle_mitm(
+                audit.open(ConnKind::Mitm, dst, Some(domain));
+                let r = handle_mitm(
                     id,
                     dst,
-                    domain,
+                    domain.clone(),
                     tls_buf,
                     data_rx,
                     cmd_tx,
                     ca,
                     substitutions,
                     upstream_ssl,
+                    &audit,
                 )
                 .await;
+                audit.close();
+                return r;
             }
         }
 
         // Blind tunnel: forward the buffered data and relay the rest
         debug!("blind tunnel to {dst}");
+        audit.open(ConnKind::BlindTunnel, dst, sni.as_deref());
         let upstream = TcpStream::connect(dst).await?;
         let (mut upstream_rd, mut upstream_wr) = upstream.into_split();
 
         // Send the buffered TLS data
         upstream_wr.write_all(&tls_buf).await?;
+        audit.bytes_tx.fetch_add(tls_buf.len() as u64, Ordering::Relaxed);
 
-        return blind_relay(id, &mut upstream_rd, &mut upstream_wr, data_rx, cmd_tx).await;
+        let r =
+            blind_relay(id, &mut upstream_rd, &mut upstream_wr, data_rx, cmd_tx, &audit).await;
+        audit.close();
+        return r;
     }
 
     // Non-TLS: blind tunnel
     debug!("TCP tunnel to {dst}");
+    audit.open(ConnKind::PlainTcp, dst, None);
     let upstream = TcpStream::connect(dst).await?;
     let (mut upstream_rd, mut upstream_wr) = upstream.into_split();
 
-    blind_relay(id, &mut upstream_rd, &mut upstream_wr, data_rx, cmd_tx).await
+    let r = blind_relay(id, &mut upstream_rd, &mut upstream_wr, data_rx, cmd_tx, &audit).await;
+    audit.close();
+    r
 }
 
-/// Blind bidirectional relay (no inspection).
+/// Blind bidirectional relay (no inspection). Counts bytes in each direction into the
+/// audit counters; the actual relayed bytes are never inspected or recorded.
 async fn blind_relay(
     id: ConnectionId,
     upstream_rd: &mut tokio::net::tcp::OwnedReadHalf,
     upstream_wr: &mut tokio::net::tcp::OwnedWriteHalf,
     mut data_rx: mpsc::UnboundedReceiver<Vec<u8>>,
     cmd_tx: mpsc::UnboundedSender<StackCommand>,
+    audit: &ConnAudit,
 ) -> anyhow::Result<()> {
     let cmd_tx_clone = cmd_tx.clone();
+    let bytes_rx = audit.bytes_rx.clone();
     let upstream_to_guest = async {
         let mut buf = vec![0u8; 65536];
         loop {
             match upstream_rd.read(&mut buf).await {
                 Ok(0) | Err(_) => break,
                 Ok(n) => {
+                    bytes_rx.fetch_add(n as u64, Ordering::Relaxed);
                     if cmd_tx_clone
                         .send(StackCommand::Send {
                             id,
@@ -307,8 +410,10 @@ async fn blind_relay(
         }
     };
 
+    let bytes_tx = audit.bytes_tx.clone();
     let guest_to_upstream = async {
         while let Some(payload) = data_rx.recv().await {
+            bytes_tx.fetch_add(payload.len() as u64, Ordering::Relaxed);
             if upstream_wr.write_all(&payload).await.is_err() {
                 break;
             }
@@ -337,6 +442,7 @@ async fn handle_mitm(
     ca: Arc<tokio::sync::Mutex<CertificateAuthority>>,
     substitutions: Vec<(String, String)>,
     upstream_ssl: SslConnector,
+    audit: &ConnAudit,
 ) -> anyhow::Result<()> {
     let acceptor = {
         let mut ca = ca.lock().await;
@@ -359,12 +465,16 @@ async fn handle_mitm(
     let (mut guest_rd, mut guest_wr) = tokio::io::split(guest_tls);
     let (mut upstream_rd, mut upstream_wr) = tokio::io::split(upstream_tls);
 
+    // Count the GUEST-side (pre-substitution) byte volume so the audit never reflects the
+    // real secret's length. Substitution is left exactly as-is — capture is observe-only.
+    let bytes_tx = audit.bytes_tx.clone();
     let guest_to_upstream = async move {
         let mut buf = vec![0u8; 65536];
         loop {
             match guest_rd.read(&mut buf).await {
                 Ok(0) | Err(_) => break,
                 Ok(n) => {
+                    bytes_tx.fetch_add(n as u64, Ordering::Relaxed);
                     let mut data = buf[..n].to_vec();
                     for (placeholder, real_value) in &substitutions {
                         data = replace_bytes(&data, placeholder.as_bytes(), real_value.as_bytes());
@@ -377,12 +487,14 @@ async fn handle_mitm(
         }
     };
 
+    let bytes_rx = audit.bytes_rx.clone();
     let upstream_to_guest = async move {
         let mut buf = vec![0u8; 65536];
         loop {
             match upstream_rd.read(&mut buf).await {
                 Ok(0) | Err(_) => break,
                 Ok(n) => {
+                    bytes_rx.fetch_add(n as u64, Ordering::Relaxed);
                     if guest_wr.write_all(&buf[..n]).await.is_err() {
                         break;
                     }

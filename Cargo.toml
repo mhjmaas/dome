@@ -1,6 +1,7 @@
 [workspace]
 resolver = "2"
 members = [
+    "crates/dome-audit",
     "crates/dome-cli",
     "crates/dome-darwin",
     "crates/dome-linux",
@@ -15,6 +16,7 @@ members = [
 # transitively via dome-vm's cfg'd deps. Excluded from default builds
 # so `cargo check` doesn't fail on the wrong OS.
 default-members = [
+    "crates/dome-audit",
     "crates/dome-cli",
     "crates/dome-proto",
     "crates/dome-proxy",

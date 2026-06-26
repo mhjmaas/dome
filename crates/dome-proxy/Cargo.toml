@@ -14,6 +14,7 @@ smoltcp = { version = "0.12", default-features = false, features = [
     "socket-tcp",
     "socket-udp",
 ] }
+dome-audit = { path = "../dome-audit" }
 tokio = { version = "1", features = ["rt-multi-thread", "net", "io-util", "sync", "macros", "time"] }
 tokio-rustls = "0.26"
 rustls = { version = "0.23", default-features = false, features = ["aws_lc_rs", "logging", "tls12"] }
