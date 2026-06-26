@@ -15,6 +15,9 @@
 //! [`Direction::Response`]); the proxy stamps `conn_id` + `ts_ms` via
 //! [`FrameEvent::into_audit`] and `try_send`s the result fail-open.
 
+use std::sync::Arc;
+
+use crate::redact::{scrub_header, PlaceholderNames};
 use crate::AuditEvent;
 
 /// Which side of a connection a framer observes.
@@ -30,21 +33,23 @@ pub enum Direction {
 /// [`AuditEvent`] via [`FrameEvent::into_audit`], stamping `conn_id` and `ts_ms`.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum FrameEvent {
-    /// A request head was parsed.
+    /// A request head was parsed. `headers` are already redacted.
     Request {
         method: String,
         path: String,
         http_minor: u8,
         head_bytes: u64,
         body_bytes: Option<u64>,
+        headers: Vec<(String, String)>,
     },
-    /// A response head was parsed.
+    /// A response head was parsed. `headers` are already redacted.
     Response {
         status: u16,
         reason: String,
         http_minor: u8,
         head_bytes: u64,
         body_bytes: Option<u64>,
+        headers: Vec<(String, String)>,
     },
     /// The framer gave up on this connection's direction.
     Unparsed { reason: &'static str },
@@ -62,6 +67,7 @@ impl FrameEvent {
                 http_minor,
                 head_bytes,
                 body_bytes,
+                headers,
             } => AuditEvent::HttpRequest {
                 conn_id,
                 method,
@@ -69,6 +75,7 @@ impl FrameEvent {
                 http_minor,
                 head_bytes,
                 body_bytes,
+                headers,
                 ts_ms,
             },
             FrameEvent::Response {
@@ -77,6 +84,7 @@ impl FrameEvent {
                 http_minor,
                 head_bytes,
                 body_bytes,
+                headers,
             } => AuditEvent::HttpResponse {
                 conn_id,
                 status,
@@ -84,6 +92,7 @@ impl FrameEvent {
                 http_minor,
                 head_bytes,
                 body_bytes,
+                headers,
                 ts_ms,
             },
             FrameEvent::Unparsed { reason } => AuditEvent::Unparsed {
@@ -108,6 +117,9 @@ pub struct HttpFramer {
     state: State,
     /// Unconsumed bytes: head bytes still accumulating, or carried-over pipeline bytes.
     buf: Vec<u8>,
+    /// `placeholder → secret-name`, applied as headers are captured so a raw credential is
+    /// never carried on an event. Shared across both directions of a connection.
+    names: Arc<PlaceholderNames>,
 }
 
 enum State {
@@ -136,12 +148,20 @@ enum ChunkState {
 const HEAD_LIMIT: usize = 256 * 1024;
 
 impl HttpFramer {
-    /// Create a framer for one direction of a connection.
+    /// Create a framer for one direction of a connection with no placeholder map: sensitive
+    /// header values are still redacted (to `<redacted len=N>`), they just cannot be attributed.
     pub fn new(direction: Direction) -> Self {
+        Self::with_names(direction, Arc::new(PlaceholderNames::new()))
+    }
+
+    /// Create a framer that attributes known dome placeholders in sensitive headers to their
+    /// secret name via `names` (`placeholder → secret-name`).
+    pub fn with_names(direction: Direction, names: Arc<PlaceholderNames>) -> Self {
         HttpFramer {
             direction,
             state: State::Head,
             buf: Vec::new(),
+            names,
         }
     }
 
@@ -209,10 +229,22 @@ impl HttpFramer {
     /// Attempt to parse a complete head from `self.buf`.
     fn parse_head(&self) -> HeadParse {
         match self.direction {
-            Direction::Request => parse_request_head(&self.buf),
-            Direction::Response => parse_response_head(&self.buf),
+            Direction::Request => parse_request_head(&self.buf, &self.names),
+            Direction::Response => parse_response_head(&self.buf, &self.names),
         }
     }
+}
+
+/// Capture each header as a `(name, redacted-value)` pair in wire order. Redaction happens
+/// here, at capture, so a raw sensitive value is never carried on a [`FrameEvent`].
+fn capture_headers(headers: &[httparse::Header], names: &PlaceholderNames) -> Vec<(String, String)> {
+    headers
+        .iter()
+        .map(|h| {
+            let value = String::from_utf8_lossy(h.value);
+            (h.name.to_string(), scrub_header(h.name, &value, names))
+        })
+        .collect()
 }
 
 /// Outcome of attempting to parse one message head.
@@ -229,7 +261,7 @@ enum HeadParse {
     },
 }
 
-fn parse_request_head(buf: &[u8]) -> HeadParse {
+fn parse_request_head(buf: &[u8], names: &PlaceholderNames) -> HeadParse {
     let mut headers = [httparse::EMPTY_HEADER; 64];
     let mut req = httparse::Request::new(&mut headers);
     let head_len = match req.parse(buf) {
@@ -248,6 +280,7 @@ fn parse_request_head(buf: &[u8]) -> HeadParse {
         Err(reason) => return HeadParse::Unparsed(reason),
     };
     let body_bytes = next_declared_len(&next);
+    let captured = capture_headers(req.headers, names);
     HeadParse::Complete {
         head_len,
         event: FrameEvent::Request {
@@ -256,12 +289,13 @@ fn parse_request_head(buf: &[u8]) -> HeadParse {
             http_minor: req.version.unwrap_or(1),
             head_bytes: head_len as u64,
             body_bytes,
+            headers: captured,
         },
         next,
     }
 }
 
-fn parse_response_head(buf: &[u8]) -> HeadParse {
+fn parse_response_head(buf: &[u8], names: &PlaceholderNames) -> HeadParse {
     let mut headers = [httparse::EMPTY_HEADER; 64];
     let mut resp = httparse::Response::new(&mut headers);
     let head_len = match resp.parse(buf) {
@@ -281,6 +315,7 @@ fn parse_response_head(buf: &[u8]) -> HeadParse {
         }
     };
     let body_bytes = next_declared_len(&next);
+    let captured = capture_headers(resp.headers, names);
     HeadParse::Complete {
         head_len,
         event: FrameEvent::Response {
@@ -289,6 +324,7 @@ fn parse_response_head(buf: &[u8]) -> HeadParse {
             http_minor: resp.version.unwrap_or(1),
             head_bytes: head_len as u64,
             body_bytes,
+            headers: captured,
         },
         next,
     }
@@ -474,6 +510,7 @@ mod tests {
                 http_minor: 1,
                 head_bytes: 42,
                 body_bytes: Some(0),
+                headers: vec![("Host".into(), "example.com".into())],
             }]
         );
     }
@@ -575,6 +612,7 @@ mod tests {
                 http_minor: 1,
                 head_bytes: 38,
                 body_bytes: Some(0),
+                headers: vec![("Content-Length".into(), "0".into())],
             }]
         );
     }
@@ -649,6 +687,70 @@ mod tests {
             .any(|e| matches!(e, FrameEvent::Unparsed { reason: "chunked framing" })));
     }
 
+    /// The headers of the first request event, in order.
+    fn req_headers(events: &[FrameEvent]) -> Vec<(String, String)> {
+        events
+            .iter()
+            .find_map(|e| match e {
+                FrameEvent::Request { headers, .. } => Some(headers.clone()),
+                _ => None,
+            })
+            .unwrap_or_default()
+    }
+
+    #[test]
+    fn request_headers_are_captured_and_redacted() {
+        let mut names = std::collections::HashMap::new();
+        names.insert("dome_tok_xyz".to_string(), "ECHO_TOKEN".to_string());
+        let mut f = HttpFramer::with_names(Direction::Request, std::sync::Arc::new(names));
+        let events = f.push(
+            b"GET /get HTTP/1.1\r\nHost: api.example.com\r\nAuthorization: Bearer dome_tok_xyz\r\n\r\n",
+        );
+        assert_eq!(
+            req_headers(&events),
+            vec![
+                ("Host".into(), "api.example.com".into()),
+                ("Authorization".into(), "Bearer <secret:ECHO_TOKEN>".into()),
+            ]
+        );
+    }
+
+    #[test]
+    fn unknown_sensitive_header_is_length_redacted_in_event() {
+        let mut f = HttpFramer::new(Direction::Request);
+        let events = f.push(b"GET / HTTP/1.1\r\nCookie: session=opaque99\r\n\r\n");
+        assert_eq!(
+            req_headers(&events),
+            vec![("Cookie".into(), "<redacted len=16>".into())]
+        );
+    }
+
+    #[test]
+    fn into_audit_carries_headers() {
+        let ev = FrameEvent::Request {
+            method: "GET".into(),
+            path: "/a".into(),
+            http_minor: 1,
+            head_bytes: 20,
+            body_bytes: Some(0),
+            headers: vec![("Host".into(), "x".into())],
+        }
+        .into_audit(1, Direction::Request, 9);
+        assert_eq!(
+            ev,
+            AuditEvent::HttpRequest {
+                conn_id: 1,
+                method: "GET".into(),
+                path: "/a".into(),
+                http_minor: 1,
+                head_bytes: 20,
+                body_bytes: Some(0),
+                headers: vec![("Host".into(), "x".into())],
+                ts_ms: 9,
+            }
+        );
+    }
+
     #[test]
     fn into_audit_stamps_identity_and_direction() {
         let req = FrameEvent::Request {
@@ -657,6 +759,7 @@ mod tests {
             http_minor: 1,
             head_bytes: 20,
             body_bytes: Some(0),
+            headers: vec![],
         }
         .into_audit(7, Direction::Request, 123);
         assert_eq!(
@@ -668,6 +771,7 @@ mod tests {
                 http_minor: 1,
                 head_bytes: 20,
                 body_bytes: Some(0),
+                headers: vec![],
                 ts_ms: 123,
             }
         );
