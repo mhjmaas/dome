@@ -809,7 +809,9 @@ fn boot_vm(config: SandboxConfig) -> Result<BootedVm> {
         proxy_config.expose_host = config.expose_host;
 
         let (vm_fd, host_fd) = dome_proxy::create_socketpair()?;
-        let handle = dome_proxy::start(host_fd, proxy_config)?;
+        // No egress-audit sink here: the audit writer is wired by the dome CLI boot paths,
+        // not the embedding SDK. `None` disables auditing with no behavioral change.
+        let handle = dome_proxy::start(host_fd, proxy_config, None)?;
         (Some(vm_fd), Some(handle))
     } else {
         (None, None)

@@ -314,14 +314,19 @@ fn send_error_shared(
 pub(crate) fn run_stdio(prepared: &PreparedVm) -> Result<i32> {
     let out: SharedWriter = Arc::new(Mutex::new(io::stdout()));
 
-    // Set up proxy networking if --allow-net
-    let (vm_fd, proxy_handle) = if let Some(ref proxy_config) = prepared.proxy_config {
-        let (vm_fd, host_fd) = dome_proxy::create_socketpair()?;
-        let handle = dome_proxy::start(host_fd, proxy_config.clone())?;
-        (Some(vm_fd), Some(handle))
-    } else {
-        (None, None)
-    };
+    // Set up proxy networking if --allow-net. Egress auditing rides the proxy (the single
+    // egress chokepoint); the writer is kept alive for the whole attach so its tail flushes
+    // when this function returns (the `Drop`-guard drains it).
+    let (vm_fd, proxy_handle, _audit_handle) =
+        if let Some(ref proxy_config) = prepared.proxy_config {
+            let (vm_fd, host_fd) = dome_proxy::create_socketpair()?;
+            let audit = vm::start_audit_writer(&prepared.sandbox_name, prepared.verbose);
+            let audit_tx = audit.as_ref().map(|a| a.sender());
+            let handle = dome_proxy::start(host_fd, proxy_config.clone(), audit_tx)?;
+            (Some(vm_fd), Some(handle), audit)
+        } else {
+            (None, None, None)
+        };
 
     let nbd_handle = vm::start_nbd(prepared)?;
     let nbd_uri = nbd_handle.as_ref().map(|h| h.uri());

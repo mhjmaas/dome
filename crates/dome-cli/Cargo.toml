@@ -16,6 +16,7 @@ dome-vm = { path = "../dome-vm" }
 dome-proto = { path = "../dome-proto" }
 dome-proxy = { path = "../dome-proxy" }
 dome-store = { path = "../dome-store" }
+dome-audit = { path = "../dome-audit" }
 blake3 = "1"
 sha2 = "0.10"
 clap = { version = "4", features = ["derive", "env"] }

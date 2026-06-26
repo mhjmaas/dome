@@ -45,6 +45,9 @@ pub(crate) struct SandboxSource {
 
 pub(crate) struct PreparedVm {
     pub instance_dir: String,
+    /// Audit bucket name for egress rows: `audit/<sandbox_name>/<session>/`. A persistent
+    /// sandbox sets its real name; an ephemeral `dome run` keeps the default `"ephemeral"`.
+    pub sandbox_name: String,
     pub source_rootfs: String,
     pub work_rootfs: String,
     /// If restoring from a CAS checkpoint, the index path.
@@ -269,6 +272,9 @@ pub(crate) fn prepare_vm(
 
     Ok(PreparedVm {
         instance_dir,
+        // Persistent sandboxes overwrite this with their real name before boot; an ephemeral
+        // `dome run` keeps the default and groups its (single-session) rows under `ephemeral/`.
+        sandbox_name: "ephemeral".to_string(),
         source_rootfs: source,
         work_rootfs,
         cas_index,
@@ -362,6 +368,9 @@ pub(crate) struct BootedVm {
     proxy_handle: Option<dome_proxy::ProxyHandle>,
     /// Port-forward listeners; kept alive so `-p` forwards keep serving.
     fwd_handle: Option<dome_vm::PortForwardHandle>,
+    /// Egress-audit writer; kept alive so audit rows keep flushing. Dropping it drains the
+    /// channel and flushes the tail (the `Drop`-guard backstop). `None` when no proxy runs.
+    audit_handle: Option<dome_audit::AuditHandle>,
 }
 
 /// Boot the prepared VM and bring up all support services (proxy, CAS NBD, port
@@ -378,18 +387,23 @@ pub(crate) fn boot_vm(prepared: &PreparedVm) -> Result<BootedVm> {
         prepared.cpus, prepared.memory, prepared.disk_size
     );
 
-    // Set up proxy networking if --allow-net
-    let (vm_fd, proxy_handle) = if let Some(ref proxy_config) = prepared.proxy_config {
+    // Set up proxy networking if --allow-net. Egress auditing rides the proxy: it is the
+    // single chokepoint every connection passes through, so the writer is only constructed
+    // when a proxy exists. On by default whenever there is egress to record.
+    let (vm_fd, proxy_handle, audit_handle) = if let Some(ref proxy_config) = prepared.proxy_config
+    {
         let (vm_fd, host_fd) = dome_proxy::create_socketpair()?;
-        let handle = dome_proxy::start(host_fd, proxy_config.clone())?;
+        let audit = start_audit_writer(&prepared.sandbox_name, prepared.verbose);
+        let audit_tx = audit.as_ref().map(|a| a.sender());
+        let handle = dome_proxy::start(host_fd, proxy_config.clone(), audit_tx)?;
 
         if prepared.verbose {
             eprintln!("dome: proxy started");
         }
 
-        (Some(vm_fd), Some(handle))
+        (Some(vm_fd), Some(handle), audit)
     } else {
-        (None, None)
+        (None, None, None)
     };
 
     let nbd_handle = start_nbd(prepared)?;
@@ -439,7 +453,38 @@ pub(crate) fn boot_vm(prepared: &PreparedVm) -> Result<BootedVm> {
         nbd_handle,
         proxy_handle,
         fwd_handle,
+        audit_handle,
     })
+}
+
+/// Construct and spawn the egress-audit writer bound to `{sandbox, freshly-minted session}`
+/// under the central `audit/` root. Fail-open: if the writer cannot be created (e.g. the
+/// audit dir is unwritable), auditing is silently skipped rather than blocking the boot —
+/// observability must never become a failure mode for the workload.
+pub(crate) fn start_audit_writer(
+    sandbox_name: &str,
+    verbose: bool,
+) -> Option<dome_audit::AuditHandle> {
+    let audit_dir = format!("{}/audit", dome_vm::default_data_dir());
+    let session = dome_audit::mint_session();
+    match dome_audit::AuditWriter::spawn(dome_audit::WriterConfig::new(
+        audit_dir,
+        sandbox_name.to_string(),
+        session.clone(),
+    )) {
+        Ok(handle) => {
+            if verbose {
+                eprintln!("dome: egress audit log -> audit/{sandbox_name}/{session}/");
+            }
+            Some(handle)
+        }
+        Err(e) => {
+            if verbose {
+                eprintln!("dome: egress audit disabled ({e})");
+            }
+            None
+        }
+    }
 }
 
 pub(crate) fn run_command(prepared: &PreparedVm, command: &[String]) -> Result<RunResult> {
@@ -466,11 +511,15 @@ pub(crate) fn run_command(prepared: &PreparedVm, command: &[String]) -> Result<R
         proxy_handle,
         fwd_handle,
         nbd_handle,
+        audit_handle,
         ..
     } = booted;
     drop(proxy_handle);
     drop(fwd_handle);
     let _ = sandbox.stop();
+    // Drain the audit writer last, after the proxy is gone, so connection-close events from
+    // the just-finished run land before the writer flushes its tail.
+    drop(audit_handle);
     Ok(RunResult {
         exit_code,
         nbd_handle,
@@ -586,11 +635,14 @@ pub(crate) fn build_provision_layer(
         proxy_handle,
         fwd_handle,
         nbd_handle,
+        audit_handle,
         ..
     } = booted;
     drop(proxy_handle);
     drop(fwd_handle);
     let _ = sandbox.stop();
+    // Drain the audit writer after the proxy is gone (see `run_command`).
+    drop(audit_handle);
 
     let result = match failure {
         Some(e) => {

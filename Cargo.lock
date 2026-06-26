@@ -511,6 +511,16 @@ dependencies = [
 ]
 
 [[package]]
+name = "dome-audit"
+version = "0.1.0"
+dependencies = [
+ "serde",
+ "serde_json",
+ "tempfile",
+ "tokio",
+]
+
+[[package]]
 name = "dome-cli"
 version = "0.6.3"
 dependencies = [
@@ -518,6 +528,7 @@ dependencies = [
  "base64",
  "blake3",
  "clap",
+ "dome-audit",
  "dome-proto",
  "dome-proxy",
  "dome-store",
@@ -589,6 +600,7 @@ version = "0.2.4"
 dependencies = [
  "anyhow",
  "boring",
+ "dome-audit",
  "libc",
  "lru",
  "rcgen",

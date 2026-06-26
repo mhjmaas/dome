@@ -697,7 +697,10 @@ fn boot_and_serve(name: &str, data_dir: &str) -> Result<()> {
         }
     }
 
-    let prepared = vm::prepare_vm(&resolved, &boot.vm_args, None, None, Some(&source))?;
+    let mut prepared = vm::prepare_vm(&resolved, &boot.vm_args, None, None, Some(&source))?;
+    // Persistent sandbox: stamp egress-audit rows with the real sandbox name (not the
+    // ephemeral default) so a long-lived sandbox's rows group under `audit/<name>/`.
+    prepared.sandbox_name = name.to_string();
     let instance_dir = prepared.instance_dir.clone();
 
     let booted = vm::boot_vm(&prepared)?;
