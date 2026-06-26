@@ -653,8 +653,9 @@ fn egress_audit_log_redacts_and_attributes_headers() {
 /// after each roll, unlinks the oldest segments across the sandbox until under the per-sandbox
 /// size ceiling — the always-on safety bound that holds without `dome prune` and can trim
 /// oldest segments of even the still-running session. We force tiny caps via the
-/// `DOME_AUDIT_*` env overrides (read by the worker, same channel as the secret values) so a
-/// handful of egress connections drives many rotations and a trim. We then assert that
+/// `DOME_AUDIT_*` env overrides (resolved client-side at boot-spec construction, never read in
+/// the shared worker) so a handful of egress connections drives many rotations and a trim. We
+/// then assert that
 /// multiple segments exist, that the oldest was reaped, that the on-disk total stayed bounded
 /// by the ceiling, and that the active writer was never disrupted (its newest rows survive,
 /// still self-describing).
