@@ -325,8 +325,8 @@ pub(crate) fn run_stdio(prepared: &PreparedVm) -> Result<i32> {
             prepared.verbose,
             prepared.audit_caps.as_ref(),
         );
-        let audit_tx = audit.as_ref().map(|a| a.sender());
-        let handle = dome_proxy::start(host_fd, proxy_config.clone(), audit_tx)?;
+        let audit_sink = audit.as_ref().map(|a| a.sink());
+        let handle = dome_proxy::start(host_fd, proxy_config.clone(), audit_sink)?;
         (Some(vm_fd), Some(handle), audit)
     } else {
         (None, None, None)

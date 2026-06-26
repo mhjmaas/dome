@@ -5,7 +5,7 @@ use std::sync::Arc;
 use std::time::{Instant, SystemTime, UNIX_EPOCH};
 
 use boring::ssl::{SslConnector, SslMethod};
-use dome_audit::{AuditEvent, ConnKind, Direction, HttpFramer, PlaceholderNames};
+use dome_audit::{AuditEvent, AuditSink, ConnKind, Direction, HttpFramer, PlaceholderNames};
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::TcpStream;
 use tokio::sync::mpsc;
@@ -39,7 +39,7 @@ pub struct ProxyEngine {
     upstream_ssl: SslConnector,
     allowed_ips: AllowedIps,
     dns_cache: crate::dns::SharedDnsCache,
-    audit_tx: Option<mpsc::Sender<AuditEvent>>,
+    audit_sink: Option<AuditSink>,
     /// Monotonic per-session connection id, assigned as each connection opens. Stable and
     /// unambiguous within a `{sandbox, session}`.
     next_conn_id: u64,
@@ -55,7 +55,7 @@ impl ProxyEngine {
         placeholders: HashMap<String, String>,
         allowed_ips: AllowedIps,
         dns_cache: crate::dns::SharedDnsCache,
-        audit_tx: Option<mpsc::Sender<AuditEvent>>,
+        audit_sink: Option<AuditSink>,
     ) -> Self {
         // BoringSSL upstream connector — Chrome's TLS stack so Cloudflare
         // doesn't reject our MITM connections based on JA3/JA4 fingerprint.
@@ -81,7 +81,7 @@ impl ProxyEngine {
             upstream_ssl,
             allowed_ips,
             dns_cache,
-            audit_tx,
+            audit_sink,
             next_conn_id: 0,
         }
     }
@@ -139,7 +139,7 @@ impl ProxyEngine {
 
         let conn_id = self.next_conn_id;
         self.next_conn_id += 1;
-        let audit = ConnAudit::new(self.audit_tx.clone(), conn_id);
+        let audit = ConnAudit::new(self.audit_sink.clone(), conn_id);
 
         tokio::spawn(async move {
             if let Err(e) = handle_connection(
@@ -176,7 +176,7 @@ fn now_ms() -> u64 {
 /// started without an audit sink (`audit_tx == None`) every method is a no-op, so the
 /// network paths carry it unconditionally without branching.
 struct ConnAudit {
-    tx: Option<mpsc::Sender<AuditEvent>>,
+    tx: Option<AuditSink>,
     conn_id: u64,
     started: Instant,
     /// Bytes guest → upstream. Shared so the relay's directional tasks can increment it.
@@ -187,7 +187,7 @@ struct ConnAudit {
 }
 
 impl ConnAudit {
-    fn new(tx: Option<mpsc::Sender<AuditEvent>>, conn_id: u64) -> Self {
+    fn new(tx: Option<AuditSink>, conn_id: u64) -> Self {
         ConnAudit {
             tx,
             conn_id,
@@ -202,7 +202,7 @@ impl ConnAudit {
     fn open(&mut self, kind: ConnKind, dst: SocketAddr, sni: Option<&str>) {
         self.opened = true;
         let Some(tx) = &self.tx else { return };
-        let _ = tx.try_send(AuditEvent::ConnOpen {
+        tx.try_send(AuditEvent::ConnOpen {
             conn_id: self.conn_id,
             dst: dst.to_string(),
             sni: sni.map(str::to_string),
@@ -225,7 +225,7 @@ impl Drop for ConnAudit {
             return;
         }
         let Some(tx) = &self.tx else { return };
-        let _ = tx.try_send(AuditEvent::ConnClose {
+        tx.try_send(AuditEvent::ConnClose {
             conn_id: self.conn_id,
             bytes_tx: self.bytes_tx.load(Ordering::Relaxed),
             bytes_rx: self.bytes_rx.load(Ordering::Relaxed),
@@ -507,7 +507,7 @@ async fn handle_mitm(
                     bytes_tx.fetch_add(n as u64, Ordering::Relaxed);
                     if let (Some(tx), Some(framer)) = (&req_tx, framer.as_mut()) {
                         for ev in framer.push(&buf[..n]) {
-                            let _ = tx.try_send(ev.into_audit(conn_id, Direction::Request, now_ms()));
+                            tx.try_send(ev.into_audit(conn_id, Direction::Request, now_ms()));
                         }
                     }
                     let mut data = buf[..n].to_vec();
@@ -537,7 +537,7 @@ async fn handle_mitm(
                     bytes_rx.fetch_add(n as u64, Ordering::Relaxed);
                     if let (Some(tx), Some(framer)) = (&resp_tx, framer.as_mut()) {
                         for ev in framer.push(&buf[..n]) {
-                            let _ = tx.try_send(ev.into_audit(conn_id, Direction::Response, now_ms()));
+                            tx.try_send(ev.into_audit(conn_id, Direction::Response, now_ms()));
                         }
                     }
                     if guest_wr.write_all(&buf[..n]).await.is_err() {

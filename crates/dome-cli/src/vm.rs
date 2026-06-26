@@ -59,6 +59,10 @@ pub(crate) struct AuditCaps {
     pub segment_max_events: Option<u64>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub sandbox_max_bytes: Option<u64>,
+    /// Bounded proxy→writer channel depth. A tiny value lets a test saturate the channel and
+    /// exercise drop accounting; unset keeps the writer's generous production default.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub channel_capacity: Option<u64>,
 }
 
 impl AuditCaps {
@@ -73,10 +77,12 @@ impl AuditCaps {
             segment_max_bytes: var_u64("DOME_AUDIT_SEGMENT_MAX_BYTES"),
             segment_max_events: var_u64("DOME_AUDIT_SEGMENT_MAX_EVENTS"),
             sandbox_max_bytes: var_u64("DOME_AUDIT_SANDBOX_MAX_BYTES"),
+            channel_capacity: var_u64("DOME_AUDIT_CHANNEL_CAPACITY"),
         };
         let any_set = caps.segment_max_bytes.is_some()
             || caps.segment_max_events.is_some()
-            || caps.sandbox_max_bytes.is_some();
+            || caps.sandbox_max_bytes.is_some()
+            || caps.channel_capacity.is_some();
         any_set.then_some(caps)
     }
 
@@ -85,7 +91,11 @@ impl AuditCaps {
         let segment_max_bytes = self.segment_max_bytes.unwrap_or(config.segment_max_bytes);
         let segment_max_events = self.segment_max_events.unwrap_or(config.segment_max_events);
         let sandbox_max_bytes = self.sandbox_max_bytes.unwrap_or(config.sandbox_max_bytes);
-        config.with_caps(segment_max_bytes, segment_max_events, sandbox_max_bytes)
+        let config = config.with_caps(segment_max_bytes, segment_max_events, sandbox_max_bytes);
+        match self.channel_capacity {
+            Some(cap) => config.with_channel_capacity(cap as usize),
+            None => config,
+        }
     }
 }
 
@@ -450,8 +460,8 @@ pub(crate) fn boot_vm(prepared: &PreparedVm) -> Result<BootedVm> {
             prepared.verbose,
             prepared.audit_caps.as_ref(),
         );
-        let audit_tx = audit.as_ref().map(|a| a.sender());
-        let handle = dome_proxy::start(host_fd, proxy_config.clone(), audit_tx)?;
+        let audit_sink = audit.as_ref().map(|a| a.sink());
+        let handle = dome_proxy::start(host_fd, proxy_config.clone(), audit_sink)?;
 
         if prepared.verbose {
             eprintln!("dome: proxy started");

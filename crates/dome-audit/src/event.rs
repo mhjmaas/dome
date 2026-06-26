@@ -117,4 +117,15 @@ pub enum AuditEvent {
         reason: &'static str,
         ts_ms: u64,
     },
+    /// A gap marker: the bounded proxy→writer channel was full and `count` events were
+    /// dropped since the previous marker. The writer materializes this row *directly* to
+    /// the file (it can never travel through the channel that just overflowed), so a flood
+    /// produces a labeled hole rather than a silent one — the log is either complete or it
+    /// tells you exactly where, and by how much, it is not. Fail-open is made visible.
+    Dropped {
+        /// Number of events lost since the previous `dropped` marker.
+        count: u64,
+        /// Wall-clock time the gap was recorded, milliseconds since the Unix epoch.
+        ts_ms: u64,
+    },
 }

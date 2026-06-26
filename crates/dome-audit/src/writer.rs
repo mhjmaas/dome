@@ -12,6 +12,7 @@
 
 use std::io::{BufWriter, Write};
 use std::path::PathBuf;
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
 use std::thread::JoinHandle;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
@@ -98,6 +99,42 @@ impl WriterConfig {
         self.segment_max_events = segment_max_events;
         self.sandbox_max_bytes = sandbox_max_bytes;
         self
+    }
+
+    /// Override the bounded channel depth. A tiny depth lets a test (or an ops knob) make the
+    /// channel saturate deterministically so drop accounting is exercised.
+    pub fn with_channel_capacity(mut self, channel_capacity: usize) -> Self {
+        self.channel_capacity = channel_capacity.max(1);
+        self
+    }
+}
+
+/// A cloneable, fail-open handle the proxy sends [`AuditEvent`]s through. Wraps the bounded
+/// channel sender plus a shared drop counter: [`AuditSink::try_send`] never blocks egress —
+/// on a full channel it drops the event and bumps the counter, which the writer task reads to
+/// materialize `dropped` gap markers. The whole hot path is one atomic increment in the worst
+/// case.
+#[derive(Clone)]
+pub struct AuditSink {
+    tx: mpsc::Sender<AuditEvent>,
+    /// Events lost to a full channel, monotonically increasing. Shared with the writer task,
+    /// which converts increments into `dropped` markers.
+    drops: Arc<AtomicU64>,
+}
+
+impl AuditSink {
+    /// Try to enqueue an event without ever blocking. If the channel is full the event is
+    /// dropped and the shared drop counter is incremented so the writer can label the gap.
+    /// A closed channel (writer gone) is a silent no-op — there is nothing left to record to.
+    pub fn try_send(&self, event: AuditEvent) {
+        if let Err(mpsc::error::TrySendError::Full(_)) = self.tx.try_send(event) {
+            self.drops.fetch_add(1, Ordering::Relaxed);
+        }
+    }
+
+    /// Total events dropped so far due to a full channel. Exposed for visibility/diagnostics.
+    pub fn dropped(&self) -> u64 {
+        self.drops.load(Ordering::Relaxed)
     }
 }
 
@@ -288,12 +325,14 @@ impl AuditWriter {
 
         let (tx, rx) = mpsc::channel::<AuditEvent>(config.channel_capacity);
         let shutdown = Arc::new(Notify::new());
+        let drops = Arc::new(AtomicU64::new(0));
 
         let sandbox = config.sandbox.clone();
         let session = config.session.clone();
         let flush_every = config.flush_every;
         let flush_interval = config.flush_interval;
         let task_shutdown = shutdown.clone();
+        let task_drops = drops.clone();
 
         let thread = std::thread::Builder::new()
             .name("dome-audit-writer".into())
@@ -308,6 +347,7 @@ impl AuditWriter {
                 rt.block_on(run_writer(
                     rx,
                     task_shutdown,
+                    task_drops,
                     sink,
                     sandbox,
                     session,
@@ -318,6 +358,7 @@ impl AuditWriter {
 
         Ok(AuditHandle {
             tx,
+            drops,
             shutdown,
             thread: Some(thread),
         })
@@ -329,14 +370,21 @@ impl AuditWriter {
 /// `Drop`-guard backstop), so a callsite that merely drops it still gets the tail on disk.
 pub struct AuditHandle {
     tx: mpsc::Sender<AuditEvent>,
+    /// Shared drop counter handed to every [`AuditSink`]; the writer task reads it.
+    drops: Arc<AtomicU64>,
     shutdown: Arc<Notify>,
     thread: Option<JoinHandle<()>>,
 }
 
 impl AuditHandle {
-    /// A cloneable sender for the proxy. The proxy `try_send`s into it (fail-open).
-    pub fn sender(&self) -> mpsc::Sender<AuditEvent> {
-        self.tx.clone()
+    /// A cloneable, fail-open sink for the proxy. The proxy `try_send`s into it; a full
+    /// channel drops the event and bumps the shared counter the writer turns into a `dropped`
+    /// marker.
+    pub fn sink(&self) -> AuditSink {
+        AuditSink {
+            tx: self.tx.clone(),
+            drops: self.drops.clone(),
+        }
     }
 
     /// Explicitly drain and flush, joining the writer within the bounded timeout. Idempotent
@@ -370,9 +418,13 @@ fn join_bounded(thread: JoinHandle<()>, timeout: Duration) {
 /// The writer event loop. Serializes each event into a stamped JSONL row, flushing on a
 /// short cadence or after `flush_every` events. Exits — flushing and fsyncing — on a
 /// shutdown signal or when every sender has been dropped.
+// The writer's inputs are a flat list of independent channels/handles/tuning knobs; bundling
+// them into a struct would add a type without making any callsite clearer.
+#[allow(clippy::too_many_arguments)]
 async fn run_writer(
     mut rx: mpsc::Receiver<AuditEvent>,
     shutdown: Arc<Notify>,
+    drops: Arc<AtomicU64>,
     mut sink: SegmentSink,
     sandbox: String,
     session: String,
@@ -382,21 +434,29 @@ async fn run_writer(
     let mut interval = tokio::time::interval(flush_interval);
     interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
     let mut since_flush = 0usize;
+    // Drops already materialized into markers; the next marker's `count` is the delta from
+    // here to the live atomic, so the markers partition the drop stream with no double-counting.
+    let mut recorded_drops = 0u64;
 
     loop {
         tokio::select! {
             biased;
             _ = shutdown.notified() => {
-                // Drain everything already queued, then flush+fsync and exit.
+                // Drain everything already queued, then label any final gap, flush+fsync, exit.
                 while let Ok(event) = rx.try_recv() {
                     write_row(&mut sink, &event, &sandbox, &session);
                 }
+                record_drops(&mut sink, &drops, &mut recorded_drops, &sandbox, &session);
                 sink.finalize();
                 return;
             }
             event = rx.recv() => {
                 match event {
                     Some(event) => {
+                        // The channel just freed a slot, so any drop happened *before* this
+                        // event regained admission: emit the gap marker ahead of the row it
+                        // precedes, so the log reads "<N dropped> … resumed-event".
+                        record_drops(&mut sink, &drops, &mut recorded_drops, &sandbox, &session);
                         write_row(&mut sink, &event, &sandbox, &session);
                         since_flush += 1;
                         if since_flush >= flush_every {
@@ -406,12 +466,16 @@ async fn run_writer(
                     }
                     // All senders dropped: no more events will ever arrive.
                     None => {
+                        record_drops(&mut sink, &drops, &mut recorded_drops, &sandbox, &session);
                         sink.finalize();
                         return;
                     }
                 }
             }
             _ = interval.tick() => {
+                // Catch a trailing drop burst that overload left behind when the senders fell
+                // quiet without dropping the handle — the recv arm above would otherwise block.
+                record_drops(&mut sink, &drops, &mut recorded_drops, &sandbox, &session);
                 if since_flush > 0 {
                     sink.flush();
                     since_flush = 0;
@@ -419,6 +483,42 @@ async fn run_writer(
             }
         }
     }
+}
+
+/// Materialize a `dropped` gap marker directly to the file if the live drop counter has moved
+/// past what we have already recorded. The marker's `count` is exactly the number lost since
+/// the previous marker, so concatenating every marker's count reconstructs the total drops
+/// with no gap and no overlap. Bypasses the channel by construction (it is the channel that
+/// overflowed). A no-op when no new drops have accrued, so a healthy run is never polluted.
+fn record_drops(
+    sink: &mut SegmentSink,
+    drops: &AtomicU64,
+    recorded: &mut u64,
+    sandbox: &str,
+    session: &str,
+) {
+    let total = drops.load(Ordering::Relaxed);
+    if total > *recorded {
+        let count = total - *recorded;
+        *recorded = total;
+        write_row(
+            sink,
+            &AuditEvent::Dropped {
+                count,
+                ts_ms: now_ms(),
+            },
+            sandbox,
+            session,
+        );
+    }
+}
+
+/// Current wall-clock time in milliseconds since the Unix epoch.
+fn now_ms() -> u64 {
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_millis() as u64
 }
 
 /// Serialize one event into a self-describing JSONL row, stamping `{sandbox, session}`, and
@@ -494,15 +594,14 @@ mod tests {
 
     /// Push a `conn_open` event whose `dst` is padded so each serialized row is comfortably
     /// large, making byte-cap rotation easy to drive with a handful of events.
-    fn send_padded(tx: &mpsc::Sender<AuditEvent>, conn_id: u64) {
+    fn send_padded(tx: &AuditSink, conn_id: u64) {
         tx.try_send(AuditEvent::ConnOpen {
             conn_id,
             dst: "1.2.3.4:443".into(),
             sni: Some("x".repeat(200)),
             conn_kind: ConnKind::Mitm,
             ts_ms: 1_717_000_000_000,
-        })
-        .unwrap();
+        });
     }
 
     #[test]
@@ -515,7 +614,7 @@ mod tests {
             WriterConfig::new(&audit_dir, "web", "sess-rot").with_caps(300, 1_000_000, u64::MAX),
         )
         .unwrap();
-        let tx = handle.sender();
+        let tx = handle.sink();
         for id in 0..6 {
             send_padded(&tx, id);
         }
@@ -550,7 +649,7 @@ mod tests {
             WriterConfig::new(&audit_dir, "web", "sess-evt").with_caps(u64::MAX, 2, u64::MAX),
         )
         .unwrap();
-        let tx = handle.sender();
+        let tx = handle.sink();
         for id in 0..5 {
             send_padded(&tx, id);
         }
@@ -592,7 +691,7 @@ mod tests {
             WriterConfig::new(&audit_dir, "web", "sess-trim").with_caps(200, u64::MAX, 900),
         )
         .unwrap();
-        let tx = handle.sender();
+        let tx = handle.sink();
         for id in 0..20 {
             send_padded(&tx, id);
         }
@@ -644,16 +743,13 @@ mod tests {
         let mut handle =
             AuditWriter::spawn(WriterConfig::new(&audit_dir, "web", "sess-1")).unwrap();
 
-        handle
-            .sender()
-            .try_send(AuditEvent::ConnOpen {
-                conn_id: 7,
-                dst: "1.2.3.4:443".into(),
-                sni: Some("api.github.com".into()),
-                conn_kind: ConnKind::Mitm,
-                ts_ms: 1_717_000_000_000,
-            })
-            .unwrap();
+        handle.sink().try_send(AuditEvent::ConnOpen {
+            conn_id: 7,
+            dst: "1.2.3.4:443".into(),
+            sni: Some("api.github.com".into()),
+            conn_kind: ConnKind::Mitm,
+            ts_ms: 1_717_000_000_000,
+        });
         handle.shutdown();
 
         let rows = read_rows(&segment(&audit_dir, "web", "sess-1"));
@@ -675,7 +771,7 @@ mod tests {
         let audit_dir = tmp.path().to_path_buf();
         let mut handle =
             AuditWriter::spawn(WriterConfig::new(&audit_dir, "web", "sess-2")).unwrap();
-        let tx = handle.sender();
+        let tx = handle.sink();
 
         tx.try_send(AuditEvent::ConnOpen {
             conn_id: 1,
@@ -683,16 +779,14 @@ mod tests {
             sni: None,
             conn_kind: ConnKind::PlainTcp,
             ts_ms: 1_000,
-        })
-        .unwrap();
+        });
         tx.try_send(AuditEvent::ConnClose {
             conn_id: 1,
             bytes_tx: 42,
             bytes_rx: 1024,
             duration_ms: 5,
             ts_ms: 1_005,
-        })
-        .unwrap();
+        });
         handle.shutdown();
 
         let rows = read_rows(&segment(&audit_dir, "web", "sess-2"));
@@ -716,22 +810,120 @@ mod tests {
         {
             let handle =
                 AuditWriter::spawn(WriterConfig::new(&audit_dir, "eph", "sess-3")).unwrap();
-            handle
-                .sender()
-                .try_send(AuditEvent::ConnOpen {
-                    conn_id: 99,
-                    dst: "8.8.8.8:443".into(),
-                    sni: Some("dns.google".into()),
-                    conn_kind: ConnKind::BlindTunnel,
-                    ts_ms: 2_000,
-                })
-                .unwrap();
+            handle.sink().try_send(AuditEvent::ConnOpen {
+                conn_id: 99,
+                dst: "8.8.8.8:443".into(),
+                sni: Some("dns.google".into()),
+                conn_kind: ConnKind::BlindTunnel,
+                ts_ms: 2_000,
+            });
         } // handle dropped here
 
         let rows = read_rows(&segment(&audit_dir, "eph", "sess-3"));
         assert_eq!(rows.len(), 1, "Drop-guard must flush the tail event");
         assert_eq!(rows[0]["conn_kind"], "blind_tunnel");
         assert_eq!(rows[0]["conn_id"], 99);
+    }
+
+    /// Every row across all of a session's segments, oldest-first.
+    fn all_rows(audit_dir: &std::path::Path, sandbox: &str, session: &str) -> Vec<serde_json::Value> {
+        segments(audit_dir, sandbox, session)
+            .iter()
+            .flat_map(|p| read_rows(p))
+            .collect()
+    }
+
+    #[test]
+    fn saturating_the_channel_records_dropped_gap_markers() {
+        let tmp = tempfile::tempdir().unwrap();
+        let audit_dir = tmp.path().to_path_buf();
+        // Depth-1 channel: a tight burst of try_sends outpaces the writer's per-event disk
+        // write, so the channel goes Full and the sink counts the drops. Generous rotation caps
+        // so only the channel saturates here, never a segment roll.
+        let mut handle = AuditWriter::spawn(
+            WriterConfig::new(&audit_dir, "web", "sess-drop").with_channel_capacity(1),
+        )
+        .unwrap();
+        let sink = handle.sink();
+        for id in 0..5000 {
+            sink.try_send(AuditEvent::ConnOpen {
+                conn_id: id,
+                dst: "1.2.3.4:443".into(),
+                sni: Some("x".repeat(64)),
+                conn_kind: ConnKind::Mitm,
+                ts_ms: 1_717_000_000_000,
+            });
+        }
+        // All sends are done: the counter is now final and the test reads a stable value.
+        let dropped_total = sink.dropped();
+        assert!(
+            dropped_total > 0,
+            "a tight burst into a depth-1 channel must drop events; dropped {dropped_total}"
+        );
+        handle.shutdown();
+
+        let rows = all_rows(&audit_dir, "web", "sess-drop");
+        let markers: Vec<&serde_json::Value> =
+            rows.iter().filter(|r| r["kind"] == "dropped").collect();
+        assert!(
+            !markers.is_empty(),
+            "a saturated channel must produce at least one dropped marker"
+        );
+        // Gaps are labeled exactly once: the markers' counts sum to every dropped event, with
+        // no double-counting and none missed.
+        let recorded: u64 = markers.iter().map(|r| r["count"].as_u64().unwrap()).sum();
+        assert_eq!(
+            recorded, dropped_total,
+            "dropped markers must account for every dropped event exactly once"
+        );
+        // Markers are self-describing like every other row, and carry a positive count.
+        assert!(
+            markers
+                .iter()
+                .all(|r| r["sandbox"] == "web" && r["session"] == "sess-drop"),
+            "dropped markers are stamped with identity"
+        );
+        assert!(
+            markers.iter().all(|r| r["count"].as_u64().unwrap() > 0),
+            "a dropped marker is only written for a real gap"
+        );
+        // Conservation: the rows that survived plus the labeled drops account for every event
+        // the sink accepted — the log is complete or it tells you where it is not.
+        let survived = rows.iter().filter(|r| r["kind"] == "conn_open").count() as u64;
+        assert_eq!(
+            survived + dropped_total,
+            5000,
+            "every event is either persisted or labeled as dropped"
+        );
+    }
+
+    #[test]
+    fn a_healthy_run_writes_no_dropped_markers() {
+        let tmp = tempfile::tempdir().unwrap();
+        let audit_dir = tmp.path().to_path_buf();
+        // Default (generous) channel depth and a trickle of events: nothing is ever dropped, so
+        // no marker must pollute a healthy log.
+        let mut handle =
+            AuditWriter::spawn(WriterConfig::new(&audit_dir, "web", "sess-clean")).unwrap();
+        let sink = handle.sink();
+        for id in 0..10 {
+            sink.try_send(AuditEvent::ConnOpen {
+                conn_id: id,
+                dst: "1.2.3.4:443".into(),
+                sni: None,
+                conn_kind: ConnKind::PlainTcp,
+                ts_ms: 1_717_000_000_000,
+            });
+        }
+        assert_eq!(sink.dropped(), 0, "a depth-4096 channel never drops a trickle");
+        handle.shutdown();
+
+        let rows = all_rows(&audit_dir, "web", "sess-clean");
+        assert_eq!(rows.len(), 10, "all events persisted");
+        assert!(
+            rows.iter().all(|r| r["kind"] != "dropped"),
+            "a healthy run must contain no dropped markers; rows: {rows:#?}"
+        );
     }
 
     #[test]
