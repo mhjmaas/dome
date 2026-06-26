@@ -165,6 +165,12 @@ pub(crate) struct BootSpec {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub land_cwd: Option<String>,
     pub vm_args: VmArgs,
+    /// Per-invocation egress-audit cap overrides, resolved from the client's environment at
+    /// spec-construction time and carried to the worker so it never reads them from its own
+    /// (long-lived, shared) domed-inherited environment. Absent in the common case (baked
+    /// defaults). See [`crate::vm::AuditCaps`].
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub audit_caps: Option<crate::vm::AuditCaps>,
 }
 
 impl BootSpec {
@@ -186,6 +192,9 @@ impl BootSpec {
             // VmArgs is cheap, plain data; serialize via its serde derives by cloning
             // through JSON so we don't have to thread a borrow through the wire types.
             vm_args: serde_json::from_value(serde_json::to_value(vm_args)?)?,
+            // Resolve in the client (fresh env); the worker must not read these from its own
+            // domed-inherited environment, which is shared and long-lived across boots.
+            audit_caps: crate::vm::AuditCaps::from_env(),
         })
     }
 
@@ -701,6 +710,9 @@ fn boot_and_serve(name: &str, data_dir: &str) -> Result<()> {
     // Persistent sandbox: stamp egress-audit rows with the real sandbox name (not the
     // ephemeral default) so a long-lived sandbox's rows group under `audit/<name>/`.
     prepared.sandbox_name = name.to_string();
+    // Carry the client-resolved audit cap overrides (if any) so the writer can be tuned for a
+    // boot without the worker reading its own (shared, long-lived) domed-inherited environment.
+    prepared.audit_caps = boot.audit_caps.clone();
     let instance_dir = prepared.instance_dir.clone();
 
     let booted = vm::boot_vm(&prepared)?;
@@ -942,7 +954,16 @@ fn handle_conn(worker: &Arc<Worker>, mut stream: UnixStream) {
             rows,
             cols,
             land_cwd,
-        } => handle_attach(worker, stream, &token, tty, &argv, rows, cols, land_cwd.as_deref()),
+        } => handle_attach(
+            worker,
+            stream,
+            &token,
+            tty,
+            &argv,
+            rows,
+            cols,
+            land_cwd.as_deref(),
+        ),
     }
 }
 
@@ -1301,8 +1322,14 @@ mod tests {
 
         let env = session_env(&base, Some("/workspace/packages/core"));
 
-        assert_eq!(env.get("DOME_LAND_CWD").map(String::as_str), Some("/workspace/packages/core"));
-        assert_eq!(env.get("DOME_SANDBOX").map(String::as_str), Some("trader-v3"));
+        assert_eq!(
+            env.get("DOME_LAND_CWD").map(String::as_str),
+            Some("/workspace/packages/core")
+        );
+        assert_eq!(
+            env.get("DOME_SANDBOX").map(String::as_str),
+            Some("trader-v3")
+        );
     }
 
     #[test]
@@ -1380,7 +1407,8 @@ mod tests {
             cols: 120,
             land_cwd: Some("/workspace/apps".to_string()),
         };
-        let back: WorkerRequest = serde_json::from_str(&serde_json::to_string(&req).unwrap()).unwrap();
+        let back: WorkerRequest =
+            serde_json::from_str(&serde_json::to_string(&req).unwrap()).unwrap();
         assert_eq!(back, req);
 
         // A legacy attach line with no land_cwd field still parses (defaults to None).
@@ -1659,7 +1687,11 @@ mod tests {
         // A guard claims a slot (count goes to 1) and releases it on a normal drop (back to 0).
         {
             let _g = SessionGuard::acquire(&sessions).expect("idle worker grants a session");
-            assert_eq!(sessions.lock().unwrap().attached, 1, "guard claims one slot");
+            assert_eq!(
+                sessions.lock().unwrap().attached,
+                1,
+                "guard claims one slot"
+            );
         }
         assert_eq!(
             sessions.lock().unwrap().attached,

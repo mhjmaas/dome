@@ -110,13 +110,17 @@ fn main() -> Result<()> {
                 }
             }
 
-            let prepared = vm::prepare_vm(
+            let mut prepared = vm::prepare_vm(
                 &resolved,
                 &vm,
                 effective_from,
                 provision_seed.as_deref(),
                 None,
             )?;
+            // Ephemeral `dome run` boots in this (client) process, so resolve any audit cap
+            // overrides from the environment here — the worker path resolves them client-side
+            // into the boot spec instead, never reading them in the shared domed process.
+            prepared.audit_caps = vm::AuditCaps::from_env();
 
             let result = if stdio {
                 let r = stdio::run_stdio(&prepared);

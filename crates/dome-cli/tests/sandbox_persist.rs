@@ -346,14 +346,35 @@ fn audit_sandbox_dir(name: &str) -> String {
     format!("{}/.local/share/dome/audit/{}", home, name)
 }
 
-/// Read every audit row across all of a sandbox's sessions as raw JSONL lines.
-fn audit_rows(name: &str) -> Vec<String> {
-    let mut rows = Vec::new();
+/// Every `events-NNNN.jsonl` segment under a sandbox's sessions, sorted oldest-first (session
+/// dir names are timestamp-led and segment names zero-padded, so a path sort is an age sort).
+fn audit_segments(name: &str) -> Vec<std::path::PathBuf> {
+    let mut segs = Vec::new();
     let Ok(sessions) = std::fs::read_dir(audit_sandbox_dir(name)) else {
-        return rows;
+        return segs;
     };
     for session in sessions.filter_map(|e| e.ok()) {
-        let segment = session.path().join("events-0001.jsonl");
+        let Ok(files) = std::fs::read_dir(session.path()) else {
+            continue;
+        };
+        for f in files.filter_map(|e| e.ok()) {
+            let p = f.path();
+            if p.file_name()
+                .and_then(|n| n.to_str())
+                .is_some_and(|n| n.starts_with("events-") && n.ends_with(".jsonl"))
+            {
+                segs.push(p);
+            }
+        }
+    }
+    segs.sort();
+    segs
+}
+
+/// Read every audit row across all of a sandbox's sessions and segments as raw JSONL lines.
+fn audit_rows(name: &str) -> Vec<String> {
+    let mut rows = Vec::new();
+    for segment in audit_segments(name) {
         if let Ok(text) = std::fs::read_to_string(&segment) {
             rows.extend(text.lines().map(str::to_string));
         }
@@ -414,7 +435,8 @@ fn egress_audit_log_records_connection_metadata() {
     );
     // Every row is self-describing: stamped with the sandbox identity by the writer.
     assert!(
-        rows.iter().all(|r| r.contains(&format!("\"sandbox\":\"{name}\""))),
+        rows.iter()
+            .all(|r| r.contains(&format!("\"sandbox\":\"{name}\""))),
         "every row must carry the sandbox identity; rows: {rows:#?}"
     );
     assert!(
@@ -524,8 +546,8 @@ fn egress_audit_log_frames_http_requests() {
     );
     // The response side was framed symmetrically into an http_response row.
     assert!(
-        rows.iter().any(|r| r.contains("\"kind\":\"http_response\"")
-            && r.contains("\"status\":200")),
+        rows.iter()
+            .any(|r| r.contains("\"kind\":\"http_response\"") && r.contains("\"status\":200")),
         "expected an http_response row with status 200; rows: {rows:#?}"
     );
     // The real secret value never appears even though the guest sent it as an Authorization
@@ -606,8 +628,8 @@ fn egress_audit_log_redacts_and_attributes_headers() {
     );
     // A non-sensitive header passes through verbatim, so the row carries real header context.
     assert!(
-        rows.iter().any(|r| r.contains("\"kind\":\"http_request\"")
-            && r.contains("postman-echo.com")),
+        rows.iter()
+            .any(|r| r.contains("\"kind\":\"http_request\"") && r.contains("postman-echo.com")),
         "expected the request row to carry the verbatim Host header; rows: {rows:#?}"
     );
     // The real secret value never reaches the log, even as a redacted header.
@@ -620,6 +642,108 @@ fn egress_audit_log_redacts_and_attributes_headers() {
     assert!(
         !rows.iter().any(|r| r.contains("dome_tok_")),
         "the raw placeholder token must not appear in the audit log; rows: {rows:#?}"
+    );
+
+    rm_sandbox(&name);
+    let _ = std::fs::remove_dir_all(audit_sandbox_dir(&name));
+}
+
+/// Segment rotation + inline size-ceiling retention (#104), end-to-end through the real boot
+/// path. The writer rolls to `events-NNNN.jsonl` once a segment hits its cap and, immediately
+/// after each roll, unlinks the oldest segments across the sandbox until under the per-sandbox
+/// size ceiling — the always-on safety bound that holds without `dome prune` and can trim
+/// oldest segments of even the still-running session. We force tiny caps via the
+/// `DOME_AUDIT_*` env overrides (read by the worker, same channel as the secret values) so a
+/// handful of egress connections drives many rotations and a trim. We then assert that
+/// multiple segments exist, that the oldest was reaped, that the on-disk total stayed bounded
+/// by the ceiling, and that the active writer was never disrupted (its newest rows survive,
+/// still self-describing).
+#[test]
+#[ignore]
+fn egress_audit_log_rotates_segments_and_enforces_size_ceiling() {
+    let name = sandbox_name("audit-rotation");
+    rm_sandbox(&name);
+    let _ = std::fs::remove_dir_all(audit_sandbox_dir(&name));
+
+    // Roll every 2 events and keep the sandbox under ~1.5 KB: a loop of blind-tunnel curls
+    // (conn_open + conn_close = 2 events each → one segment per curl) produces far more
+    // segments than the ceiling holds, forcing the oldest to be trimmed while the run is live.
+    let guest_cmd = "for i in $(seq 1 12); do \
+         curl -sS --max-time 20 https://example.com/ > /dev/null 2>&1; done; \
+         curl -sS --max-time 25 -H \"Authorization: $ECHO_TOKEN\" \
+         https://postman-echo.com/get > /dev/null 2>&1; echo rotation-done";
+    let out = Command::new(dome_bin())
+        .env("ECHO_TOKEN", "real-secret-value")
+        .env("DOME_AUDIT_SEGMENT_MAX_BYTES", "1000000")
+        .env("DOME_AUDIT_SEGMENT_MAX_EVENTS", "2")
+        .env("DOME_AUDIT_SANDBOX_MAX_BYTES", "1500")
+        .args([
+            "sandbox",
+            "run",
+            &name,
+            "--allow-net",
+            "--secret",
+            "ECHO_TOKEN=ECHO_TOKEN@postman-echo.com",
+            "--",
+            "sh",
+            "-c",
+            guest_cmd,
+        ])
+        .output()
+        .expect("failed to spawn dome — is DOME_BIN correct?");
+    assert!(
+        out.status.success(),
+        "the audited run should succeed; stdout: {}, stderr: {}",
+        String::from_utf8_lossy(&out.stdout),
+        String::from_utf8_lossy(&out.stderr)
+    );
+
+    // Stop the worker so the writer drains and flushes its tail before we read the log.
+    stop_worker(&name);
+
+    let segs = audit_segments(&name);
+    // Rotation fired: the run produced multiple `events-NNNN.jsonl` segments, not one big file.
+    assert!(
+        segs.len() >= 2,
+        "the event cap should have rolled multiple segments; got: {segs:#?}"
+    );
+    // Segments are numbered, and the very first (oldest) was trimmed once over the ceiling —
+    // the dir does not simply start at events-0001 and grow forever.
+    assert!(
+        !segs
+            .iter()
+            .any(|p| p.file_name().and_then(|n| n.to_str()) == Some("events-0001.jsonl")),
+        "the oldest segment (events-0001.jsonl) should have been trimmed; got: {segs:#?}"
+    );
+
+    // The size ceiling is the always-on safety bound: the sandbox's audit dir stays bounded
+    // (ceiling + at most one active segment's growth), nowhere near the full run.
+    let total_bytes: u64 = segs
+        .iter()
+        .filter_map(|p| std::fs::metadata(p).ok())
+        .map(|m| m.len())
+        .sum();
+    assert!(
+        total_bytes <= 1500 + 2000,
+        "the size ceiling must bound the audit dir; got {total_bytes} bytes over {segs:#?}"
+    );
+
+    // The active writer was never disrupted by trimming: the surviving newest segments still
+    // hold self-describing rows stamped with the sandbox identity.
+    let rows = audit_rows(&name);
+    assert!(
+        !rows.is_empty(),
+        "the newest segments must still hold rows after trimming"
+    );
+    assert!(
+        rows.iter()
+            .all(|r| r.contains(&format!("\"sandbox\":\"{name}\""))),
+        "every surviving row must carry the sandbox identity; rows: {rows:#?}"
+    );
+    // Trimming never compromises the guest-side capture invariant: the real secret is absent.
+    assert!(
+        !rows.iter().any(|r| r.contains("real-secret-value")),
+        "the real secret value must never enter the audit log; rows: {rows:#?}"
     );
 
     rm_sandbox(&name);
