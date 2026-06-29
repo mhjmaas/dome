@@ -106,6 +106,21 @@ mod guest {
             ("/usr/local/bin/docker", "/usr/bin/docker"),
             ("/usr/local/bin/podman", "/usr/bin/podman"),
         ] {
+            // Never clobber a real binary a user installed at this path. In a sandbox the root
+            // disk persists across sessions, and a user who installs the runtime as a static
+            // binary to /usr/local/bin (a standard install target) would have overwritten our
+            // shim there in an earlier session. Restoring that binary and then blindly rewriting
+            // the shim on the next cold boot would replace it with a script that execs
+            // `/usr/bin/<runtime>` — which a static install never creates — breaking every
+            // invocation. So write only when the path is absent or already one of our shims.
+            if !crate::should_write_managed_shim(std::fs::read(path).ok().as_deref()) {
+                eprintln!(
+                    "dome-guest: {} is a real binary, not a dome shim — leaving it untouched \
+                     (no container CA injection for it)",
+                    path
+                );
+                continue;
+            }
             if std::fs::write(path, container_ca_shim(real)).is_ok() {
                 let _ = std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o755));
             } else {
@@ -120,9 +135,10 @@ mod guest {
     /// through. The combined bundle is a superset of the image's own roots, so overlaying it never
     /// removes trust; the env vars cover tools that read a non-default bundle path.
     fn container_ca_shim(real: &str) -> String {
+        let marker = crate::SHIM_MARKER;
         format!(
             r#"#!/bin/sh
-# Managed by dome — do not edit. Makes dome's per-boot MITM CA trusted inside containers so HTTPS
+{marker} — do not edit. Makes dome's per-boot MITM CA trusted inside containers so HTTPS
 # and secret injection work from a container identically to VM-local. No-op when no dome CA is
 # present (no MITM active). See skills/dome/references/container-runtimes.md.
 REAL="{real}"
@@ -1743,6 +1759,59 @@ exec "$REAL" "$@"
 
             reap_zombies();
         }
+    }
+}
+
+/// Stable sentinel embedded in the first comment line of every dome-managed container CLI shim.
+/// Used both to mark the generated script and, on a later (persisted-sandbox) cold boot, to tell
+/// whether the file at a shim path is still our shim or a real binary the user installed over it.
+/// Lives outside the linux-only `guest` module so its guard logic is unit-tested in CI (which runs
+/// `cargo test` on macOS, where `mod guest` is compiled out).
+#[allow(dead_code)]
+const SHIM_MARKER: &str = "# Managed by dome";
+
+/// Whether `install_container_runtime_shims` should (over)write the managed shim at a path, given
+/// the bytes currently there (`None` = file absent). Write when the path is absent or already holds
+/// one of our shims (idempotent refresh); leave anything else untouched — most importantly a real
+/// `docker`/`podman` binary a user installed to `/usr/local/bin`, which a persisted sandbox would
+/// restore on the next boot and which we must not replace with a shim that execs a `/usr/bin`
+/// binary the static install never created. A real binary is not valid UTF-8 and cannot contain
+/// the marker, so it correctly resolves to "do not write".
+#[allow(dead_code)]
+fn should_write_managed_shim(existing: Option<&[u8]>) -> bool {
+    match existing {
+        None => true,
+        Some(bytes) => String::from_utf8_lossy(bytes).contains(SHIM_MARKER),
+    }
+}
+
+#[cfg(test)]
+mod shim_guard_tests {
+    use super::{should_write_managed_shim, SHIM_MARKER};
+
+    #[test]
+    fn writes_when_path_is_absent() {
+        assert!(should_write_managed_shim(None));
+    }
+
+    #[test]
+    fn rewrites_an_existing_dome_shim() {
+        let existing = format!("#!/bin/sh\n{SHIM_MARKER} — do not edit.\nexec /usr/bin/docker \"$@\"\n");
+        assert!(should_write_managed_shim(Some(existing.as_bytes())));
+    }
+
+    #[test]
+    fn leaves_a_real_user_shell_wrapper_untouched() {
+        // A plausible non-dome wrapper a user dropped at /usr/local/bin/docker.
+        let user = b"#!/bin/sh\nexec /opt/docker/bin/docker \"$@\"\n";
+        assert!(!should_write_managed_shim(Some(user)));
+    }
+
+    #[test]
+    fn leaves_a_real_binary_untouched() {
+        // ELF header + non-UTF-8 bytes: a statically-installed docker binary must never be clobbered.
+        let binary = [0x7f, b'E', b'L', b'F', 0x02, 0x01, 0x01, 0x00, 0xff, 0xfe, 0x00, 0x80];
+        assert!(!should_write_managed_shim(Some(&binary)));
     }
 }
 
