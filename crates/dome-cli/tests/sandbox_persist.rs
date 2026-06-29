@@ -505,6 +505,88 @@ fn egress_audit_log_records_connection_metadata() {
     let _ = std::fs::remove_dir_all(audit_sandbox_dir(&name));
 }
 
+/// End-to-end coverage of `dns_blocked` (#128): with a domain allowlist active, a guest
+/// resolving a domain that is NOT on the allowlist has its DNS query refused at the name
+/// layer — the guest never gets an IP and never opens a connection, so without this event
+/// the most common kind of denial leaves zero trace. The refusal must surface as a
+/// `dns_blocked` row naming the refused domain; an allowed domain must NOT produce one.
+///
+/// This also stands up the allowlist-active audit scaffold (`--allow-net` to enable
+/// networking + `--allow-host` to restrict it) that the connection-layer slice (#129) reuses.
+#[test]
+#[ignore]
+fn egress_audit_log_records_dns_blocked_for_disallowed_domain() {
+    let name = sandbox_name("audit-dns-blocked");
+    rm_sandbox(&name);
+    let _ = std::fs::remove_dir_all(audit_sandbox_dir(&name));
+
+    // Allowlist active: only example.com is permitted. The guest curls the allowed host
+    // (resolves + connects normally) and a disallowed host (github.com), whose A query the
+    // resolver refuses before resolution — a policy denial, not a SERVFAIL. The secret is
+    // bound only to make the "secret never appears" invariant a real assertion.
+    let guest_cmd = "curl -sS --max-time 25 https://example.com/ > /tmp/ex.out 2>&1; \
+         curl -sS --max-time 25 https://github.com/ > /tmp/gh.out 2>&1; echo dns-done";
+    let out = Command::new(dome_bin())
+        .env("ECHO_TOKEN", "real-secret-value")
+        .args([
+            "sandbox",
+            "run",
+            &name,
+            "--allow-net",
+            "--allow-host",
+            "example.com",
+            "--secret",
+            "ECHO_TOKEN=ECHO_TOKEN@example.com",
+            "--",
+            "sh",
+            "-c",
+            guest_cmd,
+        ])
+        .output()
+        .expect("failed to spawn dome — is DOME_BIN correct?");
+    assert!(
+        out.status.success(),
+        "the audited run should succeed even though one egress is blocked; stdout: {}, stderr: {}",
+        String::from_utf8_lossy(&out.stdout),
+        String::from_utf8_lossy(&out.stderr)
+    );
+
+    // Stop the worker so the writer drains and flushes its tail before we read the log.
+    stop_worker(&name);
+
+    let rows = audit_rows(&name);
+    assert!(
+        !rows.is_empty(),
+        "the run should have produced audit rows under audit/{name}/"
+    );
+
+    // The disallowed domain's refusal is recorded as a dns_blocked row naming that domain,
+    // stamped with the sandbox identity like every other row.
+    assert!(
+        rows.iter().any(|r| r.contains("\"kind\":\"dns_blocked\"")
+            && r.contains("\"domain\":\"github.com\"")
+            && r.contains(&format!("\"sandbox\":\"{name}\""))),
+        "expected a dns_blocked row naming the refused domain; rows: {rows:#?}"
+    );
+
+    // The allowed domain resolves and connects: it must NOT appear as a dns_blocked row.
+    assert!(
+        !rows
+            .iter()
+            .any(|r| r.contains("\"kind\":\"dns_blocked\"") && r.contains("example.com")),
+        "an allowed domain must not produce a dns_blocked row; rows: {rows:#?}"
+    );
+
+    // The real secret value must never appear in any audit row, including the new block row.
+    assert!(
+        !rows.iter().any(|r| r.contains("real-secret-value")),
+        "the real secret value must never enter the audit log; rows: {rows:#?}"
+    );
+
+    rm_sandbox(&name);
+    let _ = std::fs::remove_dir_all(audit_sandbox_dir(&name));
+}
+
 /// Per-HTTP-request framing on secret-bound (MITM) connections (#103): the read-only framer
 /// tee'd alongside the substitution relay must turn the decrypted request/response stream into
 /// per-request `http_request` / `http_response` rows carrying the request line, status, sizes,
@@ -792,7 +874,14 @@ fn egress_audit_log_reaps_aged_sessions_via_prune() {
         "curl -sS --max-time 25 https://example.com/ > /dev/null 2>&1; echo persistent-done";
     let persistent = Command::new(dome_bin())
         .args([
-            "sandbox", "run", &name, "--allow-net", "--", "sh", "-c", guest_cmd,
+            "sandbox",
+            "run",
+            &name,
+            "--allow-net",
+            "--",
+            "sh",
+            "-c",
+            guest_cmd,
         ])
         .output()
         .expect("failed to spawn dome — is DOME_BIN correct?");

@@ -270,7 +270,8 @@ mod tests {
             },
         ] {
             let req = Request::new(None, cmd.clone());
-            let back: Request = serde_json::from_str(&serde_json::to_string(&req).unwrap()).unwrap();
+            let back: Request =
+                serde_json::from_str(&serde_json::to_string(&req).unwrap()).unwrap();
             assert_eq!(back.command, cmd);
             assert_eq!(back.protocol_version, PROTOCOL_VERSION);
         }
@@ -339,7 +340,10 @@ mod tests {
     fn ok_response_roundtrips() {
         let resp = Response::ok(Some(1), serde_json::json!({"pid": 99}));
         let line = serde_json::to_string(&resp).unwrap();
-        assert!(!line.contains("error"), "ok response must omit error: {line}");
+        assert!(
+            !line.contains("error"),
+            "ok response must omit error: {line}"
+        );
         let back: Response = serde_json::from_str(&line).unwrap();
         assert_eq!(back, resp);
         assert!(back.ok);
@@ -350,7 +354,10 @@ mod tests {
     fn err_response_roundtrips() {
         let resp = Response::err(None, "boom");
         let line = serde_json::to_string(&resp).unwrap();
-        assert!(!line.contains("result"), "err response must omit result: {line}");
+        assert!(
+            !line.contains("result"),
+            "err response must omit result: {line}"
+        );
         let back: Response = serde_json::from_str(&line).unwrap();
         assert_eq!(back, resp);
         assert!(!back.ok);

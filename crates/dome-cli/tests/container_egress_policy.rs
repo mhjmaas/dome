@@ -128,8 +128,11 @@ fn container_egress_is_bound_by_network_allowlist() {
         // The security contract under test: container egress must obey exactly this list.
         "network": { "allow": ["example.com"] }
     });
-    std::fs::write(dir.path().join("dome.json"), serde_json::to_string_pretty(&dome_json).unwrap())
-        .expect("write dome.json");
+    std::fs::write(
+        dir.path().join("dome.json"),
+        serde_json::to_string_pretty(&dome_json).unwrap(),
+    )
+    .expect("write dome.json");
 
     let out = Command::new(dome_bin())
         .current_dir(dir.path())

@@ -135,7 +135,13 @@ mod tests {
         let root = tmp.path();
         // An old first segment but a fresh rotated one — a live, busy session.
         seed_session(root, "web", "busy", Duration::from_secs(45 * 86_400));
-        add_segment(root, "web", "busy", "events-0002.jsonl", Duration::from_secs(30));
+        add_segment(
+            root,
+            "web",
+            "busy",
+            "events-0002.jsonl",
+            Duration::from_secs(30),
+        );
 
         let stats = reap_aged_sessions(root, DEFAULT_MAX_AGE);
 
@@ -154,7 +160,9 @@ mod tests {
         let per1 = seed_session(root, "persist", "sess-old", aged);
         add_segment(root, "persist", "sess-old", "events-0002.jsonl", aged);
         let per2 = std::fs::metadata(
-            root.join("persist").join("sess-old").join("events-0002.jsonl"),
+            root.join("persist")
+                .join("sess-old")
+                .join("events-0002.jsonl"),
         )
         .unwrap()
         .len();
