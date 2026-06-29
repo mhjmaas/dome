@@ -42,6 +42,20 @@ pub enum AuditEvent {
         /// Wall-clock open time, milliseconds since the Unix epoch.
         ts_ms: u64,
     },
+    /// A DNS query was refused because the domain is not in `network.allow`. The most
+    /// common denial: the guest gets no IP and never opens a connection, so without this
+    /// event a domain-allowlist block leaves zero trace in the log. Deliberately carries
+    /// no `conn_id` — at the DNS layer no connection exists yet. The variant name is the
+    /// reason (a domain not in the allowlist is the only way it fires), so it needs no
+    /// reason enum. A DNS resolution *failure* (SERVFAIL) is a failure, not a policy
+    /// denial, and is left un-audited.
+    DnsBlocked {
+        /// The refused domain (query name, trailing dot trimmed). Guest-controlled, but
+        /// JSON serialization escapes control bytes so it cannot forge extra rows.
+        domain: String,
+        /// Wall-clock time the query was refused, milliseconds since the Unix epoch.
+        ts_ms: u64,
+    },
     /// A connection closed. Carries byte counts and how long it was open.
     ConnClose {
         conn_id: u64,
@@ -128,4 +142,25 @@ pub enum AuditEvent {
         /// Wall-clock time the gap was recorded, milliseconds since the Unix epoch.
         ts_ms: u64,
     },
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn dns_blocked_serializes_as_self_describing_row() {
+        let row = serde_json::to_value(AuditEvent::DnsBlocked {
+            domain: "evil.example.com".into(),
+            ts_ms: 1_700_000_000_000,
+        })
+        .unwrap();
+
+        // Tagged with a snake_case `kind` like every other row.
+        assert_eq!(row["kind"], "dns_blocked");
+        assert_eq!(row["domain"], "evil.example.com");
+        assert_eq!(row["ts_ms"], 1_700_000_000_000u64);
+        // No connection exists at the DNS layer, so the row carries no conn_id.
+        assert!(row.get("conn_id").is_none());
+    }
 }

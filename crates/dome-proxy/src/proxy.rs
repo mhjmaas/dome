@@ -109,6 +109,7 @@ impl ProxyEngine {
                     let config = self.config.clone();
                     let allowed_ips = self.allowed_ips.clone();
                     let dns_cache = self.dns_cache.clone();
+                    let audit_sink = self.audit_sink.clone();
                     tokio::spawn(async move {
                         dns::handle_dns_query(
                             src,
@@ -117,6 +118,7 @@ impl ProxyEngine {
                             &config,
                             &allowed_ips,
                             &dns_cache,
+                            audit_sink.as_ref(),
                         )
                         .await;
                     });
@@ -164,7 +166,7 @@ impl ProxyEngine {
 }
 
 /// Current wall-clock time in milliseconds since the Unix epoch.
-fn now_ms() -> u64 {
+pub(crate) fn now_ms() -> u64 {
     SystemTime::now()
         .duration_since(UNIX_EPOCH)
         .unwrap_or_default()
@@ -210,7 +212,6 @@ impl ConnAudit {
             ts_ms: now_ms(),
         });
     }
-
 }
 
 /// Emit `conn_close` on drop with the observed byte counts and duration. Driving the close
@@ -268,8 +269,15 @@ async fn handle_connection(
             let upstream = TcpStream::connect(local_dst).await?;
             let (mut upstream_rd, mut upstream_wr) = upstream.into_split();
             // `audit` drops at function return, emitting the paired `conn_close`.
-            return blind_relay(id, &mut upstream_rd, &mut upstream_wr, data_rx, cmd_tx, &audit)
-                .await;
+            return blind_relay(
+                id,
+                &mut upstream_rd,
+                &mut upstream_wr,
+                data_rx,
+                cmd_tx,
+                &audit,
+            )
+            .await;
         }
     }
 
@@ -377,10 +385,20 @@ async fn handle_connection(
 
         // Send the buffered TLS data
         upstream_wr.write_all(&tls_buf).await?;
-        audit.bytes_tx.fetch_add(tls_buf.len() as u64, Ordering::Relaxed);
+        audit
+            .bytes_tx
+            .fetch_add(tls_buf.len() as u64, Ordering::Relaxed);
 
         // `audit` drops at function return, emitting the paired `conn_close`.
-        return blind_relay(id, &mut upstream_rd, &mut upstream_wr, data_rx, cmd_tx, &audit).await;
+        return blind_relay(
+            id,
+            &mut upstream_rd,
+            &mut upstream_wr,
+            data_rx,
+            cmd_tx,
+            &audit,
+        )
+        .await;
     }
 
     // Non-TLS: blind tunnel
@@ -390,7 +408,15 @@ async fn handle_connection(
     let (mut upstream_rd, mut upstream_wr) = upstream.into_split();
 
     // `audit` drops at function return, emitting the paired `conn_close`.
-    blind_relay(id, &mut upstream_rd, &mut upstream_wr, data_rx, cmd_tx, &audit).await
+    blind_relay(
+        id,
+        &mut upstream_rd,
+        &mut upstream_wr,
+        data_rx,
+        cmd_tx,
+        &audit,
+    )
+    .await
 }
 
 /// Blind bidirectional relay (no inspection). Counts bytes in each direction into the

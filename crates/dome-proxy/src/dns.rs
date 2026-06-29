@@ -9,7 +9,10 @@ use smoltcp::wire::IpEndpoint;
 use tokio::sync::mpsc;
 use tracing::{debug, warn};
 
+use dome_audit::{AuditEvent, AuditSink};
+
 use crate::config::ProxyConfig;
+use crate::proxy::now_ms;
 use crate::stack::StackCommand;
 use crate::AllowedIps;
 
@@ -113,8 +116,9 @@ pub async fn handle_dns_query(
     config: &ProxyConfig,
     allowed_ips: &AllowedIps,
     cache: &SharedDnsCache,
+    audit: Option<&AuditSink>,
 ) {
-    let response = match resolve_query(&payload, config, allowed_ips, cache).await {
+    let response = match resolve_query(&payload, config, allowed_ips, cache, audit).await {
         Ok(resp) => resp,
         Err(e) => {
             // Don't drop the reply: an unanswered query makes the guest resolver
@@ -146,6 +150,7 @@ async fn resolve_query(
     config: &ProxyConfig,
     allowed_ips: &AllowedIps,
     cache: &SharedDnsCache,
+    audit: Option<&AuditSink>,
 ) -> anyhow::Result<Vec<u8>> {
     let query = Packet::parse(query_bytes)?;
 
@@ -184,6 +189,18 @@ async fn resolve_query(
             "DNS blocked (not in network.allow): {}",
             sanitize_for_log(domain)
         );
+        // Surface the denial in the audit log. This is the most common block — the guest
+        // never gets an IP, so without this row a domain-allowlist denial leaves no trace.
+        // Fail-open like every other event: a full channel drops the row (a hostile guest
+        // controls denial volume, so a flood could push legitimate rows into a visible
+        // `dropped` gap — an accepted trade-off, revisit only if observed). One row per
+        // refused query, retries included; no dedup or coalescing.
+        if let Some(sink) = audit {
+            sink.try_send(AuditEvent::DnsBlocked {
+                domain: domain.to_string(),
+                ts_ms: now_ms(),
+            });
+        }
         return build_refused_response(query_bytes);
     }
 
