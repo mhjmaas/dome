@@ -587,6 +587,99 @@ fn egress_audit_log_records_dns_blocked_for_disallowed_domain() {
     let _ = std::fs::remove_dir_all(audit_sandbox_dir(&name));
 }
 
+/// End-to-end coverage of `conn_blocked` (#129): with a domain allowlist active, a guest that
+/// reaches the connection layer but is rejected by policy must surface as a terminal
+/// `conn_blocked` row — and NOT as a `conn_open`/`conn_close` pair. The most reachable of the
+/// three connection-layer denials from a guest is the literal-IP bypass: curling an IP that was
+/// never DNS-pinned skips the name layer entirely (no DNS query), reaches `handle_connection`,
+/// and is rejected as `ip_not_allowed`. The allowed host still opens normally, proving
+/// `conn_open` keeps meaning "allowed and established".
+///
+/// Reuses the allowlist-active scaffold from the Slice 1 (`dns_blocked`) test.
+#[test]
+#[ignore]
+fn egress_audit_log_records_conn_blocked_for_unpinned_literal_ip() {
+    let name = sandbox_name("audit-conn-blocked");
+    rm_sandbox(&name);
+    let _ = std::fs::remove_dir_all(audit_sandbox_dir(&name));
+
+    // Allowlist active: only example.com is permitted. The guest curls the allowed host
+    // (resolves + connects normally → conn_open) and a literal IP (1.1.1.1:443) that was never
+    // DNS-pinned. The literal IP bypasses the name layer, so it is rejected at the connection
+    // layer as ip_not_allowed rather than producing a dns_blocked row. The secret is bound only
+    // to make the "secret never appears" invariant a real assertion.
+    let guest_cmd = "curl -sS --max-time 25 https://example.com/ > /tmp/ex.out 2>&1; \
+         curl -sS --max-time 25 https://1.1.1.1/ > /tmp/ip.out 2>&1; echo conn-done";
+    let out = Command::new(dome_bin())
+        .env("ECHO_TOKEN", "real-secret-value")
+        .args([
+            "sandbox",
+            "run",
+            &name,
+            "--allow-net",
+            "--allow-host",
+            "example.com",
+            "--secret",
+            "ECHO_TOKEN=ECHO_TOKEN@example.com",
+            "--",
+            "sh",
+            "-c",
+            guest_cmd,
+        ])
+        .output()
+        .expect("failed to spawn dome — is DOME_BIN correct?");
+    assert!(
+        out.status.success(),
+        "the audited run should succeed even though one egress is blocked; stdout: {}, stderr: {}",
+        String::from_utf8_lossy(&out.stdout),
+        String::from_utf8_lossy(&out.stderr)
+    );
+
+    // Stop the worker so the writer drains and flushes its tail before we read the log.
+    stop_worker(&name);
+
+    let rows = audit_rows(&name);
+    assert!(
+        !rows.is_empty(),
+        "the run should have produced audit rows under audit/{name}/"
+    );
+
+    // The literal-IP attempt is recorded as a terminal conn_blocked row with reason
+    // ip_not_allowed, naming the destination and stamped with the sandbox identity.
+    assert!(
+        rows.iter().any(|r| r.contains("\"kind\":\"conn_blocked\"")
+            && r.contains("\"reason\":\"ip_not_allowed\"")
+            && r.contains("\"dst\":\"1.1.1.1:443\"")
+            && r.contains(&format!("\"sandbox\":\"{name}\""))),
+        "expected a conn_blocked row for the unpinned literal IP; rows: {rows:#?}"
+    );
+
+    // conn_blocked is terminal: the blocked attempt must NOT also produce a conn_open or
+    // conn_close for that destination.
+    assert!(
+        !rows.iter().any(|r| (r.contains("\"kind\":\"conn_open\"")
+            || r.contains("\"kind\":\"conn_close\""))
+            && r.contains("1.1.1.1:443")),
+        "a blocked connection must not also open or close; rows: {rows:#?}"
+    );
+
+    // The allowed host still opens normally — conn_open keeps meaning "allowed and established".
+    assert!(
+        rows.iter()
+            .any(|r| r.contains("\"kind\":\"conn_open\"") && r.contains("\"sni\":\"example.com\"")),
+        "the allowed host should still produce a conn_open; rows: {rows:#?}"
+    );
+
+    // The real secret value must never appear in any audit row, including the new block row.
+    assert!(
+        !rows.iter().any(|r| r.contains("real-secret-value")),
+        "the real secret value must never enter the audit log; rows: {rows:#?}"
+    );
+
+    rm_sandbox(&name);
+    let _ = std::fs::remove_dir_all(audit_sandbox_dir(&name));
+}
+
 /// Per-HTTP-request framing on secret-bound (MITM) connections (#103): the read-only framer
 /// tee'd alongside the substitution relay must turn the decrypted request/response stream into
 /// per-request `http_request` / `http_response` rows carrying the request line, status, sizes,

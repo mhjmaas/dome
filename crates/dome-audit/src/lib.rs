@@ -15,7 +15,7 @@ mod reap;
 mod redact;
 mod writer;
 
-pub use event::{AuditEvent, ConnKind};
+pub use event::{AuditEvent, BlockReason, ConnKind};
 pub use framer::{Direction, FrameEvent, HttpFramer};
 pub use reap::{reap_aged_sessions, ReapStats, DEFAULT_MAX_AGE};
 pub use redact::{attribute_placeholders, is_sensitive_header, scrub_header, PlaceholderNames};
