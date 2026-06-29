@@ -192,9 +192,18 @@ mod tests {
         write_frame(&mut buf, STDOUT, b"bb").unwrap();
         write_frame(&mut buf, STDERR, b"ccc").unwrap();
         let mut cursor = Cursor::new(buf);
-        assert_eq!(read_frame(&mut cursor).unwrap().unwrap(), (STDIN, b"a".to_vec()));
-        assert_eq!(read_frame(&mut cursor).unwrap().unwrap(), (STDOUT, b"bb".to_vec()));
-        assert_eq!(read_frame(&mut cursor).unwrap().unwrap(), (STDERR, b"ccc".to_vec()));
+        assert_eq!(
+            read_frame(&mut cursor).unwrap().unwrap(),
+            (STDIN, b"a".to_vec())
+        );
+        assert_eq!(
+            read_frame(&mut cursor).unwrap().unwrap(),
+            (STDOUT, b"bb".to_vec())
+        );
+        assert_eq!(
+            read_frame(&mut cursor).unwrap().unwrap(),
+            (STDERR, b"ccc".to_vec())
+        );
         assert!(read_frame(&mut cursor).unwrap().is_none());
     }
 
@@ -249,7 +258,11 @@ mod tests {
         for code in [0, 1, 137, -1, i32::MIN, i32::MAX] {
             assert_eq!(parse_exit_code(&exit_payload(code)), Some(code));
         }
-        assert_eq!(parse_exit_code(&[0, 0]), None, "a short payload yields None");
+        assert_eq!(
+            parse_exit_code(&[0, 0]),
+            None,
+            "a short payload yields None"
+        );
     }
 
     /// `try_parse` reports a complete frame's type and bounds without consuming input,

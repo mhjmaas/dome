@@ -826,7 +826,11 @@ mod tests {
     }
 
     /// Every row across all of a session's segments, oldest-first.
-    fn all_rows(audit_dir: &std::path::Path, sandbox: &str, session: &str) -> Vec<serde_json::Value> {
+    fn all_rows(
+        audit_dir: &std::path::Path,
+        sandbox: &str,
+        session: &str,
+    ) -> Vec<serde_json::Value> {
         segments(audit_dir, sandbox, session)
             .iter()
             .flat_map(|p| read_rows(p))
@@ -915,7 +919,11 @@ mod tests {
                 ts_ms: 1_717_000_000_000,
             });
         }
-        assert_eq!(sink.dropped(), 0, "a depth-4096 channel never drops a trickle");
+        assert_eq!(
+            sink.dropped(),
+            0,
+            "a depth-4096 channel never drops a trickle"
+        );
         handle.shutdown();
 
         let rows = all_rows(&audit_dir, "web", "sess-clean");

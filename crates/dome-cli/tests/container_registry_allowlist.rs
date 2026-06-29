@@ -124,8 +124,11 @@ fn container_pull_requires_registry_hosts_in_network_allow() {
             "*.cloudflarestorage.com"
         ] }
     });
-    std::fs::write(dir.path().join("dome.json"), serde_json::to_string_pretty(&dome_json).unwrap())
-        .expect("write dome.json");
+    std::fs::write(
+        dir.path().join("dome.json"),
+        serde_json::to_string_pretty(&dome_json).unwrap(),
+    )
+    .expect("write dome.json");
 
     let out = Command::new(dome_bin())
         .current_dir(dir.path())

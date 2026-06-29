@@ -132,7 +132,9 @@ fn shell_exit_over_pty(name: &str, secs: u64) {
             Ok(())
         });
     }
-    let mut child = cmd.spawn().expect("failed to spawn `dome sandbox shell` under a pty");
+    let mut child = cmd
+        .spawn()
+        .expect("failed to spawn `dome sandbox shell` under a pty");
     unsafe {
         libc::close(slave);
     }

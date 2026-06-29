@@ -100,8 +100,8 @@ where
                 Ok(Some((frame::ERROR, payload))) => {
                     let _ = stdout.flush();
                     let msg = String::from_utf8_lossy(&payload);
-                    let _ = std::io::stderr()
-                        .write_all(format!("guest error: {}\r\n", msg).as_bytes());
+                    let _ =
+                        std::io::stderr().write_all(format!("guest error: {}\r\n", msg).as_bytes());
                     *exit_code_b.lock().unwrap() = 1;
                     break;
                 }

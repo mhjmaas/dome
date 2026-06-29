@@ -178,7 +178,9 @@ impl HttpFramer {
                 State::Head => match self.parse_head() {
                     HeadParse::Incomplete => {
                         if self.buf.len() > HEAD_LIMIT {
-                            events.push(FrameEvent::Unparsed { reason: "head too large" });
+                            events.push(FrameEvent::Unparsed {
+                                reason: "head too large",
+                            });
                             self.stop();
                         }
                         break;
@@ -188,7 +190,11 @@ impl HttpFramer {
                         self.stop();
                         break;
                     }
-                    HeadParse::Complete { head_len, event, next } => {
+                    HeadParse::Complete {
+                        head_len,
+                        event,
+                        next,
+                    } => {
                         self.buf.drain(..head_len);
                         events.push(event);
                         self.state = next;
@@ -209,7 +215,9 @@ impl HttpFramer {
                     ChunkProgress::NeedMore => break,
                     ChunkProgress::Done => self.state = State::Head,
                     ChunkProgress::Error => {
-                        events.push(FrameEvent::Unparsed { reason: "chunked framing" });
+                        events.push(FrameEvent::Unparsed {
+                            reason: "chunked framing",
+                        });
                         self.stop();
                         break;
                     }
@@ -237,7 +245,10 @@ impl HttpFramer {
 
 /// Capture each header as a `(name, redacted-value)` pair in wire order. Redaction happens
 /// here, at capture, so a raw sensitive value is never carried on a [`FrameEvent`].
-fn capture_headers(headers: &[httparse::Header], names: &PlaceholderNames) -> Vec<(String, String)> {
+fn capture_headers(
+    headers: &[httparse::Header],
+    names: &PlaceholderNames,
+) -> Vec<(String, String)> {
     headers
         .iter()
         .map(|h| {
@@ -458,7 +469,9 @@ fn consume_chunked(buf: &mut Vec<u8>, st: &mut ChunkState) -> ChunkProgress {
                     *st = ChunkState::Trailer;
                 } else {
                     // +2 to also skip the CRLF that terminates the chunk data.
-                    *st = ChunkState::Data { remaining: size + 2 };
+                    *st = ChunkState::Data {
+                        remaining: size + 2,
+                    };
                 }
             }
             ChunkState::Data { remaining } => {
@@ -662,7 +675,12 @@ mod tests {
     fn malformed_input_yields_unparsed_and_stops() {
         let mut f = HttpFramer::new(Direction::Request);
         let events = f.push(b"\x16\x03\x01 not http at all \x00\x00\r\n\r\n");
-        assert_eq!(events, vec![FrameEvent::Unparsed { reason: "request head" }]);
+        assert_eq!(
+            events,
+            vec![FrameEvent::Unparsed {
+                reason: "request head"
+            }]
+        );
         // Once stopped, valid traffic afterward is ignored — no garbage, no recovery.
         assert!(f.push(b"GET /x HTTP/1.1\r\n\r\n").is_empty());
     }
@@ -681,19 +699,22 @@ mod tests {
         let events = f.push(b"CONNECT example.com:443 HTTP/1.1\r\nHost: example.com\r\n\r\n");
         assert_eq!(
             events,
-            vec![FrameEvent::Unparsed { reason: "connect tunnel" }]
+            vec![FrameEvent::Unparsed {
+                reason: "connect tunnel"
+            }]
         );
     }
 
     #[test]
     fn conflicting_length_headers_yield_unparsed() {
         let mut f = HttpFramer::new(Direction::Request);
-        let events = f.push(
-            b"POST /x HTTP/1.1\r\nContent-Length: 3\r\nTransfer-Encoding: chunked\r\n\r\n",
-        );
+        let events =
+            f.push(b"POST /x HTTP/1.1\r\nContent-Length: 3\r\nTransfer-Encoding: chunked\r\n\r\n");
         assert_eq!(
             events,
-            vec![FrameEvent::Unparsed { reason: "conflicting length" }]
+            vec![FrameEvent::Unparsed {
+                reason: "conflicting length"
+            }]
         );
     }
 
@@ -702,12 +723,13 @@ mod tests {
         let mut f = HttpFramer::new(Direction::Request);
         // Two distinct Content-Length values: a downstream proxy may honor the first while we
         // honor the last, so we refuse to frame rather than desync the next request.
-        let events = f.push(
-            b"POST /x HTTP/1.1\r\nContent-Length: 10\r\nContent-Length: 20\r\n\r\n",
-        );
+        let events =
+            f.push(b"POST /x HTTP/1.1\r\nContent-Length: 10\r\nContent-Length: 20\r\n\r\n");
         assert_eq!(
             events,
-            vec![FrameEvent::Unparsed { reason: "conflicting length" }]
+            vec![FrameEvent::Unparsed {
+                reason: "conflicting length"
+            }]
         );
     }
 
@@ -734,12 +756,12 @@ mod tests {
         let mut f = HttpFramer::new(Direction::Request);
         // `chunked, gzip` makes gzip — not chunked — the framing layer, so the body is not
         // self-delimiting to the framer. Stop rather than mis-skip bytes.
-        let events = f.push(
-            b"POST /x HTTP/1.1\r\nTransfer-Encoding: chunked, gzip\r\n\r\n",
-        );
+        let events = f.push(b"POST /x HTTP/1.1\r\nTransfer-Encoding: chunked, gzip\r\n\r\n");
         assert_eq!(
             events,
-            vec![FrameEvent::Unparsed { reason: "transfer-encoding" }]
+            vec![FrameEvent::Unparsed {
+                reason: "transfer-encoding"
+            }]
         );
     }
 
@@ -765,14 +787,16 @@ mod tests {
     #[test]
     fn bad_chunk_size_yields_unparsed() {
         let mut f = HttpFramer::new(Direction::Request);
-        let events = f.push(
-            b"POST /c HTTP/1.1\r\nTransfer-Encoding: chunked\r\n\r\nXYZ\r\njunk\r\n",
-        );
+        let events =
+            f.push(b"POST /c HTTP/1.1\r\nTransfer-Encoding: chunked\r\n\r\nXYZ\r\njunk\r\n");
         // The request head frames fine; the garbage chunk size trips the body machine.
         assert_eq!(req_lines(&events), vec![("POST".into(), "/c".into(), None)]);
-        assert!(events
-            .iter()
-            .any(|e| matches!(e, FrameEvent::Unparsed { reason: "chunked framing" })));
+        assert!(events.iter().any(|e| matches!(
+            e,
+            FrameEvent::Unparsed {
+                reason: "chunked framing"
+            }
+        )));
     }
 
     /// The headers of the first request event, in order.
@@ -864,8 +888,10 @@ mod tests {
             }
         );
 
-        let note = FrameEvent::Unparsed { reason: "response head" }
-            .into_audit(7, Direction::Response, 456);
+        let note = FrameEvent::Unparsed {
+            reason: "response head",
+        }
+        .into_audit(7, Direction::Response, 456);
         assert_eq!(
             note,
             AuditEvent::Unparsed {

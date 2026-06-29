@@ -124,7 +124,10 @@ mod guest {
             if std::fs::write(path, container_ca_shim(real)).is_ok() {
                 let _ = std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o755));
             } else {
-                eprintln!("dome-guest: failed to install container CA shim at {}", path);
+                eprintln!(
+                    "dome-guest: failed to install container CA shim at {}",
+                    path
+                );
             }
         }
     }
@@ -1796,7 +1799,8 @@ mod shim_guard_tests {
 
     #[test]
     fn rewrites_an_existing_dome_shim() {
-        let existing = format!("#!/bin/sh\n{SHIM_MARKER} — do not edit.\nexec /usr/bin/docker \"$@\"\n");
+        let existing =
+            format!("#!/bin/sh\n{SHIM_MARKER} — do not edit.\nexec /usr/bin/docker \"$@\"\n");
         assert!(should_write_managed_shim(Some(existing.as_bytes())));
     }
 
@@ -1810,7 +1814,9 @@ mod shim_guard_tests {
     #[test]
     fn leaves_a_real_binary_untouched() {
         // ELF header + non-UTF-8 bytes: a statically-installed docker binary must never be clobbered.
-        let binary = [0x7f, b'E', b'L', b'F', 0x02, 0x01, 0x01, 0x00, 0xff, 0xfe, 0x00, 0x80];
+        let binary = [
+            0x7f, b'E', b'L', b'F', 0x02, 0x01, 0x01, 0x00, 0xff, 0xfe, 0x00, 0x80,
+        ];
         assert!(!should_write_managed_shim(Some(&binary)));
     }
 }

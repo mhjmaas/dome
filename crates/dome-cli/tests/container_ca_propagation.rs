@@ -140,8 +140,11 @@ fn container_trusts_dome_ca_for_mitm_https_and_secret_injection() {
         // value from the host env below — it never appears in dome.json.
         "secrets": { "ECHO_TOKEN": { "from": "ECHO_TOKEN", "hosts": ["postman-echo.com"] } }
     });
-    std::fs::write(dir.path().join("dome.json"), serde_json::to_string_pretty(&dome_json).unwrap())
-        .expect("write dome.json");
+    std::fs::write(
+        dir.path().join("dome.json"),
+        serde_json::to_string_pretty(&dome_json).unwrap(),
+    )
+    .expect("write dome.json");
 
     let out = Command::new(dome_bin())
         .current_dir(dir.path())
