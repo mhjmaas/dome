@@ -68,6 +68,11 @@ mod guest {
             Some("newinstance,ptmxmode=0666"),
         );
         mount_fs("tmpfs", "/tmp", "tmpfs", None);
+        // Unified cgroup v2 hierarchy. There is no systemd here to set this up, but a container
+        // runtime (Docker/Podman) needs the cgroup tree mounted to create containers — so make
+        // it an unconditional property of every box, mounted at boot. The kernel pre-creates the
+        // /sys/fs/cgroup directory inside sysfs when CONFIG_CGROUPS=y, so no mkdir is needed.
+        mount_fs("cgroup2", "/sys/fs/cgroup", "cgroup2", None);
     }
 
     fn process_mount(req: &MountRequest) -> MountResponse {
