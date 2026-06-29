@@ -75,6 +75,69 @@ mod guest {
         mount_fs("cgroup2", "/sys/fs/cgroup", "cgroup2", None);
     }
 
+    /// Install transparent `docker`/`podman` shims so dome's MITM CA is trusted **inside**
+    /// containers, unconditionally, at boot.
+    ///
+    /// When dome's proxy MITMs TLS to inject secrets it presents certificates signed by a CA
+    /// generated fresh each boot; the host injects that CA into the VM trust store
+    /// (`/etc/ssl/certs/ca-certificates.crt` + `/usr/local/share/ca-certificates/dome-proxy.crt`).
+    /// A freshly pulled image does not trust it, so HTTPS from a container would fail the handshake
+    /// and the injected secret would never reach upstream. These shims sit ahead of the real binary
+    /// on `PATH` (`/usr/local/bin` precedes `/usr/bin`) and, for `run`/`create`, bind-mount the VM's
+    /// combined trust bundle (public roots + dome CA) into the container and export the common CA
+    /// env vars. They are a no-op when no dome CA is present (no MITM active), so default behavior is
+    /// unchanged. Written at boot — before any provision/command/interactive container starts — so a
+    /// container is policed identically no matter how it was launched.
+    fn install_container_runtime_shims() {
+        use std::os::unix::fs::PermissionsExt;
+        let _ = std::fs::create_dir_all("/usr/local/bin");
+        for (path, real) in [
+            ("/usr/local/bin/docker", "/usr/bin/docker"),
+            ("/usr/local/bin/podman", "/usr/bin/podman"),
+        ] {
+            if std::fs::write(path, container_ca_shim(real)).is_ok() {
+                let _ = std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o755));
+            } else {
+                eprintln!("dome-guest: failed to install container CA shim at {}", path);
+            }
+        }
+    }
+
+    /// The shim script for one runtime CLI. `real` is the path of the actual binary the shim wraps.
+    /// Only `run`/`create` are rewritten (the only subcommands that start a container needing the
+    /// CA at runtime); everything else — including `pull`, `build`, and `compose` — passes straight
+    /// through. The combined bundle is a superset of the image's own roots, so overlaying it never
+    /// removes trust; the env vars cover tools that read a non-default bundle path.
+    fn container_ca_shim(real: &str) -> String {
+        format!(
+            r#"#!/bin/sh
+# Managed by dome — do not edit. Makes dome's per-boot MITM CA trusted inside containers so HTTPS
+# and secret injection work from a container identically to VM-local. No-op when no dome CA is
+# present (no MITM active). See skills/dome/references/container-runtimes.md.
+REAL="{real}"
+CA="/usr/local/share/ca-certificates/dome-proxy.crt"
+BUNDLE="/etc/ssl/certs/ca-certificates.crt"
+if [ -f "$CA" ] && [ -f "$BUNDLE" ]; then
+  case "${{1:-}}" in
+    run|create)
+      sub="$1"; shift
+      exec "$REAL" "$sub" \
+        -v "$BUNDLE:/etc/ssl/certs/ca-certificates.crt:ro" \
+        -v "$CA:/usr/local/share/ca-certificates/dome-proxy.crt:ro" \
+        -e "SSL_CERT_FILE=/etc/ssl/certs/ca-certificates.crt" \
+        -e "CURL_CA_BUNDLE=/etc/ssl/certs/ca-certificates.crt" \
+        -e "REQUESTS_CA_BUNDLE=/etc/ssl/certs/ca-certificates.crt" \
+        -e "GIT_SSL_CAINFO=/etc/ssl/certs/ca-certificates.crt" \
+        -e "NODE_EXTRA_CA_CERTS=/usr/local/share/ca-certificates/dome-proxy.crt" \
+        "$@"
+      ;;
+  esac
+fi
+exec "$REAL" "$@"
+"#
+        )
+    }
+
     fn process_mount(req: &MountRequest) -> MountResponse {
         if let Err(e) = std::fs::create_dir_all(&req.guest_path) {
             return MountResponse {
@@ -1612,6 +1675,8 @@ mod guest {
 
         mount_filesystems();
         eprintln!("dome-guest: filesystems mounted");
+
+        install_container_runtime_shims();
 
         // Set hostname
         let hostname = b"dome\0";
