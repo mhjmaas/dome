@@ -22,6 +22,23 @@ pub enum ConnKind {
     ExposeHost,
 }
 
+/// Why the proxy denied an egress connection at the connection layer. Policy denials
+/// *only* — a `connect()` failure, a SERVFAIL, or an unexposed gateway port is a failure,
+/// not a denial, and is deliberately excluded so the log answers "what did dome deny"
+/// without noise. Exactly three members; serialized snake_case.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum BlockReason {
+    /// The destination IP was never DNS-pinned under an active allowlist — a literal-IP
+    /// or hardcoded-IP attempt to bypass the name layer.
+    IpNotAllowed,
+    /// The TLS SNI is not on the allowlist (e.g. a non-allowed host sharing an IP with an
+    /// allowed one behind a shared CDN).
+    SniNotAllowed,
+    /// A TLS ClientHello carried no SNI, so it cannot be checked against the allowlist.
+    NoSni,
+}
+
 /// A single audit event. Flat and append-only: the connection→close relationship is
 /// reconstructed at read time by grouping on `conn_id` within a `{sandbox, session}`.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
@@ -54,6 +71,28 @@ pub enum AuditEvent {
         /// JSON serialization escapes control bytes so it cannot forge extra rows.
         domain: String,
         /// Wall-clock time the query was refused, milliseconds since the Unix epoch.
+        ts_ms: u64,
+    },
+    /// An egress connection was denied by policy at the connection layer. Terminal: a
+    /// blocked connection emits this and nothing else — no `conn_open`, no `conn_close`, so
+    /// the open↔close pairing every reader relies on is never muddied by a blocked attempt.
+    /// Fires at the three connection-time rejections; the [`BlockReason`] says which. Rides
+    /// the same fail-open channel as every other event: one row per blocked attempt (retries
+    /// included), no dedup or coalescing. A hostile guest controls denial volume, so a flood
+    /// could push legitimate rows into a visible `dropped` gap — an accepted trade-off,
+    /// revisit only if observed.
+    ConnBlocked {
+        /// Per-session connection id, unambiguous within `{sandbox, session}`.
+        conn_id: u64,
+        /// Destination socket address (`ip:port`).
+        dst: String,
+        /// The offending SNI — present only for [`BlockReason::SniNotAllowed`], where the
+        /// name is what was rejected. `ip_not_allowed`/`no_sni` have no SNI to report.
+        #[serde(skip_serializing_if = "Option::is_none")]
+        sni: Option<String>,
+        /// Which connection-layer policy rejected the attempt.
+        reason: BlockReason,
+        /// Wall-clock time of the denial, milliseconds since the Unix epoch.
         ts_ms: u64,
     },
     /// A connection closed. Carries byte counts and how long it was open.
@@ -147,6 +186,49 @@ pub enum AuditEvent {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn conn_blocked_serializes_with_snake_case_reason_and_optional_sni() {
+        // SNI-not-allowed carries the offending SNI alongside the destination.
+        let row = serde_json::to_value(AuditEvent::ConnBlocked {
+            conn_id: 7,
+            dst: "93.184.216.34:443".into(),
+            sni: Some("evil.example.com".into()),
+            reason: BlockReason::SniNotAllowed,
+            ts_ms: 1_700_000_000_000,
+        })
+        .unwrap();
+        assert_eq!(row["kind"], "conn_blocked");
+        assert_eq!(row["conn_id"], 7);
+        assert_eq!(row["dst"], "93.184.216.34:443");
+        assert_eq!(row["sni"], "evil.example.com");
+        // The typed reason serializes snake_case like every other tag/enum.
+        assert_eq!(row["reason"], "sni_not_allowed");
+        assert_eq!(row["ts_ms"], 1_700_000_000_000u64);
+
+        // ip_not_allowed has no SNI to report — the field is omitted, not null.
+        let row = serde_json::to_value(AuditEvent::ConnBlocked {
+            conn_id: 0,
+            dst: "10.1.2.3:443".into(),
+            sni: None,
+            reason: BlockReason::IpNotAllowed,
+            ts_ms: 1,
+        })
+        .unwrap();
+        assert_eq!(row["reason"], "ip_not_allowed");
+        assert!(row.get("sni").is_none());
+
+        // The third policy reason rounds out the enum.
+        let row = serde_json::to_value(AuditEvent::ConnBlocked {
+            conn_id: 1,
+            dst: "10.1.2.3:443".into(),
+            sni: None,
+            reason: BlockReason::NoSni,
+            ts_ms: 1,
+        })
+        .unwrap();
+        assert_eq!(row["reason"], "no_sni");
+    }
 
     #[test]
     fn dns_blocked_serializes_as_self_describing_row() {

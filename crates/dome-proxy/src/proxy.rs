@@ -5,7 +5,9 @@ use std::sync::Arc;
 use std::time::{Instant, SystemTime, UNIX_EPOCH};
 
 use boring::ssl::{SslConnector, SslMethod};
-use dome_audit::{AuditEvent, AuditSink, ConnKind, Direction, HttpFramer, PlaceholderNames};
+use dome_audit::{
+    AuditEvent, AuditSink, BlockReason, ConnKind, Direction, HttpFramer, PlaceholderNames,
+};
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::TcpStream;
 use tokio::sync::mpsc;
@@ -173,10 +175,23 @@ pub(crate) fn now_ms() -> u64 {
         .as_millis() as u64
 }
 
+/// The terminal outcome of one connection, tracked so the drop-guard knows whether a
+/// `conn_close` is owed and so a second terminal transition is caught. Exactly one terminal
+/// event is emitted per connection: it either `Opened` (and later closes) or was `Blocked`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ConnState {
+    /// No terminal event emitted yet — the path/policy decision is still pending.
+    Pending,
+    /// `conn_open` was emitted (allowed and established); a paired `conn_close` is owed on drop.
+    Opened,
+    /// `conn_blocked` was emitted (policy denial); terminal, no close to pair.
+    Blocked,
+}
+
 /// Observe-and-emit audit helper for one connection. Tracks the open instant and byte
-/// counters, and emits `conn_open`/`conn_close` events fail-open. When the proxy was
-/// started without an audit sink (`audit_tx == None`) every method is a no-op, so the
-/// network paths carry it unconditionally without branching.
+/// counters, and emits `conn_open`/`conn_close`/`conn_blocked` events fail-open. When the
+/// proxy was started without an audit sink (`audit_tx == None`) every method is a no-op, so
+/// the network paths carry it unconditionally without branching.
 struct ConnAudit {
     tx: Option<AuditSink>,
     conn_id: u64,
@@ -185,7 +200,8 @@ struct ConnAudit {
     bytes_tx: Arc<AtomicU64>,
     /// Bytes upstream → guest.
     bytes_rx: Arc<AtomicU64>,
-    opened: bool,
+    /// Which terminal event (if any) has been emitted. Enforces exactly-one-terminal.
+    state: ConnState,
 }
 
 impl ConnAudit {
@@ -196,13 +212,21 @@ impl ConnAudit {
             started: Instant::now(),
             bytes_tx: Arc::new(AtomicU64::new(0)),
             bytes_rx: Arc::new(AtomicU64::new(0)),
-            opened: false,
+            state: ConnState::Pending,
         }
     }
 
-    /// Emit `conn_open` once the path/kind (and SNI, where known) is decided.
+    /// Emit `conn_open` once the path/kind (and SNI, where known) is decided. `conn_open`
+    /// keeps meaning "allowed and established"; a blocked attempt never reaches here.
     fn open(&mut self, kind: ConnKind, dst: SocketAddr, sni: Option<&str>) {
-        self.opened = true;
+        debug_assert_eq!(
+            self.state,
+            ConnState::Pending,
+            "conn {} terminal transition twice (already {:?})",
+            self.conn_id,
+            self.state
+        );
+        self.state = ConnState::Opened;
         let Some(tx) = &self.tx else { return };
         tx.try_send(AuditEvent::ConnOpen {
             conn_id: self.conn_id,
@@ -212,17 +236,43 @@ impl ConnAudit {
             ts_ms: now_ms(),
         });
     }
+
+    /// Emit `conn_blocked` for a connection-layer policy denial. Terminal and mutually
+    /// exclusive with `open`: a blocked connection produces this row and no `conn_open`/
+    /// `conn_close`. Rides the same fail-open path; one row per blocked attempt, retries
+    /// included (no dedup). A hostile guest controls denial volume, so a flood could spill
+    /// legitimate rows into a visible `dropped` gap — an accepted, revisit-if-observed
+    /// trade-off. `sni` is populated only for [`BlockReason::SniNotAllowed`].
+    fn blocked(&mut self, reason: BlockReason, dst: SocketAddr, sni: Option<&str>) {
+        debug_assert_eq!(
+            self.state,
+            ConnState::Pending,
+            "conn {} terminal transition twice (already {:?})",
+            self.conn_id,
+            self.state
+        );
+        self.state = ConnState::Blocked;
+        let Some(tx) = &self.tx else { return };
+        tx.try_send(AuditEvent::ConnBlocked {
+            conn_id: self.conn_id,
+            dst: dst.to_string(),
+            sni: sni.map(str::to_string),
+            reason,
+            ts_ms: now_ms(),
+        });
+    }
 }
 
 /// Emit `conn_close` on drop with the observed byte counts and duration. Driving the close
 /// from `Drop` (rather than an explicit call on each path) guarantees every `conn_open` is
 /// paired with a `conn_close` on *all* exit paths — including an early `?` return when the
-/// upstream `connect` fails after the open was emitted. Skipped when the connection never
-/// reached an `open` (e.g. rejected by the allowlist before a path was chosen), so close
-/// rows always pair with an open and opens always pair with a close.
+/// upstream `connect` fails after the open was emitted. Skipped unless the connection
+/// reached `Opened` — a `Pending` connection (closed before a path was chosen) or a
+/// `Blocked` one (its terminal row is `conn_blocked`) owes no close, so close rows always
+/// pair with an open and opens always pair with a close.
 impl Drop for ConnAudit {
     fn drop(&mut self) {
-        if !self.opened {
+        if self.state != ConnState::Opened {
             return;
         }
         let Some(tx) = &self.tx else { return };
@@ -300,6 +350,9 @@ async fn handle_connection(
             if !is_allowed {
                 debug!("IP not in DNS-pinned set, rejecting: {dst}");
                 let _ = cmd_tx.send(StackCommand::Close { id });
+                // Terminal `conn_blocked`: a literal/hardcoded IP that bypasses the name
+                // layer. No SNI to report — the denial is on the address itself.
+                audit.blocked(BlockReason::IpNotAllowed, dst, None);
                 return Err(anyhow::anyhow!(
                     "connection to {dst} blocked: IP not resolved via allowed DNS"
                 ));
@@ -337,20 +390,18 @@ async fn handle_connection(
         // allowed domain. This prevents connecting to non-allowed services
         // that happen to share an IP with an allowed domain (e.g. CDN/Cloudflare).
         if config.network.has_allowlist() {
-            match &sni {
-                Some(domain) if !config.is_domain_allowed(domain) => {
-                    debug!("SNI not in allowlist, rejecting: {domain}");
-                    let _ = cmd_tx.send(StackCommand::Close { id });
-                    return Err(anyhow::anyhow!(
-                        "TLS to {dst} blocked: SNI '{domain}' not in allowlist"
-                    ));
-                }
-                None => {
-                    debug!("no SNI in ClientHello, rejecting connection to {dst}");
-                    let _ = cmd_tx.send(StackCommand::Close { id });
-                    return Err(anyhow::anyhow!("TLS to {dst} blocked: no SNI"));
-                }
-                _ => {}
+            if let Some(reason) = sni_block_reason(sni.as_deref(), |d| config.is_domain_allowed(d))
+            {
+                // The offending SNI is meaningful only when the name itself was rejected;
+                // `no_sni` has none to report.
+                let blocked_sni = match reason {
+                    BlockReason::SniNotAllowed => sni.as_deref(),
+                    _ => None,
+                };
+                debug!("TLS to {dst} blocked ({reason:?}), SNI: {sni:?}");
+                let _ = cmd_tx.send(StackCommand::Close { id });
+                audit.blocked(reason, dst, blocked_sni);
+                return Err(anyhow::anyhow!("TLS to {dst} blocked: {reason:?}"));
             }
         }
 
@@ -607,6 +658,19 @@ fn replace_bytes(data: &[u8], from: &[u8], to: &[u8]) -> Vec<u8> {
     result
 }
 
+/// Map a TLS ClientHello's SNI to the connection-layer policy denial it triggers under an
+/// active allowlist, or `None` when the connection is permitted to proceed. Kept a pure
+/// function of `(sni, is_allowed)` so the reason mapping is unit-testable without standing
+/// up a live TLS handshake. `is_allowed` is the allowlist membership predicate (i.e.
+/// `config.is_domain_allowed`).
+fn sni_block_reason(sni: Option<&str>, is_allowed: impl Fn(&str) -> bool) -> Option<BlockReason> {
+    match sni {
+        Some(domain) if !is_allowed(domain) => Some(BlockReason::SniNotAllowed),
+        Some(_) => None,
+        None => Some(BlockReason::NoSni),
+    }
+}
+
 /// Extract SNI from a TLS ClientHello.
 pub fn extract_sni(data: &[u8]) -> Option<String> {
     if data.len() < 5 || data[0] != 0x16 {
@@ -684,6 +748,32 @@ pub fn extract_sni(data: &[u8]) -> Option<String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    #[should_panic(expected = "terminal transition")]
+    fn conn_audit_double_terminal_transition_trips_debug_assert() {
+        // Exactly one terminal event per connection: once a connection has Opened it must
+        // never also be Blocked (or vice versa). A no-op sink still drives the state machine,
+        // so the second terminal transition trips the debug assertion in debug builds.
+        let dst = "10.0.0.5:443".parse().unwrap();
+        let mut audit = ConnAudit::new(None, 0);
+        audit.open(ConnKind::PlainTcp, dst, None);
+        audit.blocked(BlockReason::NoSni, dst, None);
+    }
+
+    #[test]
+    fn sni_block_reason_maps_policy_decisions() {
+        let allow = |d: &str| d == "example.com";
+        // An allowlisted SNI is permitted: no denial.
+        assert_eq!(sni_block_reason(Some("example.com"), allow), None);
+        // A non-allowlisted SNI is the sni_not_allowed denial — the offending name is known.
+        assert_eq!(
+            sni_block_reason(Some("evil.example.com"), allow),
+            Some(BlockReason::SniNotAllowed)
+        );
+        // No SNI at all cannot be checked against the allowlist: no_sni.
+        assert_eq!(sni_block_reason(None, allow), Some(BlockReason::NoSni));
+    }
 
     #[test]
     fn test_extract_sni_none_for_non_tls() {
