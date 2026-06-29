@@ -36,6 +36,27 @@ docker run --rm hello-world
 
 Podman is daemonless, so there is nothing to start.
 
+After exiting and re-entering a sandbox you must start `dockerd` again — the daemon is a
+per-session process, not persisted state. Your images and containers *are* persisted (see below);
+only the running daemon needs restarting.
+
+## Persistence in a sandbox
+
+A `dome sandbox` persists its entire writable root filesystem across sessions via content-addressed
+storage. The runtime binary (`/usr/bin/docker…`) and everything under `/var/lib/docker` — pulled
+images, built images, container layers, volumes — are saved when the session's worker stops and are
+present again, unchanged, on the next `dome sandbox shell`/`run`. So a runtime you install and
+images you pull or build in one session do **not** need re-installing or re-pulling in the next.
+
+What does **not** persist is ephemeral per-boot runtime state under `/run` (pidfiles, sockets): like
+a normal Linux boot, `/run` is a fresh tmpfs each session. That is deliberate — it is what lets you
+simply re-run `dockerd` after re-entering, rather than tripping over a stale `/var/run/docker.pid`
+left by the previous session's daemon.
+
+Egress policing and CA propagation are unconditional boot properties, re-applied on every cold boot,
+so a container started in a later sandbox session is policed and trusts dome's CA *exactly* like one
+in the first session. There is no ephemeral-vs-sandbox difference in behavior.
+
 ## Egress is policed identically to VM-local
 
 Container traffic is bound by `network.allow` exactly like the VM's own traffic — a container

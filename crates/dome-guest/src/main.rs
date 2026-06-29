@@ -68,6 +68,17 @@ mod guest {
             Some("newinstance,ptmxmode=0666"),
         );
         mount_fs("tmpfs", "/tmp", "tmpfs", None);
+        // /run holds ephemeral per-boot runtime state — pidfiles and sockets such as dockerd's
+        // /var/run/docker.pid (which on Debian is the symlink /var/run -> /run, i.e.
+        // /run/docker.pid). On a normal Linux box systemd mounts /run as tmpfs so it is cleared
+        // every boot; there is no systemd here. Without this, /run lives on the persisted root
+        // disk, so a sandbox that saved a running dockerd's pidfile would refuse to restart it the
+        // next session ("failed to start daemon … process with PID N is still running"). Mount it
+        // as tmpfs so runtime state is wiped each boot — standard Linux semantics — while the
+        // runtime's durable state under /var/lib/docker persists on the disk as intended. Like the
+        // cgroup mount, this is an unconditional boot property of every box.
+        std::fs::create_dir_all("/run").ok();
+        mount_fs("tmpfs", "/run", "tmpfs", None);
         // Unified cgroup v2 hierarchy. There is no systemd here to set this up, but a container
         // runtime (Docker/Podman) needs the cgroup tree mounted to create containers — so make
         // it an unconditional property of every box, mounted at boot. The kernel pre-creates the
