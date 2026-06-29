@@ -192,4 +192,4 @@ One rule resolves every field: `--X` sets it, `--no-X` clears/disables it, omit 
 - [references/checkpoints.md](references/checkpoints.md) — checkpoint lifecycle, stacking, disk usage
 - [references/config.md](references/config.md) — dome.json fields and resolution order
 - [references/networking.md](references/networking.md) — allow-net, port forwarding, proxy behavior
-- [references/container-runtimes.md](references/container-runtimes.md) — running Docker/Podman inside a box (egress policy, CA trust, sizing)
+- [references/container-runtimes.md](references/container-runtimes.md) — running Docker/Podman inside a box (sizing, install paths, registry allow-listing, egress policy, CA trust, sandbox persistence)

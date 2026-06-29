@@ -9,6 +9,10 @@ dome's network policy — exactly like VM-local processes. This works the same f
 dome does **not** bake or auto-cache images. If you want images pre-pulled or pre-built, do it
 yourself (e.g. in a `provision` step).
 
+The recommended default engine target is **`dockerd` + `docker compose`**. Running it rootful is
+fine — the VM is already the isolation boundary, so there is no security benefit to rootless inside
+the box. Podman (daemonless) works too; everything below applies to both.
+
 ## Sizing the box
 
 Container images are large, and `disk_size` is **create-only** (it cannot be grown after the box
@@ -40,6 +44,52 @@ After exiting and re-entering a sandbox you must start `dockerd` again — the d
 per-session process, not persisted state. Your images and containers *are* persisted (see below);
 only the running daemon needs restarting.
 
+## The install path doesn't matter
+
+Bringing a runtime in is the same `apt-get install -y docker.io` + `dockerd &` no matter how the
+box is driven, and the kernel capability, egress policing, and CA trust are unconditional boot
+properties — so a container behaves **identically** across all four entry points:
+
+```bash
+# 1. Interactive `dome run` shell
+dome run --memory 4096 --disk-size 8192 --allow-net -- sh
+#   then, inside: apt-get install -y docker.io && dockerd & … && docker run …
+
+# 2. Interactive `dome sandbox shell` (persists — see below)
+dome sandbox shell mybox          # same commands inside; runtime survives re-entry
+```
+
+**3. A `provision` block** installs (and optionally pre-pulls/builds) at *build* time. Provisioning
+runs under full egress and is hermetic (no project mount), so it is the place to bake the runtime
+and images **once** instead of on every boot — dome does not pre-bake images, so the pull is yours
+to write:
+
+```json
+{
+  "memory": 4096,
+  "disk_size": 8192,
+  "allow_net": true,
+  "provision": {
+    "steps": [
+      "apt-get update && apt-get install -y docker.io",
+      "dockerd >/tmp/d.log 2>&1 & for i in $(seq 1 40); do docker info >/dev/null 2>&1 && break; sleep 1; done; docker pull curlimages/curl:latest"
+    ]
+  }
+}
+```
+
+**4. The configured `command`** starts the daemon and runs your workload non-interactively:
+
+```json
+{
+  "command": ["/bin/sh", "-lc", "dockerd >/tmp/d.log 2>&1 & sleep 5; docker run --rm hello-world"]
+}
+```
+
+Because policing and CA trust are applied at boot (not keyed off *how* the container is started), a
+container launched interactively mid-shell is treated exactly like one started from `provision` or
+`command`.
+
 ## Persistence in a sandbox
 
 A `dome sandbox` persists its entire writable root filesystem across sessions via content-addressed
@@ -66,6 +116,37 @@ same gateway), so there is nothing to configure: it is on whenever networking is
 
 See [networking.md](networking.md) for the allow-list and [config.md](config.md#secrets) for
 secrets.
+
+### Allow the registry hosts you pull from
+
+Because container egress obeys `network.allow` exactly like the VM's, **`docker pull` only works if
+the registry's hosts are in the list.** If you restrict `network.allow`, add every host the pull
+touches — the registry, its token/auth endpoint, and its blob CDN — or the pull's DNS is REFUSEd and
+it cannot resolve. For **Docker Hub** that is:
+
+```json
+{
+  "allow_net": true,
+  "network": {
+    "allow": [
+      "registry-1.docker.io",
+      "auth.docker.io",
+      "*.docker.io",
+      "*.docker.com",
+      "*.cloudflarestorage.com"
+    ]
+  }
+}
+```
+
+(The blobs are served from a Cloudflare/R2 CDN, hence the wildcards — a list with only
+`registry-1.docker.io` resolves the manifest but stalls on the layer download.) Other registries
+need their own hosts, e.g. `quay.io` + `*.quay.io`, or `ghcr.io` + `*.githubusercontent.com` +
+`pkg-containers.githubusercontent.com`. A registry you do **not** list is blocked — there is no
+container-egress bypass.
+
+The simplest alternative is to pull during `provision`, which runs under full egress, so the runtime
+boot can keep a tight `allow` list (or none) and never needs registry access at all.
 
 ## HTTPS and secret injection from containers
 
